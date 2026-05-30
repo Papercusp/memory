@@ -70,7 +70,20 @@ export interface MemoryHost {
   getLearningInstructions?: () => Promise<string | undefined>;
 }
 
-let _host: MemoryHost | null = null;
+// The host is stored on a process-global slot, NOT a module-level `let`.
+// Under the operator's tsx runtime this module loads via a node_modules
+// SYMLINK (node_modules/@papercusp/memory → packages/memory), and tsx's
+// ESM loader resolves the symlink inconsistently — some import sites get
+// the symlink path, others the realpath — so a module-level singleton
+// FORKS into two instances: `configureMemory()` (called by the operator's
+// lib/memory/configure.ts) sets `_host` on one, while the store's own
+// `await import('./mem0-connection')` reads `memoryHost()` from the other
+// → "@papercusp/memory is not configured" and memory is dead at runtime.
+// `Symbol.for` keys the global registry, so every forked instance shares
+// this one slot. (require.resolve canonicalizes to one realpath, which is
+// why this only bit the ESM/tsx path, not CJS.)
+const HOST_KEY = Symbol.for('@papercusp/memory:host');
+type HostGlobal = typeof globalThis & { [HOST_KEY]?: MemoryHost | null };
 
 /**
  * Wire the operator host seams. Call once at module load (the operator's
@@ -78,20 +91,21 @@ let _host: MemoryHost | null = null;
  * last call wins.
  */
 export function configureMemory(host: MemoryHost): void {
-  _host = host;
+  (globalThis as HostGlobal)[HOST_KEY] = host;
 }
 
 /** Internal accessor — throws if the host hasn't been configured yet. */
 export function memoryHost(): MemoryHost {
-  if (!_host) {
+  const host = (globalThis as HostGlobal)[HOST_KEY];
+  if (!host) {
     throw new Error(
       '@papercusp/memory is not configured — call configureMemory({ … }) before using the store (the operator does this in lib/memory/configure.ts).',
     );
   }
-  return _host;
+  return host;
 }
 
 /** Test/diagnostic helper: is a host wired? */
 export function isMemoryConfigured(): boolean {
-  return _host !== null;
+  return (globalThis as HostGlobal)[HOST_KEY] != null;
 }
