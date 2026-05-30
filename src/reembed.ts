@@ -78,8 +78,11 @@ export async function reembedMemories(
   const toCollection = `${MEM0_COLLECTION_PREFIX}_${toMode}`;
 
   const pg = await loadPgFields();
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { Client } = require('pg') as typeof import('pg');
+  // `require('pg')` throws "require is not defined" in this ESM package
+  // (mem0-client.ts hit the same) — use dynamic import + CJS interop.
+  const pgMod = (await import('pg')) as typeof import('pg') & { default?: typeof import('pg') };
+  const Client = pgMod.Client ?? pgMod.default?.Client;
+  if (!Client) throw new Error('pg.Client not resolvable');
   const client = new Client({
     host: pg.host,
     port: pg.port,
