@@ -105,7 +105,11 @@ function patchVectorStoreFactory(mem0Module: {
  * mem0's mergeConfig drops function-valued config fields during Zod
  * validation, so by the time create() runs the fn is already gone.
  */
-function patchEmbedderFactory(mem0Module: {
+// Exported for the regression test (mem0-client.test.ts) — it can't drive
+// getMemoryClient() under vitest because the `new Function('return import')`
+// dynamicImport trick has no import callback in vitest's module runner, so it
+// patches + asserts EmbedderFactory directly. Not re-exported from index.ts.
+export function patchEmbedderFactory(mem0Module: {
   EmbedderFactory?: { create: (provider: string, config: Record<string, unknown>) => unknown };
 }): void {
   if (_embedderFactoryPatched) return;
