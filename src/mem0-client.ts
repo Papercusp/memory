@@ -55,6 +55,13 @@ const LLM_MODEL = 'claude-haiku-4-5';
 const MEM0_COLLECTION_PREFIX = 'operator_memory';
 
 let _factoryPatched = false;
+let _embedderFactoryPatched = false;
+// The host's pre-built embed fn for the CURRENT build. mem0's
+// ConfigManager.mergeConfig strips function-valued fields out of
+// embedder.config during Zod validation, so the patched 'custom'
+// embedder (below) reads this live module var instead of config.embed.
+// Set in tryLoad() before each (re)build.
+let _currentEmbedFn: ((text: string) => Promise<number[]>) | null = null;
 /**
  * Register CanonicalVectorStore as a `'canonical'` provider on mem0's
  * VectorStoreFactory. mem0's OSS factory uses a hard-coded switch with
@@ -82,6 +89,42 @@ function patchVectorStoreFactory(mem0Module: {
     return orig(provider, config);
   };
   _factoryPatched = true;
+}
+
+/**
+ * mem0ai 3.x has NO `custom` embedder provider — its EmbedderFactory
+ * switch only knows openai/ollama/lmstudio/google/azure_openai/langchain
+ * and throws "Unsupported embedder provider: custom" otherwise. It
+ * exposes no plugin hook, but it DOES export the EmbedderFactory class,
+ * so (exactly like VectorStoreFactory) we patch its static `create` in
+ * place. Without this the Memory constructor throws on every build and
+ * the whole memory subsystem is dead — every memory:* tool returns
+ * mem0_unavailable.
+ *
+ * The 'custom' embedder reads `_currentEmbedFn`, NOT `config.embed`:
+ * mem0's mergeConfig drops function-valued config fields during Zod
+ * validation, so by the time create() runs the fn is already gone.
+ */
+function patchEmbedderFactory(mem0Module: {
+  EmbedderFactory?: { create: (provider: string, config: Record<string, unknown>) => unknown };
+}): void {
+  if (_embedderFactoryPatched) return;
+  const Factory = mem0Module.EmbedderFactory;
+  if (!Factory || typeof Factory.create !== 'function') {
+    warnOnce('mem0 EmbedderFactory not patchable (interface changed?); custom embedder unavailable');
+    return;
+  }
+  const orig = Factory.create.bind(Factory);
+  Factory.create = (provider: string, config: Record<string, unknown>) => {
+    if (provider === 'custom') {
+      return {
+        embed: (text: string) => _currentEmbedFn!(text),
+        embedBatch: (texts: string[]) => Promise.all(texts.map((t) => _currentEmbedFn!(t))),
+      };
+    }
+    return orig(provider, config);
+  };
+  _embedderFactoryPatched = true;
 }
 
 type MemoryEntry = {
@@ -225,8 +268,14 @@ async function tryLoad(): Promise<MemoryClient | null> {
   let vectorStoreConfig: Record<string, unknown>;
   try {
     // Probe: does PG have the vector extension available?
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { Client } = require('pg') as typeof import('pg');
+    // Dynamic import, NOT require(): @papercusp/memory runs as ESM (it's
+    // not in Next's transpilePackages), where `require` is undefined.
+    // require('pg') here threw "require is not defined", silently failing
+    // the probe and downgrading the store to mem0's volatile in-process
+    // provider.
+    const pgMod = (await import('pg')) as typeof import('pg') & { default?: typeof import('pg') };
+    const Client = pgMod.Client ?? pgMod.default?.Client;
+    if (!Client) throw new Error('pg.Client not resolvable');
     const probe = new Client({ host: pgFields.host, port: pgFields.port, user: pgFields.user, password: pgFields.password, database: pgFields.dbname });
     await probe.connect();
     const r = await probe.query("SELECT 1 FROM pg_available_extensions WHERE name='vector'");
@@ -293,8 +342,13 @@ async function tryLoad(): Promise<MemoryClient | null> {
   } catch { /* best-effort */ }
 
   try {
-    const mem0 = await dynamicImport<Mem0Module & { VectorStoreFactory: { create: (provider: string, config: Record<string, unknown>) => unknown } }>(MEM0_PACKAGE);
+    const mem0 = await dynamicImport<Mem0Module & {
+      VectorStoreFactory: { create: (provider: string, config: Record<string, unknown>) => unknown };
+      EmbedderFactory?: { create: (provider: string, config: Record<string, unknown>) => unknown };
+    }>(MEM0_PACKAGE);
     patchVectorStoreFactory(mem0);
+    _currentEmbedFn = resolved.embed; // feed the patched 'custom' embedder (mem0 strips config.embed)
+    patchEmbedderFactory(mem0);
     const { Memory } = mem0;
     _client = new Memory({
       embedder: embedderConfig,
