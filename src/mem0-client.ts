@@ -131,6 +131,17 @@ export function patchEmbedderFactory(mem0Module: {
   _embedderFactoryPatched = true;
 }
 
+/**
+ * Test seam (mem0-client.test.ts) — set the embed fn the patched 'custom'
+ * embedder routes to. In production `tryLoad()` sets this from the host's
+ * `resolveEmbedder()` before each (re)build. Not re-exported from index.ts.
+ */
+export function _setCurrentEmbedFnForTest(
+  fn: ((text: string) => Promise<number[]>) | null,
+): void {
+  _currentEmbedFn = fn;
+}
+
 type MemoryEntry = {
   id: string;
   memory?: string;

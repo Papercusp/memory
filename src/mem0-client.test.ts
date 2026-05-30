@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { patchEmbedderFactory } from './mem0-client';
+import { describe, it, expect, vi } from 'vitest';
+import { patchEmbedderFactory, _setCurrentEmbedFnForTest } from './mem0-client';
 
 /**
  * Regression guard for the mem0ai 3.x compatibility fix (commit 879fc733).
@@ -35,6 +35,21 @@ describe('patchEmbedderFactory — mem0ai 3.x custom-embedder compatibility', ()
     };
     expect(typeof emb.embed).toBe('function');
     expect(typeof emb.embedBatch).toBe('function');
+
+    // The deepest invariant: .embed() / .embedBatch() must route to the
+    // INJECTED fn (set by tryLoad from the host's resolveEmbedder), NOT to
+    // `config.embed` — which mem0's mergeConfig strips during Zod validation.
+    // The bare typeof checks above would still pass if the embedder called a
+    // dropped/stale fn; THIS is the exact failure mode the fix addresses.
+    const injected = vi.fn(async (t: string) => [t.length, 7]);
+    _setCurrentEmbedFnForTest(injected);
+    const live = oss.EmbedderFactory.create('custom', {
+      embed: () => { throw new Error('config.embed must NOT be used — mem0 strips it'); },
+    }) as { embed: (t: string) => Promise<number[]>; embedBatch: (t: string[]) => Promise<number[][]> };
+    await expect(live.embed('hi')).resolves.toEqual([2, 7]);
+    expect(injected).toHaveBeenCalledWith('hi');
+    await expect(live.embedBatch(['a', 'bbb'])).resolves.toEqual([[1, 7], [3, 7]]);
+    _setCurrentEmbedFnForTest(null);
 
     // Non-custom providers still route through to the real factory (unknown
     // ones still throw — we didn't swallow the original behavior).
