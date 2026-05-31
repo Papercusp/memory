@@ -1,35 +1,47 @@
 /**
  * Re-embed memories when the user switches `memoryEmbedderMode`.
  *
- * Background: switching between `openai` and `local` modes uses
- * different embedding models (text-embedding-3-small vs BGE-small).
- * Each lives in a per-mode pgvector collection
- * (`operator_memory_openai` vs `operator_memory_local`) because the
- * vector spaces aren't comparable — same query embedded by different
- * models lands in different parts of the space, so cross-model search
- * returns nothing.
+ * Background: switching between `openai` and `local` modes uses different
+ * embedding models (text-embedding-3-small @ 384 dims via the `dimensions`
+ * param, vs BGE-small @ 384). The vector spaces aren't comparable — the same
+ * query embedded by different models lands in different parts of the space —
+ * so each mode gets its OWN per-fact vector row.
  *
- * Without re-embedding, switching mode silently hides memories until
- * the user switches back. This worker walks the source collection,
- * re-embeds each memory body with the target embedder, and upserts
- * into the target collection.
+ * Under the canonical schema (migration 081) the fact text lives once in
+ * `harness_shared.memory_canonical` and each mode's vector lives in
+ * `harness_shared.memory_vec_<mode>` (joined by `memory_id`). The text doesn't
+ * move when you switch modes — only which vec table recall reads. So
+ * "re-embedding" = embedding each fact under the target model and upserting a
+ * row into the target vec table. (The pre-081 worker walked the obsolete
+ * per-collection `operator_memory_<mode>` tables, which migration 081 dropped
+ * — it read a never-populated source and wrote a target recall never reads.)
  *
- * Triggered explicitly via `POST /api/user/memory/reembed`. NOT
- * automatic on mode-change — re-embedding 500 memories at 100ms/each
- * is ~1min; we keep it user-initiated so they see progress.
+ * Without re-embedding, switching mode silently hides memories until the user
+ * switches back. This worker walks every fact that has a SOURCE-mode vector,
+ * re-embeds its body with the target embedder, and upserts the TARGET-mode
+ * vector row.
  *
- * The target-mode embedder is built by the host (`buildEmbedderForMode`
- * seam) — re-embedding must use the *target* model's space regardless of
- * the current preference, so we can't reuse the preference-resolved
- * embedder. Part of P-021.
+ * Triggered explicitly via `POST /api/user/memory/reembed`. NOT automatic on
+ * mode-change — re-embedding 500 memories at ~100ms/each is ~1min; we keep it
+ * user-initiated so they see progress.
+ *
+ * The target-mode embedder is built by the host (`buildEmbedderForMode` seam)
+ * — re-embedding must use the *target* model's space regardless of the current
+ * preference, so we can't reuse the preference-resolved embedder. Part of P-021.
  */
 
 import { memoryHost } from './config';
 
 const EMBEDDER_DIM = 384;
-const MEM0_COLLECTION_PREFIX = 'operator_memory';
 
 type ResolvedMode = 'openai' | 'local';
+
+/** Map a mode to its canonical vec table — fixed lookup (no interpolation of
+ *  caller input into SQL identifiers). */
+const VEC_TABLE: Record<ResolvedMode, string> = {
+  openai: 'harness_shared.memory_vec_openai',
+  local: 'harness_shared.memory_vec_local',
+};
 
 interface PgFields {
   host: string;
@@ -58,12 +70,12 @@ async function loadPgFields(): Promise<PgFields> {
 }
 
 /**
- * Walk every row in the source collection, embed under the target's
- * embedder, write to the target collection. Existing rows in the
- * target with the same id are upserted (overwritten).
+ * Walk every canonical fact that has a SOURCE-mode vector, embed its body
+ * under the target embedder, and upsert the row into the target vec table.
+ * Existing target rows for the same `memory_id` are overwritten.
  *
- * Returns progress counts; throws on fatal errors (PG unavailable,
- * embedder build failure).
+ * Returns progress counts; throws on fatal errors (PG unavailable, embedder
+ * build failure).
  */
 export async function reembedMemories(
   fromMode: ResolvedMode,
@@ -74,8 +86,8 @@ export async function reembedMemories(
     throw new Error('reembed_noop_same_mode');
   }
   const started = Date.now();
-  const fromCollection = `${MEM0_COLLECTION_PREFIX}_${fromMode}`;
-  const toCollection = `${MEM0_COLLECTION_PREFIX}_${toMode}`;
+  const fromTable = VEC_TABLE[fromMode];
+  const toTable = VEC_TABLE[toMode];
 
   const pg = await loadPgFields();
   // `require('pg')` throws "require is not defined" in this ESM package
@@ -92,43 +104,17 @@ export async function reembedMemories(
   });
   await client.connect();
   try {
-    // Confirm source collection exists; if not, nothing to do.
-    const exists = await client.query<{ to_regclass: string | null }>(
-      `SELECT to_regclass($1) AS to_regclass`,
-      [fromCollection],
-    );
-    if (!exists.rows[0]?.to_regclass) {
-      return {
-        fromCollection,
-        toCollection,
-        totalSource: 0,
-        reembedded: 0,
-        skipped: 0,
-        errors: 0,
-        durationMs: Date.now() - started,
-      };
-    }
-
-    // Build embedder for the target mode (host seam — the operator owns
-    // the openai/local cascade).
+    // Build embedder for the target mode (host seam — the operator owns the
+    // openai/local cascade).
     const embed = await memoryHost().buildEmbedderForMode(toMode);
 
-    // Ensure target collection exists with the right shape. mem0's
-    // PGVector.createCol DDL is what we mirror here. Doing it manually
-    // (rather than spinning up a mem0 Memory instance) keeps the worker
-    // independent of the runtime mem0 init.
-    await client.query('CREATE EXTENSION IF NOT EXISTS vector');
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS "${toCollection}" (
-        id UUID PRIMARY KEY,
-        vector vector(${EMBEDDER_DIM}),
-        payload JSONB
-      )
-    `);
-
-    // Stream source rows.
+    // Source = canonical facts that already carry a source-mode vector. The
+    // canonical + vec tables exist from migration 081 (applied at embedded-PG
+    // boot) — no DDL here.
     const rows = await client.query<{ id: string; payload: Record<string, unknown> }>(
-      `SELECT id, payload FROM "${fromCollection}"`,
+      `SELECT c.id, c.payload
+         FROM harness_shared.memory_canonical c
+         JOIN ${fromTable} v ON v.memory_id = c.id`,
     );
     const progress: ReembedProgress = {
       totalSource: rows.rowCount ?? 0,
@@ -152,10 +138,10 @@ export async function reembedMemories(
           continue;
         }
         await client.query(
-          `INSERT INTO "${toCollection}" (id, vector, payload)
-           VALUES ($1, $2::vector, $3::jsonb)
-           ON CONFLICT (id) DO UPDATE SET vector = EXCLUDED.vector, payload = EXCLUDED.payload`,
-          [row.id, `[${vec.join(',')}]`, row.payload],
+          `INSERT INTO ${toTable} (memory_id, vector, embedded_at)
+           VALUES ($1, $2::vector, now())
+           ON CONFLICT (memory_id) DO UPDATE SET vector = EXCLUDED.vector, embedded_at = now()`,
+          [row.id, `[${vec.join(',')}]`],
         );
         progress.reembedded += 1;
         opts.progress?.(progress);
@@ -166,8 +152,8 @@ export async function reembedMemories(
     }
 
     return {
-      fromCollection,
-      toCollection,
+      fromCollection: fromTable,
+      toCollection: toTable,
       ...progress,
       durationMs: Date.now() - started,
     };

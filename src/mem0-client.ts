@@ -84,11 +84,32 @@ function patchVectorStoreFactory(mem0Module: {
       // { provider, config }) — see Memory constructor invoking
       // VectorStoreFactory.create(this.config.vectorStore.provider,
       // this.config.vectorStore.config).
-      return new CanonicalVectorStore(config as unknown as ConstructorParameters<typeof CanonicalVectorStore>[0]);
+      const store = new CanonicalVectorStore(
+        config as unknown as ConstructorParameters<typeof CanonicalVectorStore>[0],
+      );
+      // Track it so its pg.Client is closed when the mem0 client is rebuilt
+      // (TTL / invalidate) — otherwise each rebuild orphans a connection.
+      _liveCanonicalStores.add(store);
+      return store;
     }
     return orig(provider, config);
   };
   _factoryPatched = true;
+}
+
+/**
+ * CanonicalVectorStore instances created via the patched factory. Each holds a
+ * cached `pg.Client`; they must be disposed when the mem0 client is dropped so
+ * the connection doesn't leak across the hourly TTL rebuild / invalidate.
+ */
+const _liveCanonicalStores = new Set<CanonicalVectorStore>();
+
+/** Close + forget every tracked canonical store's PG client. Fire-and-forget
+ *  safe — `dispose()` is idempotent and tolerant of an in-flight client. */
+async function disposeLiveCanonicalStores(): Promise<void> {
+  const stores = [..._liveCanonicalStores];
+  _liveCanonicalStores.clear();
+  await Promise.allSettled(stores.map((s) => s.dispose()));
 }
 
 /**
@@ -217,6 +238,9 @@ async function tryLoad(): Promise<MemoryClient | null> {
     // TTL expired — drop and rebuild so learning-loop instructions
     // refresh. mem0 doesn't ship a mutator for customInstructions.
     _client = null;
+    // Close the previous store's PG client (the new one is built below and
+    // re-tracked). Fire-and-forget: the set is snapshot+cleared synchronously.
+    void disposeLiveCanonicalStores();
   }
   if (_clientPermanentFailure) return null;
 
@@ -413,4 +437,7 @@ export function getResolvedMode(): ResolvedMode | null {
 export function invalidateMemoryClient(): void {
   _client = null;
   _clientBuiltAt = 0;
+  // Release the discarded store's PG client so invalidation doesn't leak a
+  // connection (e.g. on credential change / mode switch).
+  void disposeLiveCanonicalStores();
 }

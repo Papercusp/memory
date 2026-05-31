@@ -102,6 +102,25 @@ export class CanonicalVectorStore {
     // applied at embedded-PG boot. Nothing to do per-instance.
   }
 
+  /**
+   * Close the cached PG client. The mem0 client is torn down + rebuilt on a
+   * TTL (1h) and on `invalidateMemoryClient()`; each rebuild constructs a fresh
+   * store via the patched VectorStoreFactory. Without this, the prior store's
+   * `pg.Client` is orphaned — a slow connection leak against embedded PG over a
+   * long-running operator. Idempotent and tolerant of a never-connected store.
+   */
+  async dispose(): Promise<void> {
+    const p = this.clientPromise;
+    this.clientPromise = null;
+    if (!p) return;
+    try {
+      const c = await p;
+      await c.end();
+    } catch {
+      /* already closed, or never connected — nothing to release */
+    }
+  }
+
   async insert(
     vectors: number[][],
     ids: string[],
@@ -206,14 +225,27 @@ export class CanonicalVectorStore {
   }
 
   /**
-   * mem0 calls this for collection-wide reset (deleteAll, reset).
-   * We interpret it as "drop everything in this store's pool" — i.e.
-   * every canonical row + cascade. We do NOT scope this to vec-table
-   * presence; reset means reset.
+   * mem0 calls this for collection-wide reset (deleteAll, reset). The
+   * canonical table is SHARED across every user + harness (scope lives in
+   * `payload.user_id`), so an unscoped `DELETE` here would wipe EVERYONE's
+   * memories — a multi-tenant data-loss footgun. We scope the reset to the
+   * store's current `userId` instead: cascade clears that user's vec rows in
+   * both model tables, and other scopes are untouched. With no active scope we
+   * refuse rather than nuke the shared table.
    */
   async deleteCol(): Promise<void> {
+    if (!this.userId) {
+      console.warn(
+        '[memory] CanonicalVectorStore.deleteCol called with no userId scope — ' +
+          'refusing to wipe the shared memory_canonical table.',
+      );
+      return;
+    }
     const client = await this.getClient();
-    await client.query(`DELETE FROM harness_shared.memory_canonical`);
+    await client.query(
+      `DELETE FROM harness_shared.memory_canonical WHERE payload->>'user_id' = $1`,
+      [this.userId],
+    );
   }
 
   /**
