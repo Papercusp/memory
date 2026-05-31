@@ -47,7 +47,7 @@
  */
 
 import { CanonicalVectorStore } from './canonical-store';
-import { memoryHost } from './config';
+import { memoryHost, memorySchema } from './config';
 
 const LLM_MODEL = 'claude-haiku-4-5';
 // The collectionName is passed to mem0 for its internal bookkeeping
@@ -328,6 +328,7 @@ async function tryLoad(): Promise<MemoryClient | null> {
           user: pgFields.user,
           password: pgFields.password,
           dbname: pgFields.dbname,
+          schema: memorySchema(),
           collectionName,
           vecTable,
           embeddingModelDims: resolved.dims,
@@ -357,19 +358,24 @@ async function tryLoad(): Promise<MemoryClient | null> {
     config: { embed: resolved.embed },
   };
 
-  // mem0 tracks add/update/delete event history in SQLite. Default was
-  // `:memory:` (lost on restart). Persist under ~/.papercusp/ so the
-  // event log survives so /settings/user/memory can show it.
+  // mem0 tracks add/update/delete event history in SQLite. Default is
+  // `:memory:` (lost on restart). When the host provides a `localStoreDir`
+  // (default the OS tmpdir; the operator passes ~/.papercusp), persist
+  // there so the event log survives restarts. `localStoreDir: null`
+  // forces the in-memory history.
   let historyDbPath = ':memory:';
-  try {
-    const os = await import('node:os');
-    const path = await import('node:path');
-    const fs = await import('node:fs/promises');
-    const dir = path.join(os.homedir(), '.papercusp');
-    await fs.mkdir(dir, { recursive: true });
-    historyDbPath = path.join(dir, 'mem0-history.db');
-  } catch {
-    /* fall back to in-memory if we can't write */
+  const localStoreDir = memoryHost().localStoreDir;
+  if (localStoreDir !== null) {
+    try {
+      const os = await import('node:os');
+      const path = await import('node:path');
+      const fs = await import('node:fs/promises');
+      const dir = localStoreDir ?? os.tmpdir();
+      await fs.mkdir(dir, { recursive: true });
+      historyDbPath = path.join(dir, 'mem0-history.db');
+    } catch {
+      /* fall back to in-memory if we can't write */
+    }
   }
 
   // Feed user-feedback patterns into mem0's extraction prompt so it

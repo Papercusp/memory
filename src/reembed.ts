@@ -7,9 +7,11 @@
  * query embedded by different models lands in different parts of the space —
  * so each mode gets its OWN per-fact vector row.
  *
- * Under the canonical schema (migration 081) the fact text lives once in
- * `harness_shared.memory_canonical` and each mode's vector lives in
- * `harness_shared.memory_vec_<mode>` (joined by `memory_id`). The text doesn't
+ * Under the canonical schema the fact text lives once in
+ * `<schema>.memory_canonical` and each mode's vector lives in
+ * `<schema>.memory_vec_<mode>` (joined by `memory_id`), where `<schema>` is
+ * the host-configured schema (default `public`; the operator uses
+ * `harness_shared`). The text doesn't
  * move when you switch modes — only which vec table recall reads. So
  * "re-embedding" = embedding each fact under the target model and upserting a
  * row into the target vec table. (The pre-081 worker walked the obsolete
@@ -30,17 +32,17 @@
  * preference, so we can't reuse the preference-resolved embedder. Part of P-021.
  */
 
-import { memoryHost } from './config';
+import { memoryHost, memorySchema } from './config';
 
 const EMBEDDER_DIM = 384;
 
 type ResolvedMode = 'openai' | 'local';
 
-/** Map a mode to its canonical vec table — fixed lookup (no interpolation of
- *  caller input into SQL identifiers). */
+/** Map a mode to its (unqualified) vec table — fixed lookup (no interpolation
+ *  of caller input into SQL identifiers); schema is prefixed at use. */
 const VEC_TABLE: Record<ResolvedMode, string> = {
-  openai: 'harness_shared.memory_vec_openai',
-  local: 'harness_shared.memory_vec_local',
+  openai: 'memory_vec_openai',
+  local: 'memory_vec_local',
 };
 
 interface PgFields {
@@ -86,8 +88,9 @@ export async function reembedMemories(
     throw new Error('reembed_noop_same_mode');
   }
   const started = Date.now();
-  const fromTable = VEC_TABLE[fromMode];
-  const toTable = VEC_TABLE[toMode];
+  const schema = memorySchema();
+  const fromTable = `${schema}.${VEC_TABLE[fromMode]}`;
+  const toTable = `${schema}.${VEC_TABLE[toMode]}`;
 
   const pg = await loadPgFields();
   // `require('pg')` throws "require is not defined" in this ESM package
@@ -113,7 +116,7 @@ export async function reembedMemories(
     // boot) — no DDL here.
     const rows = await client.query<{ id: string; payload: Record<string, unknown> }>(
       `SELECT c.id, c.payload
-         FROM harness_shared.memory_canonical c
+         FROM ${schema}.memory_canonical c
          JOIN ${fromTable} v ON v.memory_id = c.id`,
     );
     const progress: ReembedProgress = {

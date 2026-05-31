@@ -49,6 +49,8 @@ export interface CanonicalStoreConfig {
   user: string;
   password: string;
   dbname: string;
+  /** Schema holding `memory_canonical` + the vec tables (host-defined). */
+  schema: string;
   /** Ignored — mem0 always passes this; we don't use collection
    *  segmentation because the canonical row carries scope in payload. */
   collectionName?: string;
@@ -130,7 +132,7 @@ export class CanonicalVectorStore {
       throw new Error('CanonicalVectorStore.insert: vectors/ids/payloads length mismatch');
     }
     const client = await this.getClient();
-    const vecTable = `harness_shared.${this.cfg.vecTable}`;
+    const vecTable = `${this.cfg.schema}.${this.cfg.vecTable}`;
     for (let i = 0; i < ids.length; i++) {
       const id = ids[i];
       const vec = vectors[i];
@@ -142,7 +144,7 @@ export class CanonicalVectorStore {
       }
       // Upsert canonical first (vec table FKs to it), then vec row.
       await client.query(
-        `INSERT INTO harness_shared.memory_canonical (id, payload, created_at, updated_at)
+        `INSERT INTO ${this.cfg.schema}.memory_canonical (id, payload, created_at, updated_at)
          VALUES ($1, $2::jsonb, now(), now())
          ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()`,
         [id, JSON.stringify(payload)],
@@ -162,7 +164,7 @@ export class CanonicalVectorStore {
     filters?: SearchFilters,
   ): Promise<VectorStoreResult[]> {
     const client = await this.getClient();
-    const vecTable = `harness_shared.${this.cfg.vecTable}`;
+    const vecTable = `${this.cfg.schema}.${this.cfg.vecTable}`;
     const conds: string[] = [];
     const params: unknown[] = [toVectorLiteral(query), topK];
     let idx = 3;
@@ -179,7 +181,7 @@ export class CanonicalVectorStore {
     const sql = `
       SELECT c.id, c.payload, 1 - (v.vector <=> $1::vector) AS score
       FROM ${vecTable} v
-      JOIN harness_shared.memory_canonical c ON c.id = v.memory_id
+      JOIN ${this.cfg.schema}.memory_canonical c ON c.id = v.memory_id
       ${where}
       ORDER BY v.vector <=> $1::vector
       LIMIT $2
@@ -206,7 +208,7 @@ export class CanonicalVectorStore {
   async get(id: string): Promise<VectorStoreResult | null> {
     const client = await this.getClient();
     const res = await client.query(
-      `SELECT id, payload FROM harness_shared.memory_canonical WHERE id = $1`,
+      `SELECT id, payload FROM ${this.cfg.schema}.memory_canonical WHERE id = $1`,
       [id],
     );
     if (res.rowCount === 0) return null;
@@ -221,7 +223,7 @@ export class CanonicalVectorStore {
     const client = await this.getClient();
     // CASCADE removes the vec rows (in BOTH model tables) — deleting
     // a memory is a real delete, not a per-model delete.
-    await client.query(`DELETE FROM harness_shared.memory_canonical WHERE id = $1`, [id]);
+    await client.query(`DELETE FROM ${this.cfg.schema}.memory_canonical WHERE id = $1`, [id]);
   }
 
   /**
@@ -243,7 +245,7 @@ export class CanonicalVectorStore {
     }
     const client = await this.getClient();
     await client.query(
-      `DELETE FROM harness_shared.memory_canonical WHERE payload->>'user_id' = $1`,
+      `DELETE FROM ${this.cfg.schema}.memory_canonical WHERE payload->>'user_id' = $1`,
       [this.userId],
     );
   }
@@ -276,14 +278,14 @@ export class CanonicalVectorStore {
 
     const listSql = `
       SELECT id, payload
-      FROM harness_shared.memory_canonical
+      FROM ${this.cfg.schema}.memory_canonical
       ${where}
       ORDER BY created_at DESC
       LIMIT $${idx}
     `;
     const countSql = `
       SELECT COUNT(*)::bigint AS n
-      FROM harness_shared.memory_canonical
+      FROM ${this.cfg.schema}.memory_canonical
       ${where}
     `;
 

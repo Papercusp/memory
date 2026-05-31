@@ -32,7 +32,7 @@ export async function pgFields(): Promise<Mem0PgConnection> {
     port: u.port ? Number(u.port) : 5432,
     user: decodeURIComponent(u.username),
     password: decodeURIComponent(u.password),
-    dbname: u.pathname.replace(/^\//, '') || 'papercusp',
+    dbname: u.pathname.replace(/^\//, '') || memoryHost().defaultDbName || 'postgres',
   };
 }
 

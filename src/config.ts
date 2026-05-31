@@ -68,6 +68,31 @@ export interface MemoryHost {
    * the package treats it as a black box. Default: none.
    */
   getLearningInstructions?: () => Promise<string | undefined>;
+
+  /**
+   * Postgres schema holding the memory tables (`memory_canonical` +
+   * `memory_vec_*`). Default `'public'`. The host's migration must create
+   * the tables in this schema. The operator passes `'harness_shared'`.
+   */
+  schema?: string;
+
+  /**
+   * Fallback Postgres database name when the admin URL has no path
+   * component. Default `'postgres'`. The operator passes `'papercusp'`.
+   */
+  defaultDbName?: string;
+
+  /**
+   * Directory for mem0's local SQLite event-history file. Default the OS
+   * tmpdir. The operator passes `~/.papercusp` so the log survives across
+   * restarts. Set to `null` to force the in-memory (`:memory:`) history.
+   */
+  localStoreDir?: string | null;
+}
+
+/** Resolved memory-table schema — host config, defaulting to `public`. */
+export function memorySchema(): string {
+  return memoryHost().schema ?? 'public';
 }
 
 // The host is stored on a process-global slot, NOT a module-level `let`.
