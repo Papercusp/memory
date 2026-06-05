@@ -30,6 +30,50 @@ export {
   invalidateMemoryClient,
 } from './mem0-client';
 
+// The neutral, swappable store seam (generalize-memory-backend-swappable
+// D-001/D-002/D-004). Consumers call getMemoryBackend() and the neutral
+// verbs; which store serves them is the host's `backend` config flip.
+export {
+  MemoryUnavailableError,
+  scopesOf,
+  type ListOptions,
+  type MemoryAvailability,
+  type MemoryBackend,
+  type MemoryEntry,
+  type RememberOptions,
+  type SearchOptions,
+  type UpdatePatch,
+} from './backend';
+export { Mem0Backend, extractAddedIds, type Mem0BackendDeps } from './mem0-backend';
+export { NoopBackend, NOOP_DISABLED_REASON } from './noop-backend';
+// The Claude Code topic-file bridge (generalize-memory-backend-swappable
+// D-005 / claude-memory-projection-integration P-004): read/write the
+// native Claude file memory through the neutral seam. Hosts register it:
+//   registerMemoryBackend('claude-file', () => new ClaudeFileMemoryBackend({ memoryDir }));
+export {
+  ClaudeFileMemoryBackend,
+  CLAUDE_FILE_BACKEND_NAME,
+  MEMORY_DIR_MISSING_REASON,
+  type ClaudeFileBackendOptions,
+} from './claude-file-backend';
+export {
+  parseTopicFile,
+  serializeTopicFile,
+  typeForKind,
+  slugify,
+  deriveDescription,
+  claudeProjectMemoryDir,
+  CLAUDE_MEMORY_TYPES,
+  type ClaudeMemoryType,
+  type TopicFile,
+} from './topic-file';
+export {
+  getMemoryBackend,
+  registerMemoryBackend,
+  registeredMemoryBackends,
+  _resetMemoryBackendsForTest,
+} from './backend-registry';
+
 export {
   connectionString,
   pgFields,

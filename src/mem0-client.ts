@@ -163,7 +163,9 @@ export function _setCurrentEmbedFnForTest(
   _currentEmbedFn = fn;
 }
 
-type MemoryEntry = {
+// Exported for Mem0Backend (./mem0-backend.ts), which adapts this raw
+// mem0 surface onto the neutral MemoryBackend interface (./backend.ts).
+export type Mem0Row = {
   id: string;
   memory?: string;
   metadata?: Record<string, unknown>;
@@ -171,17 +173,17 @@ type MemoryEntry = {
   [key: string]: unknown;
 };
 
-type MemoryListResult = {
-  results?: MemoryEntry[];
+export type Mem0ListResult = {
+  results?: Mem0Row[];
   [key: string]: unknown;
 };
 
-type MemoryClient = {
+export type MemoryClient = {
   add(content: string | unknown[], opts: Record<string, unknown>): Promise<unknown>;
   delete(id: string): Promise<unknown>;
-  get(id: string): Promise<MemoryEntry | null>;
-  getAll(opts: Record<string, unknown>): Promise<MemoryListResult>;
-  search(query: string, opts: Record<string, unknown>): Promise<MemoryListResult>;
+  get(id: string): Promise<Mem0Row | null>;
+  getAll(opts: Record<string, unknown>): Promise<Mem0ListResult>;
+  search(query: string, opts: Record<string, unknown>): Promise<Mem0ListResult>;
   update(id: string, content: string): Promise<unknown>;
 };
 

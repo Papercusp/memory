@@ -88,6 +88,17 @@ export interface MemoryHost {
    * restarts. Set to `null` to force the in-memory (`:memory:`) history.
    */
   localStoreDir?: string | null;
+
+  /**
+   * Which `MemoryBackend` `getMemoryBackend()` serves — a registered
+   * name (`'mem0'` / `'noop'` / anything added via
+   * `registerMemoryBackend()`) or a direct instance. Default `'mem0'`.
+   * The operator feeds this from `PAPERCUSP_MEMORY_BACKEND`, keeping
+   * the store a config flip (generalize-memory-backend-swappable
+   * D-004). The inline type-only import keeps config.ts free of a
+   * runtime circular dependency on backend.ts.
+   */
+  backend?: string | import('./backend').MemoryBackend;
 }
 
 /** Resolved memory-table schema — host config, defaulting to `public`. */
