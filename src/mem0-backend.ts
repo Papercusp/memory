@@ -67,6 +67,27 @@ export function extractAddedIds(result: unknown): string[] {
   return out;
 }
 
+/**
+ * Count the store-affecting events ('ADD' + 'UPDATE') in a mem0 `add()`
+ * result. An UPDATE is a legitimate store (the extractor merged the fact
+ * into an existing memory), so `extractAddedIds` alone under-reports
+ * whether anything was persisted. A swallowed extraction failure (mem0
+ * catches its LLM error internally and resolves with `{ results: [] }`)
+ * yields 0 — the signal callers use to report an HONEST capture failure
+ * instead of a false success (EI-25).
+ */
+export function extractStoredEventCount(result: unknown): number {
+  const rows = Array.isArray((result as { results?: unknown } | null)?.results)
+    ? ((result as { results: Array<{ event?: unknown }> }).results)
+    : [];
+  let n = 0;
+  for (const row of rows) {
+    const event = typeof row?.event === 'string' ? row.event.toUpperCase() : '';
+    if (event === 'ADD' || event === 'UPDATE') n += 1;
+  }
+  return n;
+}
+
 /** Map one raw mem0 row to the neutral entry shape. */
 function toEntry(row: Mem0Row, scope: string): MemoryEntry {
   const metadata = row.metadata ?? undefined;
@@ -116,12 +137,12 @@ export class Mem0Backend implements MemoryBackend {
     return client;
   }
 
-  async remember(text: string, opts: RememberOptions): Promise<{ ids: string[] }> {
+  async remember(text: string, opts: RememberOptions): Promise<{ ids: string[]; storedEvents: number }> {
     const client = await this.client();
     const metadata: Record<string, unknown> = { ...(opts.metadata ?? {}) };
     if (opts.kind !== undefined) metadata.kind = opts.kind;
     const result = await client.add(text, { userId: opts.scope, metadata });
-    return { ids: extractAddedIds(result) };
+    return { ids: extractAddedIds(result), storedEvents: extractStoredEventCount(result) };
   }
 
   async search(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
@@ -174,12 +195,12 @@ export class Mem0Backend implements MemoryBackend {
   async rememberConversation(
     messages: ReadonlyArray<{ role: string; content: string }>,
     opts: RememberOptions,
-  ): Promise<{ ids: string[] }> {
+  ): Promise<{ ids: string[]; storedEvents: number }> {
     const client = await this.client();
     const metadata: Record<string, unknown> = { ...(opts.metadata ?? {}) };
     if (opts.kind !== undefined) metadata.kind = opts.kind;
     const result = await client.add([...messages], { userId: opts.scope, metadata });
-    return { ids: extractAddedIds(result) };
+    return { ids: extractAddedIds(result), storedEvents: extractStoredEventCount(result) };
   }
 
   invalidate(): void {

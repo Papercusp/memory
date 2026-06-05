@@ -117,9 +117,16 @@ export interface MemoryBackend {
   /**
    * Store one fact. Returns the ids of entries NEWLY created — a
    * backend may merge into existing entries or decide nothing is
-   * memorable, so 0..N ids.
+   * memorable, so 0..N ids. Backends that can tell SHOULD also report
+   * `storedEvents`: the count of store-affecting operations (new
+   * inserts + merges into existing entries). `ids: [], storedEvents: 0`
+   * means NOTHING was persisted (e.g. mem0's extractor failed or
+   * declined) — callers use it to report honest capture failures
+   * instead of assuming a resolved promise stored something (EI-25).
+   * Backends that can't distinguish merges may omit it; callers fall
+   * back to `ids.length`.
    */
-  remember(text: string, opts: RememberOptions): Promise<{ ids: string[] }>;
+  remember(text: string, opts: RememberOptions): Promise<{ ids: string[]; storedEvents?: number }>;
 
   /** Semantic/text search. See `SearchOptions` for limit semantics. */
   search(query: string, opts: SearchOptions): Promise<MemoryEntry[]>;
@@ -144,7 +151,7 @@ export interface MemoryBackend {
   rememberConversation?(
     messages: ReadonlyArray<{ role: string; content: string }>,
     opts: RememberOptions,
-  ): Promise<{ ids: string[] }>;
+  ): Promise<{ ids: string[]; storedEvents?: number }>;
 
   /** OPTIONAL capability: drop cached clients/state so the next call rebuilds. */
   invalidate?(): void;

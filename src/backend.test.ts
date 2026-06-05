@@ -12,7 +12,7 @@ import {
   type MemoryBackend,
   type MemoryEntry,
 } from './backend';
-import { Mem0Backend, extractAddedIds } from './mem0-backend';
+import { Mem0Backend, extractAddedIds, extractStoredEventCount } from './mem0-backend';
 import { NoopBackend, NOOP_DISABLED_REASON } from './noop-backend';
 import {
   getMemoryBackend,
@@ -97,6 +97,33 @@ describe('extractAddedIds', () => {
   });
 });
 
+describe('extractStoredEventCount', () => {
+  it('counts ADD and UPDATE events, ignores NONE/DELETE', () => {
+    expect(
+      extractStoredEventCount({
+        results: [
+          { id: UUID_A, event: 'ADD' },
+          { id: UUID_B, event: 'UPDATE' },
+          { id: UUID_A, event: 'NONE' },
+          { id: UUID_B, event: 'DELETE' },
+        ],
+      }),
+    ).toBe(2);
+  });
+
+  it('is case-insensitive on event names', () => {
+    expect(extractStoredEventCount({ results: [{ event: 'add' }, { event: 'Update' }] })).toBe(2);
+  });
+
+  it('returns 0 for a swallowed-extraction-failure shape (empty results) and malformed input', () => {
+    expect(extractStoredEventCount({ results: [] })).toBe(0);
+    expect(extractStoredEventCount(null)).toBe(0);
+    expect(extractStoredEventCount(undefined)).toBe(0);
+    expect(extractStoredEventCount({})).toBe(0);
+    expect(extractStoredEventCount({ results: 'nope' })).toBe(0);
+  });
+});
+
 describe('NoopBackend', () => {
   const noop = new NoopBackend();
 
@@ -149,7 +176,8 @@ describe('Mem0Backend', () => {
     });
     const b = new Mem0Backend({ getClient: async () => client });
     const r = await b.remember('fact', { scope: 'harness:papercup', kind: 'project', metadata: { a: 1 } });
-    expect(r).toEqual({ ids: [UUID_A] });
+    // ids = ADD rows only; storedEvents counts the UPDATE merge too (EI-25).
+    expect(r).toEqual({ ids: [UUID_A], storedEvents: 2 });
     expect(client.add).toHaveBeenCalledWith('fact', {
       userId: 'harness:papercup',
       metadata: { a: 1, kind: 'project' },
@@ -255,7 +283,7 @@ describe('Mem0Backend', () => {
       { role: 'assistant', content: 'hello' },
     ];
     const r = await b.rememberConversation(messages, { scope: 'user-1', metadata: { turn_at: 5 } });
-    expect(r).toEqual({ ids: [UUID_A] });
+    expect(r).toEqual({ ids: [UUID_A], storedEvents: 1 });
     expect(client.add).toHaveBeenCalledWith(messages, {
       userId: 'user-1',
       metadata: { turn_at: 5 },
