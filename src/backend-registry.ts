@@ -79,7 +79,14 @@ export function registeredMemoryBackends(): string[] {
  * `PAPERCUSP_MEMORY_BACKEND` as "memory is just empty".
  */
 export function getMemoryBackend(): MemoryBackend {
-  const choice = isMemoryConfigured() ? memoryHost().backend ?? 'mem0' : 'mem0';
+  // The host's `backend` may be a static name/instance OR a thunk re-read
+  // on every call (the operator passes a thunk over the live operator
+  // setting so a UI flip takes effect without a restart — Brief 30).
+  const raw = isMemoryConfigured() ? memoryHost().backend : undefined;
+  const resolved = typeof raw === 'function'
+    ? (raw as () => string | MemoryBackend | undefined)()
+    : raw;
+  const choice = resolved ?? 'mem0';
   if (typeof choice !== 'string') return choice; // a direct instance
   const cached = instances().get(choice);
   if (cached) return cached;

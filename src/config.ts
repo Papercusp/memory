@@ -92,13 +92,20 @@ export interface MemoryHost {
   /**
    * Which `MemoryBackend` `getMemoryBackend()` serves — a registered
    * name (`'mem0'` / `'noop'` / anything added via
-   * `registerMemoryBackend()`) or a direct instance. Default `'mem0'`.
-   * The operator feeds this from `PAPERCUSP_MEMORY_BACKEND`, keeping
-   * the store a config flip (generalize-memory-backend-swappable
+   * `registerMemoryBackend()`), a direct instance, or a **thunk** that
+   * returns one of those (re-evaluated on every `getMemoryBackend()`
+   * call). Default `'mem0'`. The operator feeds a thunk reading the
+   * live operator setting (mem0-revive-or-retire) so the active backend
+   * can be switched from the UI without a restart, falling back to
+   * `PAPERCUSP_MEMORY_BACKEND` then `'mem0'`; the static string/instance
+   * forms keep the store a config flip (generalize-memory-backend-swappable
    * D-004). The inline type-only import keeps config.ts free of a
    * runtime circular dependency on backend.ts.
    */
-  backend?: string | import('./backend').MemoryBackend;
+  backend?:
+    | string
+    | import('./backend').MemoryBackend
+    | (() => string | import('./backend').MemoryBackend | undefined);
 }
 
 /** Resolved memory-table schema — host config, defaulting to `public`. */
