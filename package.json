@@ -11,6 +11,11 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./bench": {
+      "types": "./src/bench/index.ts",
+      "import": "./src/bench/index.ts",
+      "default": "./src/bench/index.ts"
     }
   },
   "scripts": {
