@@ -79,6 +79,8 @@ export interface QueryOutcome {
   rawHits: number;
   /** Backend-native score of the top hit, if reported. */
   topScore?: number;
+  /** Text of the top hit (for downstream judged-usefulness tiers). */
+  topText?: string;
   /** Search wall-clock ms. */
   ms: number;
 }

@@ -65,6 +65,7 @@ export async function runGoldSet(
         rankedKeys: rankedCorpusKeys(hits),
         rawHits: hits.length,
         ...(typeof hits[0]?.score === 'number' ? { topScore: hits[0].score } : {}),
+        ...(typeof hits[0]?.text === 'string' ? { topText: hits[0].text } : {}),
         ms,
       };
       done += 1;
