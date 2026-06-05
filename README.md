@@ -1,15 +1,42 @@
 # @papercusp/memory
 
-A host-agnostic **mem0-backed persistent-memory store**. It wraps
-[`mem0ai/oss`](https://github.com/mem0ai/mem0) with a canonical pgvector
-store — one `memory_canonical` row per fact, plus a per-embedder-mode
-vector table (`memory_vec_openai` / `memory_vec_local`) joined by
-`memory_id` — so switching embedder modes re-embeds without duplicating
-the fact text. Includes a worker-thread-isolated local BGE embedder and a
-cross-model re-embed pass.
+A host-agnostic **persistent-memory store behind a swappable
+`MemoryBackend` seam**. Consumers call `getMemoryBackend()` and five
+neutral verbs (`remember` / `search` / `list` / `forget` / `update`,
+plus `get` and an `available()` probe) over a neutral entry shape
+`{ id, text, kind?, scope, score?, metadata? }` — which store actually
+holds the facts is a config flip, not a caller concern.
+
+Shipped backends:
+
+- **`mem0`** (default) — wraps [`mem0ai/oss`](https://github.com/mem0ai/mem0)
+  with a canonical pgvector store — one `memory_canonical` row per fact,
+  plus a per-embedder-mode vector table (`memory_vec_openai` /
+  `memory_vec_local`) joined by `memory_id` — so switching embedder modes
+  re-embeds without duplicating the fact text. Includes a
+  worker-thread-isolated local BGE embedder and a cross-model re-embed
+  pass. Implements the optional capabilities (`rememberConversation` —
+  LLM fact-extraction over a chat window — and `invalidate`).
+- **`noop`** — the deliberate "no store": reads come back empty, writes
+  throw `MemoryUnavailableError('memory_backend_disabled')`, `available()`
+  reports `{ ok: false }`. Makes "memory is off" a clean, testable state.
+- **`claude-file`** — reads/writes Claude Code's topic-file memory
+  (`~/.claude/projects/<project>/memory/*.md`) through the same seam
+  (see `claude-file-backend.ts`).
+
+Out-of-lib backends register a factory and become selectable by name:
+
+```ts
+import { registerMemoryBackend, getMemoryBackend } from '@papercusp/memory';
+
+registerMemoryBackend('my-store', () => new MyBackend());
+configureMemory({ …, backend: 'my-store' }); // or a direct instance
+const entries = await getMemoryBackend().search('q', { scope: 'user-1' });
+```
 
 The store core carries **no operator coupling**. Everything host-specific
-is injected once via `configureMemory()`.
+is injected once via `configureMemory()` — including the `backend` choice
+(the Papercusp operator feeds it from `PAPERCUSP_MEMORY_BACKEND`).
 
 ## The host seam — `configureMemory()`
 

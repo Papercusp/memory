@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "mem0-backed persistent memory store core: the mem0ai/oss wrapper, a canonical pgvector store (one memory_canonical row per fact, per-embedder vec tables), a worker-thread-isolated local BGE embedder, and the cross-model re-embed pass. Host-agnostic — the embedded-pg admin URL, LLM credentials, the resolved embedder (pre-built embed fn + mode), and the optional adaptive-instruction hook are injected via configureMemory(). mem0 owns its own pg.Client, so no shared transaction handle is injected. Zero @papercusp/@restart runtime deps.",
+  "description": "Persistent-memory store behind a swappable MemoryBackend seam: neutral remember/search/list/forget/update verbs over {id,text,kind,scope,score,metadata}, a backend registry + selector (configureMemory({backend})), and three shipped impls — mem0 (mem0ai/oss + canonical pgvector store, per-embedder vec tables, local BGE embedder, re-embed pass), noop (clean 'no store'), and claude-file (Claude Code topic-file bridge). Host-agnostic — admin URL, LLM credentials, embedder, and backend choice are injected via configureMemory(). Zero @papercusp/@restart runtime deps.",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "exports": {
