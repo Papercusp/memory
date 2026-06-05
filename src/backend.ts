@@ -50,6 +50,15 @@ export interface RememberOptions {
   kind?: string;
   /** Arbitrary metadata persisted with the entry. */
   metadata?: Record<string, unknown>;
+  /**
+   * Store the text AS-IS — skip any extract/transform step the backend
+   * would otherwise run on write (mem0 maps this to `infer: false`, so
+   * the LLM fact-extraction is bypassed and exactly one entry is
+   * created). Backends that never transform (file stores, noop) ignore
+   * it. Bulk imports of already-curated facts set this so the corpus
+   * lands byte-identical (memory-backend-benchmark D-008).
+   */
+  verbatim?: boolean;
 }
 
 export interface SearchOptions {

@@ -56,3 +56,46 @@ describe('patchEmbedderFactory — mem0ai 3.x custom-embedder compatibility', ()
     expect(() => oss.EmbedderFactory.create('not-a-real-provider', {})).toThrow();
   });
 });
+
+describe('resolveExtractionLlmConfig — stale-key cascade (memory-backend-benchmark D-007)', async () => {
+  const { resolveExtractionLlmConfig, _resetAnthropicKeyProbeCacheForTest } = await import('./mem0-client');
+
+  it('prefers anthropic when the key probes usable', async () => {
+    const cfg = await resolveExtractionLlmConfig(
+      { anthropicKey: 'sk-ant-good', openaiKey: 'sk-oai' },
+      async () => true,
+    );
+    expect(cfg).toMatchObject({ provider: 'anthropic' });
+    expect((cfg!.config as { apiKey: string }).apiKey).toBe('sk-ant-good');
+  });
+
+  it('falls back to openai when the anthropic key is auth-rejected', async () => {
+    const cfg = await resolveExtractionLlmConfig(
+      { anthropicKey: 'sk-ant-stale', openaiKey: 'sk-oai' },
+      async () => false,
+    );
+    expect(cfg).toMatchObject({ provider: 'openai' });
+    expect((cfg!.config as { model: string }).model).toBe('gpt-4o-mini');
+  });
+
+  it('keeps the dead anthropic key when nothing else exists (search/verbatim still work)', async () => {
+    const cfg = await resolveExtractionLlmConfig(
+      { anthropicKey: 'sk-ant-stale', openaiKey: '' },
+      async () => false,
+    );
+    expect(cfg).toMatchObject({ provider: 'anthropic' });
+  });
+
+  it('openai-only and no-keys cases unchanged', async () => {
+    const probe = vi.fn(async () => true);
+    expect(
+      await resolveExtractionLlmConfig({ anthropicKey: '', openaiKey: 'sk-oai' }, probe),
+    ).toMatchObject({ provider: 'openai' });
+    expect(probe).not.toHaveBeenCalled(); // no anthropic key → no probe
+    expect(await resolveExtractionLlmConfig({ anthropicKey: '', openaiKey: '' }, probe)).toBeNull();
+  });
+
+  it('probe-cache hook clears without throwing', () => {
+    _resetAnthropicKeyProbeCacheForTest();
+  });
+});

@@ -231,6 +231,87 @@ function warnOnce(reason: string): void {
 }
 
 /**
+ * Per-key result cache for the Anthropic-key probe. Keyed by the key
+ * STRING, so a rotation (new string) re-probes; an invalid key is never
+ * re-probed in this process. Bounded by the handful of keys a box sees.
+ */
+const _anthropicKeyProbeCache = new Map<string, boolean>();
+
+/**
+ * Cheap auth probe for an Anthropic key (the models endpoint — no
+ * tokens billed). Returns false ONLY on an explicit auth rejection
+ * (401/403); transient/network failures resolve true so an offline box
+ * never loses its extractor over a blip.
+ */
+async function anthropicKeyUsable(
+  key: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<boolean> {
+  const cached = _anthropicKeyProbeCache.get(key);
+  if (cached !== undefined) return cached;
+  let usable = true;
+  try {
+    const r = await fetchImpl('https://api.anthropic.com/v1/models?limit=1', {
+      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+    });
+    usable = !(r.status === 401 || r.status === 403);
+  } catch {
+    usable = true; // network blip — assume usable, don't downgrade
+  }
+  _anthropicKeyProbeCache.set(key, usable);
+  return usable;
+}
+
+/** Test hook — clear the per-key probe cache. */
+export function _resetAnthropicKeyProbeCacheForTest(): void {
+  _anthropicKeyProbeCache.clear();
+}
+
+/**
+ * Resolve mem0's fact-extraction LLM config from the available keys.
+ * A PRESENT-but-rejected Anthropic key no longer kills extraction
+ * (memory-backend-benchmark D-007: a stale credential made every add()
+ * 401 inside mem0, silently swallowed into `{results: []}` — the whole
+ * store looked dead). The cascade now VALIDATES the Anthropic key at
+ * client build (cached per key string) and falls back:
+ *
+ *   anthropic (key present + not auth-rejected)
+ *   → openai gpt-4o-mini (key present)
+ *   → anthropic anyway (dead key, nothing else — extraction will fail,
+ *     but search + verbatim writes still work; warn loud)
+ *   → null (no keys at all)
+ *
+ * Exported for tests (probe injectable); not re-exported from index.ts.
+ */
+export async function resolveExtractionLlmConfig(
+  keys: { anthropicKey: string; openaiKey: string },
+  probe: (key: string) => Promise<boolean> = anthropicKeyUsable,
+): Promise<Record<string, unknown> | null> {
+  const { anthropicKey, openaiKey } = keys;
+  const anthropicOk = anthropicKey ? await probe(anthropicKey) : false;
+  if (anthropicKey && anthropicOk) {
+    return { provider: 'anthropic', config: { apiKey: anthropicKey, model: LLM_MODEL } };
+  }
+  if (openaiKey) {
+    if (anthropicKey) {
+      // Slightly more expensive than Haiku 4.5 ($1.50 vs $0.80/M input),
+      // but a working extractor beats a silently-dead one.
+      warnOnce(
+        'anthropic key rejected (401/403) — falling back to OpenAI gpt-4o-mini for fact extraction; rotate the key at /settings/api-keys',
+      );
+    }
+    return { provider: 'openai', config: { apiKey: openaiKey, model: 'gpt-4o-mini' } };
+  }
+  if (anthropicKey) {
+    warnOnce(
+      'anthropic key rejected (401/403) and no OpenAI key — mem0 fact extraction WILL fail until the key is rotated at /settings/api-keys (search + verbatim writes still work)',
+    );
+    return { provider: 'anthropic', config: { apiKey: anthropicKey, model: LLM_MODEL } };
+  }
+  return null;
+}
+
+/**
  * Try to load the mem0 client. Returns null if dependencies aren't
  * installed, mode is 'disabled', or config can't be assembled.
  */
@@ -277,20 +358,8 @@ async function tryLoad(): Promise<MemoryClient | null> {
   const anthropicKey = creds.anthropic_api_key ?? process.env.ANTHROPIC_API_KEY ?? '';
   const openaiKey = creds.openai_api_key ?? process.env.OPENAI_API_KEY ?? '';
 
-  let llmConfig: Record<string, unknown>;
-  if (anthropicKey) {
-    llmConfig = {
-      provider: 'anthropic',
-      config: { apiKey: anthropicKey, model: LLM_MODEL },
-    };
-  } else if (openaiKey) {
-    // Slightly more expensive than Haiku 4.5 ($1.50 vs $0.80/M input)
-    // but lets the user run mem0 with just one vendor configured.
-    llmConfig = {
-      provider: 'openai',
-      config: { apiKey: openaiKey, model: 'gpt-4o-mini' },
-    };
-  } else {
+  const llmConfig = await resolveExtractionLlmConfig({ anthropicKey, openaiKey });
+  if (!llmConfig) {
     warnOnce('no Anthropic or OpenAI API key in operator-credentials or env (add at /settings/api-keys)');
     return null;
   }

@@ -70,6 +70,17 @@ describe('extractAddedIds', () => {
       }),
     ).toEqual([UUID_A]);
   });
+  it('accepts the infer:false nested metadata.event shape', () => {
+    expect(
+      extractAddedIds({
+        results: [
+          { id: UUID_A, memory: 'raw', metadata: { event: 'ADD' } },
+          { id: UUID_B, memory: 'raw2', metadata: { event: 'NONE' } },
+        ],
+      }),
+    ).toEqual([UUID_A]);
+  });
+
   it('tolerates malformed results', () => {
     expect(extractAddedIds(null)).toEqual([]);
     expect(extractAddedIds(undefined)).toEqual([]);
@@ -182,6 +193,33 @@ describe('Mem0Backend', () => {
       userId: 'harness:papercup',
       metadata: { a: 1, kind: 'project' },
     });
+  });
+
+  it('remember verbatim maps to infer:false and reads the nested metadata.event shape', async () => {
+    // mem0's infer:false branch nests the event under metadata
+    // (returnedMemories.push({ id, memory, metadata: { event: 'ADD' } })) —
+    // verified against mem0ai 3.0.3 dist (D-008).
+    const client = fakeClient({
+      add: vi.fn(async () => ({
+        results: [{ id: UUID_A, memory: 'fact', metadata: { event: 'ADD' } }],
+      })),
+    });
+    const b = new Mem0Backend({ getClient: async () => client });
+    const r = await b.remember('fact', { scope: 'u', verbatim: true });
+    expect(r).toEqual({ ids: [UUID_A], storedEvents: 1 });
+    expect(client.add).toHaveBeenCalledWith('fact', {
+      userId: 'u',
+      metadata: {},
+      infer: false,
+    });
+  });
+
+  it('remember without verbatim does NOT pass infer (mem0 default extraction path)', async () => {
+    const client = fakeClient();
+    const b = new Mem0Backend({ getClient: async () => client });
+    await b.remember('fact', { scope: 'u' });
+    const callOpts = (client.add as ReturnType<typeof vi.fn>).mock.calls[0][1] as Record<string, unknown>;
+    expect('infer' in callOpts).toBe(false);
   });
 
   it('search fans out per scope, maps rows to neutral entries, merges + sorts', async () => {

@@ -47,6 +47,19 @@ const DEFAULT_SEARCH_LIMIT = 8;
 const LIST_TOP_K = 5000;
 
 /**
+ * Read one result row's event. mem0's add() has TWO wire shapes: the
+ * infer (LLM-extraction) path reports a top-level `event`, while the
+ * `infer: false` path nests it as `metadata.event` (verified against
+ * mem0ai 3.0.3 dist — addToVectorStore's no-infer branch). Accept both.
+ */
+function rowEvent(row: { event?: unknown; metadata?: unknown } | null | undefined): string {
+  const direct = row?.event;
+  if (typeof direct === 'string') return direct.toUpperCase();
+  const nested = (row?.metadata as { event?: unknown } | undefined)?.event;
+  return typeof nested === 'string' ? nested.toUpperCase() : '';
+}
+
+/**
  * mem0's `client.add(...)` returns `{ results: Array<{ id, event, … }> }`.
  * Extract the ids of newly-inserted rows ('ADD' events). 'UPDATE' and
  * 'NONE' rows are existing memories the extractor merged into — not new
@@ -55,12 +68,11 @@ const LIST_TOP_K = 5000;
  */
 export function extractAddedIds(result: unknown): string[] {
   const rows = Array.isArray((result as { results?: unknown } | null)?.results)
-    ? ((result as { results: Array<{ id?: unknown; event?: unknown }> }).results)
+    ? ((result as { results: Array<{ id?: unknown; event?: unknown; metadata?: unknown }> }).results)
     : [];
   const out: string[] = [];
   for (const row of rows) {
-    const event = typeof row?.event === 'string' ? row.event.toUpperCase() : '';
-    if (event !== 'ADD') continue;
+    if (rowEvent(row) !== 'ADD') continue;
     const id = typeof row.id === 'string' ? row.id : null;
     if (id && UUID_RE.test(id)) out.push(id);
   }
@@ -78,11 +90,11 @@ export function extractAddedIds(result: unknown): string[] {
  */
 export function extractStoredEventCount(result: unknown): number {
   const rows = Array.isArray((result as { results?: unknown } | null)?.results)
-    ? ((result as { results: Array<{ event?: unknown }> }).results)
+    ? ((result as { results: Array<{ event?: unknown; metadata?: unknown }> }).results)
     : [];
   let n = 0;
   for (const row of rows) {
-    const event = typeof row?.event === 'string' ? row.event.toUpperCase() : '';
+    const event = rowEvent(row);
     if (event === 'ADD' || event === 'UPDATE') n += 1;
   }
   return n;
@@ -141,7 +153,13 @@ export class Mem0Backend implements MemoryBackend {
     const client = await this.client();
     const metadata: Record<string, unknown> = { ...(opts.metadata ?? {}) };
     if (opts.kind !== undefined) metadata.kind = opts.kind;
-    const result = await client.add(text, { userId: opts.scope, metadata });
+    // `verbatim` → mem0's `infer: false`: skip the LLM fact-extraction and
+    // embed + insert the raw text as exactly one ADD (D-008 — bulk seeding).
+    const result = await client.add(text, {
+      userId: opts.scope,
+      metadata,
+      ...(opts.verbatim ? { infer: false } : {}),
+    });
     return { ids: extractAddedIds(result), storedEvents: extractStoredEventCount(result) };
   }
 
