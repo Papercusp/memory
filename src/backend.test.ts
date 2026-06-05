@@ -245,8 +245,11 @@ describe('Mem0Backend', () => {
     const hits = await b.search('q', { scope: ['user-1', 'harness:papercup'], limit: 7 });
 
     expect(client.search).toHaveBeenCalledTimes(2);
-    expect(client.search).toHaveBeenCalledWith('q', { filters: { user_id: 'user-1' }, limit: 7 });
-    expect(client.search).toHaveBeenCalledWith('q', { filters: { user_id: 'harness:papercup' }, limit: 7 });
+    // topK is what mem0's Memory.search actually reads (it ignores `limit`,
+    // defaulting topK to 20 — the silent over-fetch the P-007 bench run
+    // caught); limit rides along for non-mem0 doubles.
+    expect(client.search).toHaveBeenCalledWith('q', { filters: { user_id: 'user-1' }, topK: 7, limit: 7 });
+    expect(client.search).toHaveBeenCalledWith('q', { filters: { user_id: 'harness:papercup' }, topK: 7, limit: 7 });
 
     // de-duped by id keeping the higher-scored hit; sorted desc
     expect(hits.map((h) => h.id)).toEqual([UUID_A, UUID_B]);
