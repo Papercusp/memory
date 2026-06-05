@@ -27,14 +27,20 @@ function roundtripSummary(rts: readonly RoundtripOutcome[]): {
   stored: string; paraphrase: string; update: string; forget: string; nearDup: string;
 } {
   const frac = (f: (r: RoundtripOutcome) => boolean) => `${rts.filter(f).length}/${rts.length}`;
-  const dupCounts = rts.map((r) => r.nearDupNewEntries);
+  // Near-dup behavior is only meaningful for specs whose FIRST write stored
+  // (a backend that stores nothing "merges" nothing — the control must read
+  // '—', not a perfect merge score).
+  const stored = rts.filter((r) => r.stored);
+  const dupCounts = stored.map((r) => r.nearDupNewEntries);
   const merged = dupCounts.filter((c) => c === 0).length;
   return {
     stored: frac((r) => r.stored),
     paraphrase: frac((r) => r.paraphraseFound),
     update: frac((r) => r.updateHonored),
     forget: frac((r) => r.forgetHonored),
-    nearDup: `${merged}/${rts.length} merged` + (dupCounts.some((c) => c < 0) ? ' (some threw)' : ''),
+    nearDup: stored.length === 0
+      ? '—'
+      : `${merged}/${stored.length} merged` + (dupCounts.some((c) => c < 0) ? ' (some threw)' : ''),
   };
 }
 

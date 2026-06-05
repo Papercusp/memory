@@ -28,7 +28,7 @@
  * scope-2026-05-24 plan for the audit that established this.
  */
 
-import { Client as PgClient } from 'pg';
+import { Pool as PgPool } from 'pg';
 
 interface VectorStoreResult {
   id: string;
@@ -71,32 +71,32 @@ function toVectorLiteral(v: number[]): string {
 export class CanonicalVectorStore {
   private cfg: CanonicalStoreConfig;
   private userId = '';
-  private clientPromise: Promise<PgClient> | null = null;
+  // A small Pool, not a single Client: concurrent callers (parallel
+  // memory writes, the bench's concurrent seeding) interleave queries,
+  // which a lone pg.Client only tolerates via a deprecated internal
+  // queue (removed in pg@9). Connection errors surface per query and
+  // retry naturally — no poison-cache to manage.
+  private pool: PgPool | null = null;
 
   constructor(config: CanonicalStoreConfig) {
     this.cfg = config;
   }
 
-  private async getClient(): Promise<PgClient> {
-    if (!this.clientPromise) {
-      this.clientPromise = (async () => {
-        const c = new PgClient({
-          host: this.cfg.host,
-          port: this.cfg.port,
-          user: this.cfg.user,
-          password: this.cfg.password,
-          database: this.cfg.dbname,
-        });
-        await c.connect();
-        return c;
-      })().catch((err) => {
-        // Let the next call retry — transient PG hiccups shouldn't
-        // poison-cache this store.
-        this.clientPromise = null;
-        throw err;
+  private async getClient(): Promise<PgPool> {
+    if (!this.pool) {
+      this.pool = new PgPool({
+        host: this.cfg.host,
+        port: this.cfg.port,
+        user: this.cfg.user,
+        password: this.cfg.password,
+        database: this.cfg.dbname,
+        max: 5,
       });
+      // Don't let a dropped idle connection crash the process — the pool
+      // replaces it on the next query.
+      this.pool.on('error', () => {});
     }
-    return this.clientPromise;
+    return this.pool;
   }
 
   async initialize(): Promise<void> {
@@ -105,19 +105,18 @@ export class CanonicalVectorStore {
   }
 
   /**
-   * Close the cached PG client. The mem0 client is torn down + rebuilt on a
+   * Close the cached PG pool. The mem0 client is torn down + rebuilt on a
    * TTL (1h) and on `invalidateMemoryClient()`; each rebuild constructs a fresh
    * store via the patched VectorStoreFactory. Without this, the prior store's
-   * `pg.Client` is orphaned — a slow connection leak against embedded PG over a
+   * pool is orphaned — a slow connection leak against embedded PG over a
    * long-running operator. Idempotent and tolerant of a never-connected store.
    */
   async dispose(): Promise<void> {
-    const p = this.clientPromise;
-    this.clientPromise = null;
+    const p = this.pool;
+    this.pool = null;
     if (!p) return;
     try {
-      const c = await p;
-      await c.end();
+      await p.end();
     } catch {
       /* already closed, or never connected — nothing to release */
     }

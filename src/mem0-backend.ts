@@ -167,7 +167,12 @@ export class Mem0Backend implements MemoryBackend {
     const client = await this.client();
     const limit = opts.limit ?? DEFAULT_SEARCH_LIMIT;
     const pulls = scopesOf(opts.scope).map(async (scope) => {
-      const r = await client.search(query, { filters: { user_id: scope }, limit });
+      // mem0's Memory.search reads `topK` (default 20) and IGNORES a
+      // `limit` key — passing only `limit` silently over-fetched and
+      // broke the seam's per-scope limit contract (caught by the
+      // memory-backend-benchmark P-007 run). Keep `limit` for any
+      // non-mem0 MemoryClient test doubles.
+      const r = await client.search(query, { filters: { user_id: scope }, topK: limit, limit });
       return (r.results ?? []).map((row) => toEntry(row, scope));
     });
     const merged = mergeById((await Promise.all(pulls)).flat());
