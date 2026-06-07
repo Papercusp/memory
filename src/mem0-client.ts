@@ -48,6 +48,7 @@
 
 import { CanonicalVectorStore } from './canonical-store';
 import { memoryHost, memorySchema } from './config';
+import { FallbackExtractionLlm, type ExtractionLlm } from './extraction-llm';
 
 const LLM_MODEL = 'claude-haiku-4-5';
 // The collectionName is passed to mem0 for its internal bookkeeping
@@ -56,6 +57,7 @@ const MEM0_COLLECTION_PREFIX = 'operator_memory';
 
 let _factoryPatched = false;
 let _embedderFactoryPatched = false;
+let _llmFactoryPatched = false;
 // The host's pre-built embed fn for the CURRENT build. mem0's
 // ConfigManager.mergeConfig strips function-valued fields out of
 // embedder.config during Zod validation, so the patched 'custom'
@@ -161,6 +163,57 @@ export function _setCurrentEmbedFnForTest(
   fn: ((text: string) => Promise<number[]>) | null,
 ): void {
   _currentEmbedFn = fn;
+}
+
+/**
+ * The live extraction LLM the patched 'custom' LLM provider routes to —
+ * same module-var pattern as `_currentEmbedFn` (mem0's mergeConfig Zod
+ * validation strips non-scalar fields out of llm.config, so the instance
+ * can't ride the config object). Set in tryLoad() before each (re)build
+ * when the host supplies a session-backed extractor.
+ */
+let _currentExtractionLlm: ExtractionLlm | null = null;
+
+/**
+ * mem0ai 3.x has NO `custom` LLM provider — `LLMFactory.create` is a
+ * hard-coded switch (openai/anthropic/groq/…) that throws "Unsupported
+ * LLM provider: custom" otherwise. Exactly like VectorStoreFactory and
+ * EmbedderFactory, we patch its static `create` in place: provider
+ * `'custom'` yields a delegator reading `_currentExtractionLlm` live.
+ * Exported for the conformance test (extraction-llm.test.ts) — pinned
+ * there against the REAL mem0ai module so an upstream interface change
+ * fails a test, not production. Not re-exported from index.ts.
+ */
+export function patchLlmFactory(mem0Module: {
+  LLMFactory?: { create: (provider: string, config: Record<string, unknown>) => unknown };
+}): void {
+  if (_llmFactoryPatched) return;
+  const Factory = mem0Module.LLMFactory;
+  if (!Factory || typeof Factory.create !== 'function') {
+    warnOnce('mem0 LLMFactory not patchable (interface changed?); session extraction unavailable');
+    return;
+  }
+  const orig = Factory.create.bind(Factory);
+  Factory.create = (provider: string, config: Record<string, unknown>) => {
+    if (provider === 'custom') {
+      const llm: ExtractionLlm = {
+        generateResponse: (messages, responseFormat, tools) =>
+          _currentExtractionLlm!.generateResponse(messages, responseFormat, tools),
+        generateChat: (messages) => _currentExtractionLlm!.generateChat(messages),
+      };
+      return llm;
+    }
+    return orig(provider, config);
+  };
+  _llmFactoryPatched = true;
+}
+
+/**
+ * Test seam (extraction-llm.test.ts) — set the LLM the patched 'custom'
+ * provider routes to. Not re-exported from index.ts.
+ */
+export function _setCurrentExtractionLlmForTest(llm: ExtractionLlm | null): void {
+  _currentExtractionLlm = llm;
 }
 
 // Exported for Mem0Backend (./mem0-backend.ts), which adapts this raw
@@ -275,18 +328,29 @@ export function _resetAnthropicKeyProbeCacheForTest(): void {
  * store looked dead). The cascade now VALIDATES the Anthropic key at
  * client build (cached per key string) and falls back:
  *
- *   anthropic (key present + not auth-rejected)
+ *   claude-session adapter (host-supplied via getExtractionLlm —
+ *     probe-validated host-side; mem0-extraction-via-claude-session D-002)
+ *   → anthropic (key present + not auth-rejected)
  *   → openai gpt-4o-mini (key present)
  *   → anthropic anyway (dead key, nothing else — extraction will fail,
  *     but search + verbatim writes still work; warn loud)
  *   → null (no keys at all)
+ *
+ * The session rung returns `{provider:'custom'}` — tryLoad() then routes
+ * the patched LLMFactory's 'custom' provider to the session adapter
+ * wrapped in a FallbackExtractionLlm over the key rungs (D-004: an auth
+ * failure demotes loudly mid-process, never silently no-ops).
  *
  * Exported for tests (probe injectable); not re-exported from index.ts.
  */
 export async function resolveExtractionLlmConfig(
   keys: { anthropicKey: string; openaiKey: string },
   probe: (key: string) => Promise<boolean> = anthropicKeyUsable,
+  sessionLlm?: ExtractionLlm | null,
 ): Promise<Record<string, unknown> | null> {
+  if (sessionLlm) {
+    return { provider: 'custom', config: {} };
+  }
   const { anthropicKey, openaiKey } = keys;
   const anthropicOk = anthropicKey ? await probe(anthropicKey) : false;
   if (anthropicKey && anthropicOk) {
@@ -350,17 +414,26 @@ async function tryLoad(): Promise<MemoryClient | null> {
     return null;
   }
 
-  // LLM for fact extraction. Cascade: prefer Anthropic Haiku (cheaper)
-  // if a raw API key is available; fall back to OpenAI gpt-4o-mini
-  // when only OpenAI is configured. Credentials come from the host.
-  // Recoverable failure — don't poison-cache.
+  // LLM for fact extraction. Cascade: the host's session-backed
+  // extractor first (Claude-session anthropic-direct, $0 marginal, no
+  // credential to rot — mem0-extraction-via-claude-session D-001/D-002),
+  // then Anthropic Haiku on a raw API key, then OpenAI gpt-4o-mini.
+  // Credentials come from the host. Recoverable failure — don't
+  // poison-cache.
   const creds = await memoryHost().getCredentials();
   const anthropicKey = creds.anthropic_api_key ?? process.env.ANTHROPIC_API_KEY ?? '';
   const openaiKey = creds.openai_api_key ?? process.env.OPENAI_API_KEY ?? '';
 
-  const llmConfig = await resolveExtractionLlmConfig({ anthropicKey, openaiKey });
+  let sessionLlm: ExtractionLlm | null = null;
+  try {
+    sessionLlm = (await memoryHost().getExtractionLlm?.()) ?? null;
+  } catch (e) {
+    warnOnce(`host getExtractionLlm threw (${(e as Error).message}); using key rungs`);
+  }
+
+  const llmConfig = await resolveExtractionLlmConfig({ anthropicKey, openaiKey }, undefined, sessionLlm);
   if (!llmConfig) {
-    warnOnce('no Anthropic or OpenAI API key in operator-credentials or env (add at /settings/api-keys)');
+    warnOnce('no Claude session and no Anthropic or OpenAI API key in operator-credentials or env (add at /settings/api-keys)');
     return null;
   }
 
@@ -461,10 +534,32 @@ async function tryLoad(): Promise<MemoryClient | null> {
     const mem0 = await dynamicImport<Mem0Module & {
       VectorStoreFactory: { create: (provider: string, config: Record<string, unknown>) => unknown };
       EmbedderFactory?: { create: (provider: string, config: Record<string, unknown>) => unknown };
+      LLMFactory?: { create: (provider: string, config: Record<string, unknown>) => unknown };
     }>(MEM0_PACKAGE);
     patchVectorStoreFactory(mem0);
     _currentEmbedFn = resolved.embed; // feed the patched 'custom' embedder (mem0 strips config.embed)
     patchEmbedderFactory(mem0);
+    if (sessionLlm) {
+      // Session rung live: route the 'custom' LLM provider to the host's
+      // adapter wrapped in the key-rung fallback cascade. The fallback is
+      // built LAZILY (first demotion) via mem0's own factory over the key
+      // config the rungs below the session would have resolved — so a
+      // mid-process auth death lands writes on the next rung within the
+      // same call (D-004), never a silent no-op.
+      patchLlmFactory(mem0);
+      _currentExtractionLlm = new FallbackExtractionLlm(
+        sessionLlm,
+        async () => {
+          const cfg = await resolveExtractionLlmConfig({ anthropicKey, openaiKey });
+          if (!cfg || !mem0.LLMFactory) return null;
+          return mem0.LLMFactory.create(
+            cfg.provider as string,
+            cfg.config as Record<string, unknown>,
+          ) as ExtractionLlm;
+        },
+        { warn: warnOnce, primaryLabel: 'claude-session extraction' },
+      );
+    }
     const { Memory } = mem0;
     _client = new Memory({
       embedder: embedderConfig,

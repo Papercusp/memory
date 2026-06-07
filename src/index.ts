@@ -30,6 +30,20 @@ export {
   invalidateMemoryClient,
 } from './mem0-client';
 
+// Injectable fact-extraction LLM seam (mem0-extraction-via-claude-session
+// D-003): hosts implement `ExtractionLlm` (mem0ai's LLM shape) and hand it
+// back from `MemoryHost.getExtractionLlm` to become cascade rung #1.
+// `ExtractionAuthError` is the typed throw that triggers a STICKY demotion
+// to the key rungs (D-004); `FallbackExtractionLlm` is the cascade wrapper
+// (exported for hosts that compose their own cascades + for tests).
+export {
+  ExtractionAuthError,
+  FallbackExtractionLlm,
+  type ExtractionLlm,
+  type ExtractionLlmMessage,
+  type ExtractionLlmResponse,
+} from './extraction-llm';
+
 // The neutral, swappable store seam (generalize-memory-backend-swappable
 // D-001/D-002/D-004). Consumers call getMemoryBackend() and the neutral
 // verbs; which store serves them is the host's `backend` config flip.

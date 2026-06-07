@@ -70,6 +70,19 @@ export interface MemoryHost {
   getLearningInstructions?: () => Promise<string | undefined>;
 
   /**
+   * Optional: a host-provided fact-extraction LLM — cascade rung #1,
+   * ahead of the API-key rungs (mem0-extraction-via-claude-session
+   * D-002/D-003). The operator supplies `SessionExtractionLlm` riding
+   * the Claude-session `anthropic-direct` transport; other hosts can
+   * supply anything implementing mem0ai's LLM shape. Return `null`
+   * when unavailable (no session, liveness probe failed, rung demoted)
+   * — the key cascade then resolves exactly as before. Called on every
+   * client (re)build, so a mid-process demotion takes effect at the
+   * next TTL rebuild too.
+   */
+  getExtractionLlm?: () => Promise<import('./extraction-llm').ExtractionLlm | null>;
+
+  /**
    * Postgres schema holding the memory tables (`memory_canonical` +
    * `memory_vec_*`). Default `'public'`. The host's migration must create
    * the tables in this schema. The operator passes `'harness_shared'`.
