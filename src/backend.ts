@@ -72,6 +72,18 @@ export interface SearchOptions {
   scope: string | readonly string[];
   /** Max hits per scope pool. Backend default applies when omitted. */
   limit?: number;
+  /**
+   * Relevance floor (memory-backend-improve-and-hybrid P-001). Opt-in, applied
+   * on the auto-inject (push) path where no LLM filters the result (D-003): a
+   * hit below the floor is dropped, so an out-of-corpus query returns nothing
+   * instead of nearest-neighbour noise (the bench's hard-negative FP@5 fix).
+   * `minScore` is an ABSOLUTE floor on the backend's score scale (cosine
+   * similarity for the canonical/mem0 store); `minScoreRatio` is a RELATIVE
+   * floor (× the top hit's score). The stricter of the two wins. Backends
+   * whose score scale differs (or that don't score) ignore these.
+   */
+  minScore?: number;
+  minScoreRatio?: number;
 }
 
 export interface ListOptions {

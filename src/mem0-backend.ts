@@ -22,6 +22,7 @@
  * friends; this adapter only translates shapes.
  */
 
+import { applyScoreFloor } from './score-floor';
 import {
   MemoryUnavailableError,
   scopesOf,
@@ -166,6 +167,13 @@ export class Mem0Backend implements MemoryBackend {
   async search(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
     const client = await this.client();
     const limit = opts.limit ?? DEFAULT_SEARCH_LIMIT;
+    // Scope invariant (P-003): every search fans out per scope with a `user_id`
+    // filter, so a query only ever races its OWN pool (a user / harness / project),
+    // never the whole table. This is what keeps recall up at scale — the bench's
+    // 10k single-pool MRR collapse (0.86→0.05) is a NO-scoping worst case that
+    // scoping structurally avoids. A re-rank pass would only matter if one scope
+    // ever neared ~1k entries (not the case today). An empty scope produces zero
+    // pulls (scopesOf drops blanks), never an unscoped full-table scan.
     const pulls = scopesOf(opts.scope).map(async (scope) => {
       // mem0's Memory.search reads `topK` (default 20) and IGNORES a
       // `limit` key — passing only `limit` silently over-fetched and
@@ -175,8 +183,12 @@ export class Mem0Backend implements MemoryBackend {
       const r = await client.search(query, { filters: { user_id: scope }, topK: limit, limit });
       return (r.results ?? []).map((row) => toEntry(row, scope));
     });
-    const merged = mergeById((await Promise.all(pulls)).flat());
-    return merged.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    const ranked = mergeById((await Promise.all(pulls)).flat()).sort(
+      (a, b) => (b.score ?? 0) - (a.score ?? 0),
+    );
+    // Relevance floor (P-001 / D-003): drop hits too weak to be real matches, so
+    // an out-of-corpus query returns nothing instead of nearest-neighbour noise.
+    return applyScoreFloor(ranked, { minScore: opts.minScore, minScoreRatio: opts.minScoreRatio });
   }
 
   async list(opts: ListOptions): Promise<MemoryEntry[]> {
