@@ -89,10 +89,17 @@ export function fuse(
   // CROSS-LEG IDENTITY: the cosine leg (canonical store) and the lexical leg
   // (its projection) assign DIFFERENT native ids to the SAME memory, so dedup by
   // a shared key, not the native id — else one fact surfaces twice (once per leg).
-  // The write-through stamps `metadata.link_id` = the canonical id on the lexical
-  // projection; fall back to the native id when there's no link (single-leg hits).
-  const keyOf = (e: MemoryEntry): string | undefined =>
-    (typeof e.metadata?.link_id === 'string' ? (e.metadata.link_id as string) : undefined) ?? e.id;
+  // Two shared keys, in priority order:
+  //   1. `metadata.link_id` — the canonical id the write-through stamps onto a
+  //      projection (covers FUTURE hybrid writes, where mem0 extraction may
+  //      reword the cosine text so it no longer matches the lexical text);
+  //   2. normalized verbatim TEXT — covers a MIGRATED corpus, where the same
+  //      fact was stored verbatim in both legs (identical text) WITHOUT mutating
+  //      the source files (so `~/.claude` is kept exactly as-is).
+  const norm = (t: string): string => t.trim().replace(/\s+/g, ' ');
+  const keyOf = (e: MemoryEntry): string =>
+    (typeof e.metadata?.link_id === 'string' ? (e.metadata.link_id as string) : undefined) ??
+    (e.text ? norm(e.text) : e.id);
 
   // Lexical rank (1-based) + the lexical entry, keyed by cross-leg key (first wins).
   const lexRank = new Map<string, number>();

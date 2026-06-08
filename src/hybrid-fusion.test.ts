@@ -96,4 +96,21 @@ describe('fuse — cross-leg dedup via metadata.link_id', () => {
     const out = fuse([], [linked('file_x', 'canon-absent', 0.8)], { mode: 'floored-union', minLexScore: 0.5 });
     expect(out.map((x) => x.id)).toEqual(['file_x']);
   });
+
+  it('MIGRATED case: same verbatim TEXT, different ids, NO link_id → still dedupes to one', () => {
+    // The migration stores a fact verbatim in BOTH legs (cosine PG + ~/.claude file)
+    // without mutating the file, so there is no link_id — identical text is the key.
+    const cos: MemoryEntry = { id: 'pg-uuid-1', text: 'the user prefers nuqs over useState', scope: 's', score: 0.6 };
+    const lex: MemoryEntry = { id: 'file_nuqs', text: '  the user prefers nuqs over useState ', scope: 's', score: 0.9 };
+    const out = fuse([cos], [lex], { mode: 'floored-union' });
+    expect(out.length).toBe(1);            // deduped on normalized text (whitespace-insensitive)
+    expect(out[0].id).toBe('pg-uuid-1');   // canonical (cosine) entry kept
+  });
+
+  it('different text is NOT merged by the text key', () => {
+    const cos: MemoryEntry = { id: 'x', text: 'fact about redis', scope: 's', score: 0.6 };
+    const lex: MemoryEntry = { id: 'y', text: 'fact about postgres', scope: 's', score: 0.9 };
+    const out = fuse([cos], [lex], { mode: 'floored-union', minLexScore: 0.5 });
+    expect(out.map((e) => e.id).sort()).toEqual(['x', 'y']);
+  });
 });

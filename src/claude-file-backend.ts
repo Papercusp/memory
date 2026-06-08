@@ -58,7 +58,11 @@ import {
 export const CLAUDE_FILE_BACKEND_NAME = 'claude-file';
 export const MEMORY_DIR_MISSING_REASON = 'memory_dir_missing';
 
-const INDEX_FILE = 'MEMORY.md';
+// Generated index files — projections of the topic files, never data entries.
+// MEMORY.md is the always-loaded index; MEMORY-overflow.md is the on-demand
+// overflow index (memory-compact tiering). Both must be skipped when reading
+// entries, or the index text leaks in as a bogus "memory".
+const INDEX_FILES = new Set(['MEMORY.md', 'MEMORY-overflow.md']);
 const ARCHIVE_DIR = 'archive';
 const DEFAULT_SEARCH_LIMIT = 10;
 
@@ -242,7 +246,7 @@ export class ClaudeFileMemoryBackend implements MemoryBackend {
     if (!fs.existsSync(this.dir)) return [];
     const out: LoadedEntry[] = [];
     for (const d of fs.readdirSync(this.dir, { withFileTypes: true })) {
-      if (!d.isFile() || !d.name.endsWith('.md') || d.name === INDEX_FILE) continue;
+      if (!d.isFile() || !d.name.endsWith('.md') || INDEX_FILES.has(d.name)) continue;
       const loaded = this.load(d.name);
       if (loaded) out.push(loaded);
     }
