@@ -56,6 +56,13 @@ export interface FusionOptions {
    * hard-negative false positives. No effect in cosine-gated mode.
    */
   minLexScore?: number;
+  /**
+   * Weight on the LEXICAL leg's RRF contribution (default 1 = democratic RRF).
+   * >1 trusts the lexical leg more — sharpens exact-identifier recall (the lexical
+   * leg ranks identifiers perfectly) toward its ceiling, at the risk of promoting
+   * lexical token-noise. Swept in P-031b; the cosine leg's weight is fixed at 1.
+   */
+  lexWeight?: number;
 }
 
 /**
@@ -71,6 +78,7 @@ export function fuse(
   const k = opts.k ?? DEFAULT_RRF_K;
   const mode = opts.mode ?? 'floored-union';
   const minLex = opts.minLexScore ?? DEFAULT_MIN_LEX_SCORE;
+  const lexWeight = opts.lexWeight ?? 1;
 
   // Lexical rank (1-based) + the lexical entry, keyed by id (first occurrence).
   const lexRank = new Map<string, number>();
@@ -103,7 +111,7 @@ export function fuse(
   const fused = [...candidate.entries()].map(([id, e]) => {
     const cr = cosRank.get(id);
     const lr = lexRank.get(id);
-    const score = (cr !== undefined ? 1 / (k + cr) : 0) + (lr !== undefined ? 1 / (k + lr) : 0);
+    const score = (cr !== undefined ? 1 / (k + cr) : 0) + (lr !== undefined ? lexWeight / (k + lr) : 0);
     return { ...e, score };
   });
   fused.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));

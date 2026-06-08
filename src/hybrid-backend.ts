@@ -52,6 +52,8 @@ export interface HybridBackendOptions {
   fusionMode?: FusionMode;
   /** Lexical admission bar for floored-union (normalized 0..1, default 0.5). */
   minLexScore?: number;
+  /** Weight on the lexical leg's RRF contribution (default 1; >1 favors exact-id). */
+  lexWeight?: number;
 }
 
 export class HybridBackend implements MemoryBackend {
@@ -116,6 +118,7 @@ export class HybridBackend implements MemoryBackend {
       k: this.opts.rrfK ?? DEFAULT_RRF_K,
       mode,
       ...(minLexScore !== undefined ? { minLexScore } : {}),
+      ...(this.opts.lexWeight !== undefined ? { lexWeight: this.opts.lexWeight } : {}),
     });
     return opts.limit !== undefined ? fused.slice(0, opts.limit) : fused;
   }
