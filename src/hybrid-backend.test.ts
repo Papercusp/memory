@@ -55,8 +55,18 @@ describe('HybridBackend (P-020)', () => {
     const cosine = fakeBackend('cosine', [e('para', 0.55)]);
     const lexical = fakeBackend('lexical', [e('weak', 0.3)]);
     const hy = new HybridBackend(lexical, cosine);
-    const out = await hy.search('q', { scope: 's', minScore: 0.45 });
+    // Per-call minLexScore override (0.5) — 0.3 is below it → excluded.
+    const out = await hy.search('q', { scope: 's', minScore: 0.45, minLexScore: 0.5 });
     expect(out.map((x) => x.id)).toEqual(['para']); // weak lexical-only excluded
+  });
+
+  it('per-call minLexScore override beats the constructor/default bar', async () => {
+    const cosine = fakeBackend('cosine', [e('para', 0.55)]);
+    const lexical = fakeBackend('lexical', [e('mid', 0.35)]);
+    // Default bar 0.30 would admit 0.35; a per-call 0.50 override rejects it.
+    const hy = new HybridBackend(lexical, cosine);
+    expect((await hy.search('q', { scope: 's' })).map((x) => x.id).sort()).toEqual(['mid', 'para']);
+    expect((await hy.search('q', { scope: 's', minLexScore: 0.5 })).map((x) => x.id)).toEqual(['para']);
   });
 
   it('cosine-gated mode: a lexical-only hit is NEVER admitted, even when strong', async () => {

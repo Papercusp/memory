@@ -30,8 +30,16 @@
 import type { MemoryEntry } from './backend';
 
 export const DEFAULT_RRF_K = 60;
-/** Default lexical admission bar for floored-union (normalized scoreEntry 0..1). */
-export const DEFAULT_MIN_LEX_SCORE = 0.5;
+/**
+ * Default lexical admission bar for floored-union (normalized scoreEntry 0..1).
+ * Locked at 0.30 by the P-031 2D sweep (D-006): genuine exact-identifier matches
+ * score 0.33–0.96 on the lexical leg (long queries dilute the normalized score),
+ * so 0.30 ADMITS them — lifting exact-id MRR to 0.94–0.96 (≈ the lexical leg's
+ * ceiling) vs 0.87 at a 0.40 bar. This is the recall-favoring default for the
+ * pull path (where an LLM judges relevance); the no-LLM push path tightens it to
+ * 0.40 + a score floor for precision (injection.ts, the read-gate split D-003).
+ */
+export const DEFAULT_MIN_LEX_SCORE = 0.3;
 
 export type FusionMode = 'floored-union' | 'cosine-gated';
 
