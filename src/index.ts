@@ -60,6 +60,8 @@ export {
 } from './backend';
 export { Mem0Backend, extractAddedIds, type Mem0BackendDeps } from './mem0-backend';
 export { applyScoreFloor, type ScoreFloorOptions } from './score-floor';
+export { HybridBackend, type HybridBackendOptions } from './hybrid-backend';
+export { fuseCosineGated, DEFAULT_RRF_K } from './hybrid-fusion';
 export { NoopBackend, NOOP_DISABLED_REASON } from './noop-backend';
 // The Claude Code topic-file bridge (generalize-memory-backend-swappable
 // D-005 / claude-memory-projection-integration P-004): read/write the
