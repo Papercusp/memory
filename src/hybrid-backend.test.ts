@@ -71,4 +71,31 @@ describe('HybridBackend (P-020)', () => {
     await hy.search('q', { scope: 's', limit: 6, minScore: 0.42 });
     expect(search.mock.calls[0]?.[1]).toMatchObject({ minScore: 0.42 });
   });
+
+  it('cross-backend by construction: a remember via one client is recallable via another (P-022 / D-002)', async () => {
+    // One shared canonical (cosine) store; two HybridBackends over it model two
+    // different MCP clients (e.g. claude-su + codex-su) hitting the same operator.
+    const store: MemoryEntry[] = [];
+    const canonical: MemoryBackend = {
+      name: 'canonical',
+      available: async () => ({ ok: true }),
+      remember: async (text, opts) => {
+        const id = `c${store.length}`;
+        store.push({ id, text, scope: opts.scope as string, score: 0.7 });
+        return { ids: [id] };
+      },
+      search: async (q) => store.filter((e) => e.text.includes(q)),
+      list: async () => store,
+      get: async (id) => store.find((e) => e.id === id) ?? null,
+      forget: async () => {},
+      update: async () => {},
+    };
+    const clientA = new HybridBackend(fakeBackend('lexical', []), canonical);
+    const clientB = new HybridBackend(fakeBackend('lexical', []), canonical);
+
+    await clientA.remember('the user prefers nuqs', { scope: 's' });
+    // Client B (a different client instance) recalls A's write from the one store.
+    const recalled = await clientB.search('nuqs', { scope: 's', minScore: 0.45 });
+    expect(recalled.map((r) => r.text)).toEqual(['the user prefers nuqs']);
+  });
 });

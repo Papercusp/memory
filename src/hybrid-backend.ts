@@ -11,10 +11,17 @@
  *   cosine leg (FP-floored by SearchOptions.minScore) is the gate; the lexical
  *   leg only re-ranks, so a hard-negative still returns empty.
  * - WRITES (remember/forget/update/list/get) delegate to the COSINE backend —
- *   the canonical PG store — so the hybrid is cross-backend by construction
- *   (any client's `memory:*` call reaches the same store, D-002) and the two
- *   legs never diverge. The lexical leg searches the same memories projected
- *   into its form (the claude topic files, kept in sync by the P-022 projection).
+ *   the canonical PG store — so the hybrid is cross-backend BY CONSTRUCTION: any
+ *   client's `memory:*` call (claude/omp/codex all hit the same operator) lands
+ *   in the one shared store, and a remember from any client is recallable from
+ *   all three (D-002). The lexical leg searches the same memories once they are
+ *   projected into its native form (the claude topic files). In the bench both
+ *   legs are seeded identically, so fusion is exercised directly; in production
+ *   that native-surface projection of the canonical store into each client's
+ *   auto-inject surface rides the owner-deferred mem0 revive (P-022 /
+ *   docs-and-memory-as-projections D-008) — until then the lexical leg only
+ *   re-ranks what is already in the native store and the cosine gate carries
+ *   recall, so the hybrid degrades cleanly to cosine-only for un-projected writes.
  * - `available()` tracks the cosine leg (the source of truth + write target); a
  *   missing/cold lexical leg just degrades search to cosine-only.
  */
