@@ -86,37 +86,48 @@ export function fuse(
   const minLex = opts.minLexScore ?? DEFAULT_MIN_LEX_SCORE;
   const lexWeight = opts.lexWeight ?? 1;
 
-  // Lexical rank (1-based) + the lexical entry, keyed by id (first occurrence).
+  // CROSS-LEG IDENTITY: the cosine leg (canonical store) and the lexical leg
+  // (its projection) assign DIFFERENT native ids to the SAME memory, so dedup by
+  // a shared key, not the native id — else one fact surfaces twice (once per leg).
+  // The write-through stamps `metadata.link_id` = the canonical id on the lexical
+  // projection; fall back to the native id when there's no link (single-leg hits).
+  const keyOf = (e: MemoryEntry): string | undefined =>
+    (typeof e.metadata?.link_id === 'string' ? (e.metadata.link_id as string) : undefined) ?? e.id;
+
+  // Lexical rank (1-based) + the lexical entry, keyed by cross-leg key (first wins).
   const lexRank = new Map<string, number>();
   const lexEntry = new Map<string, MemoryEntry>();
   lexicalHits.forEach((e, i) => {
-    if (e.id && !lexRank.has(e.id)) {
-      lexRank.set(e.id, i + 1);
-      lexEntry.set(e.id, e);
+    const key = keyOf(e);
+    if (key && !lexRank.has(key)) {
+      lexRank.set(key, i + 1);
+      lexEntry.set(key, e);
     }
   });
 
-  // Candidate set + each candidate's cosine rank (undefined = lexical-only).
+  // Candidate set + each candidate's cosine rank (undefined = lexical-only). The
+  // COSINE entry wins the slot when a memory is in both legs (it's canonical).
   const cosRank = new Map<string, number>();
   const candidate = new Map<string, MemoryEntry>();
   cosineHits.forEach((e, i) => {
-    if (!e.id) return;
-    cosRank.set(e.id, i + 1);
-    candidate.set(e.id, e);
+    const key = keyOf(e);
+    if (!key) return;
+    if (!cosRank.has(key)) cosRank.set(key, i + 1); // first (best) rank per memory
+    if (!candidate.has(key)) candidate.set(key, e);
   });
   if (mode === 'floored-union') {
     // Admit lexical-ONLY hits that clear the identifier-precision bar.
-    for (const [id, rank] of lexRank) {
-      if (candidate.has(id)) continue;
-      const e = lexEntry.get(id)!;
-      if ((e.score ?? 0) >= minLex) candidate.set(id, e);
+    for (const [key, rank] of lexRank) {
+      if (candidate.has(key)) continue;
+      const e = lexEntry.get(key)!;
+      if ((e.score ?? 0) >= minLex) candidate.set(key, e);
       void rank;
     }
   }
 
-  const fused = [...candidate.entries()].map(([id, e]) => {
-    const cr = cosRank.get(id);
-    const lr = lexRank.get(id);
+  const fused = [...candidate.entries()].map(([key, e]) => {
+    const cr = cosRank.get(key);
+    const lr = lexRank.get(key);
     const score = (cr !== undefined ? 1 / (k + cr) : 0) + (lr !== undefined ? lexWeight / (k + lr) : 0);
     return { ...e, score };
   });

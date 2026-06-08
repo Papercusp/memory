@@ -122,6 +122,16 @@ describe('HybridBackend (P-020)', () => {
     expect(out.ids).toEqual(['c1']);
   });
 
+  it('write-through stamps link_id = canonical id onto the lexical projection (for cross-leg dedup)', async () => {
+    const cosine = fakeBackend('cosine', [], { remember: async () => ({ ids: ['canon-9'] }) });
+    const lexRemember = vi.fn(async () => ({ ids: ['l'] }));
+    const lexical = fakeBackend('lexical', [], { remember: lexRemember });
+    const hy = new HybridBackend(lexical, cosine);
+    await hy.remember('a fact', { scope: 's', metadata: { kind: 'x' } });
+    // lexical write carries the original metadata PLUS link_id = the canonical id.
+    expect(lexRemember.mock.calls[0]?.[1]?.metadata).toMatchObject({ kind: 'x', link_id: 'canon-9' });
+  });
+
   it('passes the FP floor through to the cosine leg', async () => {
     const search = vi.fn(async () => [e('a', 0.6)]);
     const cosine = fakeBackend('cosine', [], { search });

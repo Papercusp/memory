@@ -71,3 +71,29 @@ describe('fuse — floored-union (P-031)', () => {
     expect(out.map((x) => x.id).sort()).toEqual(['exact', 'para']);
   });
 });
+
+describe('fuse — cross-leg dedup via metadata.link_id', () => {
+  const linked = (id: string, linkId: string, score: number): MemoryEntry => ({
+    id, text: id, scope: 's', score, metadata: { link_id: linkId },
+  });
+
+  it('a memory in BOTH legs (shared link_id) collapses to ONE result, keeping the canonical entry', () => {
+    const cosineHit = e('canon-1', 0.6);                 // canonical id
+    const lexicalHit = linked('file_slug', 'canon-1', 0.9); // projection, link_id → canonical
+    const out = fuse([cosineHit], [lexicalHit], { mode: 'floored-union' });
+    expect(out.length).toBe(1);            // not 2 — deduped across legs
+    expect(out[0].id).toBe('canon-1');     // canonical (cosine) entry kept
+    expect(out[0].score).toBeCloseTo(1 / 61 + 1 / 61, 6); // got BOTH legs' rank boost
+  });
+
+  it('distinct memories (no shared key) are NOT collapsed', () => {
+    const out = fuse([e('a', 0.6)], [e('b', 0.9)], { mode: 'floored-union', minLexScore: 0.5 });
+    expect(out.map((x) => x.id).sort()).toEqual(['a', 'b']); // b admitted (0.9 ≥ 0.5), both kept
+  });
+
+  it('a lexical-only projection (link_id to a cosine MISS) is still admitted once', () => {
+    // cosine missed it entirely; lexical has it with a link to an absent canonical id.
+    const out = fuse([], [linked('file_x', 'canon-absent', 0.8)], { mode: 'floored-union', minLexScore: 0.5 });
+    expect(out.map((x) => x.id)).toEqual(['file_x']);
+  });
+});

@@ -79,7 +79,15 @@ export class HybridBackend implements MemoryBackend {
     // no ~/.claude dir) is non-fatal — the cosine gate still carries recall.
     // forget/update target the canonical leg; the lexical projection is
     // reconciled by re-projection, not per-delete id-mapping (P-022 / D-002).
-    try { await this.lexical.remember(text, opts); } catch { /* projection is best-effort */ }
+    //
+    // Stamp `link_id` = the canonical id onto the projection so fusion can DEDUPE
+    // a memory that surfaces from BOTH legs (the legs assign different native ids
+    // to the same fact; without a shared key it would appear twice in recall).
+    const linkId = result.ids[0];
+    const lexOpts: RememberOptions = linkId
+      ? { ...opts, metadata: { ...(opts.metadata ?? {}), link_id: linkId } }
+      : opts;
+    try { await this.lexical.remember(text, lexOpts); } catch { /* projection is best-effort */ }
     return result;
   }
 
