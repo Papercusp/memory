@@ -58,14 +58,15 @@ export interface FusionOptions {
   minLexScore?: number;
   /**
    * Weight on the LEXICAL leg's RRF contribution (default 1 = democratic RRF;
-   * the cosine leg's weight is fixed at 1). >1 trusts the lexical leg more, which
-   * should sharpen exact-identifier recall (the lexical leg ranks identifiers
-   * near-perfectly) toward its ceiling, at the risk of promoting lexical
-   * token-noise (eroding paraphrase + raising hard-neg FP). A TUNING LEVER, left
-   * at the neutral default 1 — a clean sweep to pick a value is NOT YET DONE
-   * (the P-031 attempt was blocked by an intermittently-degraded embedder on the
-   * loaded shared box; see plan D-007). Don't change the default without a clean
-   * bench run that confirms the exact-id gain doesn't cost paraphrase/precision.
+   * the cosine leg's weight is fixed at 1). >1 trusts the lexical leg more.
+   * MEASURED (P-031b sweep, local-BGE bench so OpenAI 503s couldn't contaminate
+   * it; see plan D-007): lexWeight ≥ 2 lifts exact-identifier MRR to the lexical
+   * leg's 1.00 CEILING (from 0.94 at w1) but COSTS ~0.08 paraphrase MRR
+   * (0.73→0.65), and it SATURATES at 2 (w4/w8 identical). Net overall MRR is
+   * slightly LOWER (0.82 vs 0.84) — the paraphrase loss outweighs the exact-id
+   * gain — so the default stays 1 (best aggregate quality). Raise it only for an
+   * exact-identifier-heavy workload that genuinely values 1.00 exact-id over
+   * paraphrase recall.
    */
   lexWeight?: number;
 }
