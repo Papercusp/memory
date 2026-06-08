@@ -56,8 +56,18 @@ export class HybridBackend implements MemoryBackend {
     return this.cosine.available();
   }
 
-  remember(text: string, opts: RememberOptions): Promise<{ ids: string[]; storedEvents?: number }> {
-    return this.cosine.remember(text, opts);
+  async remember(text: string, opts: RememberOptions): Promise<{ ids: string[]; storedEvents?: number }> {
+    // The CANONICAL write — the cosine (PG) store owns ids + durability.
+    const result = await this.cosine.remember(text, opts);
+    // Write-through PROJECTION into the lexical native surface so its leg can
+    // serve exact-identifier reads over the SAME memories the cosine leg sees
+    // (otherwise the lexical leg is empty and the hybrid degrades to cosine-only,
+    // losing the exact-id column). Best-effort: a cold/missing lexical leg (e.g.
+    // no ~/.claude dir) is non-fatal — the cosine gate still carries recall.
+    // forget/update target the canonical leg; the lexical projection is
+    // reconciled by re-projection, not per-delete id-mapping (P-022 / D-002).
+    try { await this.lexical.remember(text, opts); } catch { /* projection is best-effort */ }
+    return result;
   }
 
   get(id: string): Promise<MemoryEntry | null> {

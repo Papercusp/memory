@@ -53,15 +53,36 @@ describe('HybridBackend (P-020)', () => {
     expect((await hy.search('q', { scope: 's' })).map((x) => x.id)).toEqual(['a', 'b']);
   });
 
-  it('delegates writes to the cosine (canonical) leg — cross-backend by construction', async () => {
+  it('writes the canonical id from the cosine leg; forget/update target it', async () => {
     const remember = vi.fn(async () => ({ ids: ['1'] }));
     const forget = vi.fn(async () => {});
     const cosine = fakeBackend('cosine', [], { remember, forget });
     const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
-    await hy.remember('fact', { scope: 's' });
+    const out = await hy.remember('fact', { scope: 's' });
     await hy.forget('1');
     expect(remember).toHaveBeenCalledOnce();
+    expect(out.ids).toEqual(['1']); // canonical (cosine) ids are returned
     expect(forget).toHaveBeenCalledWith('1');
+  });
+
+  it('write-throughs the projection into the lexical leg (best-effort), still returns cosine ids', async () => {
+    const cosineRemember = vi.fn(async () => ({ ids: ['c1'] }));
+    const lexicalRemember = vi.fn(async () => ({ ids: ['l1'] }));
+    const cosine = fakeBackend('cosine', [], { remember: cosineRemember });
+    const lexical = fakeBackend('lexical', [], { remember: lexicalRemember });
+    const hy = new HybridBackend(lexical, cosine);
+    const out = await hy.remember('the marker token kestrel-7', { scope: 's' });
+    expect(cosineRemember).toHaveBeenCalledOnce();
+    expect(lexicalRemember).toHaveBeenCalledOnce(); // projected to the native surface
+    expect(out.ids).toEqual(['c1']); // canonical store owns ids
+  });
+
+  it('a throwing lexical projection is non-fatal — the canonical write still succeeds', async () => {
+    const cosine = fakeBackend('cosine', [], { remember: async () => ({ ids: ['c1'] }) });
+    const lexical = fakeBackend('lexical', [], { remember: async () => { throw new Error('no ~/.claude dir'); } });
+    const hy = new HybridBackend(lexical, cosine);
+    const out = await hy.remember('fact', { scope: 's' });
+    expect(out.ids).toEqual(['c1']);
   });
 
   it('passes the FP floor through to the cosine leg', async () => {
