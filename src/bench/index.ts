@@ -36,6 +36,15 @@ export {
 
 export { seedCorpus, unseedCorpus, type SeedOptions } from './seed';
 export { rankedCorpusKeys, runGoldSet, type RetrievalOptions } from './retrieval';
+export {
+  queryLevelPRF,
+  runFloorSweep,
+  renderFloorSweepMarkdown,
+  type FloorPoint,
+  type FloorSweepOptions,
+  type FloorSweepResult,
+  type QueryPRF,
+} from './floor-sweep';
 export { distinctiveToken, runRoundtrips, type RoundtripOptions } from './roundtrip';
 export { generateSyntheticCorpus, mulberry32 } from './synthetic';
 export { rememberP50, renderScorecardMarkdown } from './scorecard';

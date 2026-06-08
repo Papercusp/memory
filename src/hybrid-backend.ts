@@ -7,9 +7,13 @@
  * (claude-file exact-id MRR 0.99 + mem0 paraphrase 5/6) instead of a lossy
  * either/or (D-001).
  *
- * - READS fuse via cosine-gated reciprocal-rank fusion (see hybrid-fusion): the
- *   cosine leg (FP-floored by SearchOptions.minScore) is the gate; the lexical
- *   leg only re-ranks, so a hard-negative still returns empty.
+ * - READS fuse via reciprocal-rank fusion (see hybrid-fusion). DEFAULT mode is
+ *   `floored-union`: the result is the FP-floored cosine hits (SearchOptions.minScore)
+ *   UNION the lexical hits that clear the identifier-precision bar (minLexScore) —
+ *   so an exact-id target the cosine leg missed is still captured (the lexical leg
+ *   is a co-equal recall source, not just a re-ranker), while a hard-negative floors
+ *   away in cosine AND fails the lexical bar → empty. `cosine-gated` mode (lexical
+ *   re-ranks only, never admits) stays selectable for the strictest discipline.
  * - WRITES (remember/forget/update/list/get) delegate to the COSINE backend —
  *   the canonical PG store — so the hybrid is cross-backend BY CONSTRUCTION: any
  *   client's `memory:*` call (claude/omp/codex all hit the same operator) lands
@@ -34,13 +38,20 @@ import type {
   SearchOptions,
   UpdatePatch,
 } from './backend';
-import { DEFAULT_RRF_K, fuseCosineGated } from './hybrid-fusion';
+import { DEFAULT_RRF_K, fuse, type FusionMode } from './hybrid-fusion';
 
 export interface HybridBackendOptions {
   /** RRF damping constant (default 60). */
   rrfK?: number;
-  /** How many lexical hits to pull for re-ranking (default 3× the search limit). */
+  /** How many lexical hits to pull for re-ranking / union (default 3× the search limit). */
   lexicalDepth?: number;
+  /**
+   * Fusion mode (default 'floored-union' — admits strong lexical-only hits so the
+   * exact-identifier column is captured, not capped at the cosine leg's recall).
+   */
+  fusionMode?: FusionMode;
+  /** Lexical admission bar for floored-union (normalized 0..1, default 0.5). */
+  minLexScore?: number;
 }
 
 export class HybridBackend implements MemoryBackend {
@@ -87,15 +98,23 @@ export class HybridBackend implements MemoryBackend {
   }
 
   async search(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
-    // The cosine leg carries the FP floor (opts.minScore) → its hits are the
-    // gated candidate set; an empty set means the query matched nothing relevant.
+    const mode = this.opts.fusionMode ?? 'floored-union';
+    // The cosine leg carries the FP floor (opts.minScore). In cosine-gated mode an
+    // empty cosine set means "nothing relevant" → return early; in floored-union
+    // mode the lexical leg can still contribute strong identifier hits, so we run it.
     const cosineHits = await this.cosine.search(query, opts);
-    if (cosineHits.length === 0) return [];
+    if (cosineHits.length === 0 && mode === 'cosine-gated') return [];
     const depth = this.opts.lexicalDepth ?? (opts.limit ?? 6) * 3;
-    // Lexical leg is a re-rank enhancement; if it's unavailable, degrade cleanly.
+    // Lexical leg: a re-rank (gated mode) or a co-equal recall source (union mode);
+    // if it's unavailable, degrade cleanly to cosine-only.
     const lexicalHits = await this.lexical
       .search(query, { scope: opts.scope, limit: depth })
       .catch(() => [] as MemoryEntry[]);
-    return fuseCosineGated(cosineHits, lexicalHits, this.opts.rrfK ?? DEFAULT_RRF_K);
+    const fused = fuse(cosineHits, lexicalHits, {
+      k: this.opts.rrfK ?? DEFAULT_RRF_K,
+      mode,
+      ...(this.opts.minLexScore !== undefined ? { minLexScore: this.opts.minLexScore } : {}),
+    });
+    return opts.limit !== undefined ? fused.slice(0, opts.limit) : fused;
   }
 }

@@ -16,6 +16,14 @@ export interface RetrievalOptions {
   limit?: number;
   /** Parallel search() calls (default 4). */
   concurrency?: number;
+  /**
+   * Absolute FP score floor passed through to backend.search (the push-path
+   * relevance gate — D-003). Omit to replay UNFLOORED (raw recall); set to a
+   * value to measure the floored push path (the floor sweep, P-031).
+   */
+  minScore?: number;
+  /** Relative score-ratio trim passed through to backend.search. */
+  minScoreRatio?: number;
   /** Progress callback (done, total). */
   onProgress?: (done: number, total: number) => void;
 }
@@ -53,7 +61,12 @@ export async function runGoldSet(
       const t0 = performance.now();
       let hits: MemoryEntry[] = [];
       try {
-        hits = await backend.search(q.query, { scope: opts.scope, limit });
+        hits = await backend.search(q.query, {
+          scope: opts.scope,
+          limit,
+          ...(opts.minScore !== undefined ? { minScore: opts.minScore } : {}),
+          ...(opts.minScoreRatio !== undefined ? { minScoreRatio: opts.minScoreRatio } : {}),
+        });
       } catch {
         hits = []; // an unavailable backend scores zero, it doesn't crash the run
       }

@@ -1,44 +1,115 @@
 /**
- * Cosine-gated reciprocal-rank fusion for the HybridBackend
- * (memory-backend-improve-and-hybrid P-020).
+ * Reciprocal-rank fusion for the HybridBackend
+ * (memory-backend-improve-and-hybrid P-020 / P-031).
  *
  * The hybrid fuses two retrieval legs over the same canonical store:
  *   - the COSINE leg (semantic / paraphrase — wins the lexical-gap class), and
  *   - the LEXICAL leg (exact tokens / identifiers — wins the exact-identifier class).
  *
- * Fusion is COSINE-GATED: the result set is exactly the cosine leg's hits (which
- * the caller has already FP-floored via SearchOptions.minScore, so an out-of-corpus
- * query yields none — the hard-negative discipline). The lexical leg only RE-RANKS
- * that set: an entry that also ranks high lexically gets a reciprocal-rank boost,
- * lifting exact matches to the top WITHOUT admitting lexical noise the cosine gate
- * already rejected. So:
- *   - paraphrase recall — cosine finds it, no lexical boost, still returned;
- *   - exact-identifier precision — cosine returns it, lexical boosts it toward #1;
- *   - hard-negative — cosine gate empty → nothing returned.
+ * The caller FP-floors the cosine leg (SearchOptions.minScore) so an out-of-corpus
+ * query yields no cosine hits. Fusion then combines the legs in one of two modes:
  *
- * RRF score = Σ 1/(k+rank) over the legs an entry appears in. k (standard 60)
- * dampens the weight of low ranks. The fused score is written onto entry.score
- * (ordering-only, per the MemoryEntry contract).
+ *   - `floored-union` (DEFAULT) — the result is the UNION of the floored cosine
+ *     hits and the lexical hits whose normalized score clears `minLexScore`. This
+ *     is what captures the exact-identifier column: a target the cosine leg ranks
+ *     poorly (or misses) but the lexical leg matches on an identifier token is
+ *     ADMITTED, lifting exact-id recall toward the lexical leg's ceiling. The dual
+ *     gate keeps hard-negatives out: a query with no real answer floors away in
+ *     cosine AND fails the lexical identifier bar, so neither leg admits noise.
+ *
+ *   - `cosine-gated` — the result is exactly the cosine hits; the lexical leg only
+ *     RE-RANKS them (a lexical-only hit is never admitted). Strictest hard-negative
+ *     discipline, but recall is capped at the cosine leg's (hybrid_recall ⊆ cosine):
+ *     it cannot capture an exact-id target the cosine leg dropped. Kept selectable
+ *     for the P-031 sweep / when no lexical precision signal is trustworthy.
+ *
+ * RRF score = Σ 1/(k+rank) over the legs an entry appears in (standard k=60). The
+ * fused score is written onto entry.score (ordering-only, per the MemoryEntry
+ * contract). The exact mode + the two gate values are swept in P-031 (D-006).
  */
 import type { MemoryEntry } from './backend';
 
 export const DEFAULT_RRF_K = 60;
+/** Default lexical admission bar for floored-union (normalized scoreEntry 0..1). */
+export const DEFAULT_MIN_LEX_SCORE = 0.5;
 
+export type FusionMode = 'floored-union' | 'cosine-gated';
+
+export interface FusionOptions {
+  /** RRF damping constant (default 60). */
+  k?: number;
+  /** Fusion mode (default 'floored-union'). */
+  mode?: FusionMode;
+  /**
+   * Minimum normalized lexical score for a lexical-ONLY hit to be admitted in
+   * floored-union mode (default 0.5). Lexical hits that also appear in the cosine
+   * set are always kept (they only get a rank boost); this bar gates the
+   * lexical-only admissions so generic token overlap can't re-introduce
+   * hard-negative false positives. No effect in cosine-gated mode.
+   */
+  minLexScore?: number;
+}
+
+/**
+ * Fuse the cosine and lexical legs. The cosine leg is assumed already FP-floored
+ * by the caller (SearchOptions.minScore). Returns entries ordered by fused RRF
+ * score (descending), each carrying that score.
+ */
+export function fuse(
+  cosineHits: readonly MemoryEntry[],
+  lexicalHits: readonly MemoryEntry[],
+  opts: FusionOptions = {},
+): MemoryEntry[] {
+  const k = opts.k ?? DEFAULT_RRF_K;
+  const mode = opts.mode ?? 'floored-union';
+  const minLex = opts.minLexScore ?? DEFAULT_MIN_LEX_SCORE;
+
+  // Lexical rank (1-based) + the lexical entry, keyed by id (first occurrence).
+  const lexRank = new Map<string, number>();
+  const lexEntry = new Map<string, MemoryEntry>();
+  lexicalHits.forEach((e, i) => {
+    if (e.id && !lexRank.has(e.id)) {
+      lexRank.set(e.id, i + 1);
+      lexEntry.set(e.id, e);
+    }
+  });
+
+  // Candidate set + each candidate's cosine rank (undefined = lexical-only).
+  const cosRank = new Map<string, number>();
+  const candidate = new Map<string, MemoryEntry>();
+  cosineHits.forEach((e, i) => {
+    if (!e.id) return;
+    cosRank.set(e.id, i + 1);
+    candidate.set(e.id, e);
+  });
+  if (mode === 'floored-union') {
+    // Admit lexical-ONLY hits that clear the identifier-precision bar.
+    for (const [id, rank] of lexRank) {
+      if (candidate.has(id)) continue;
+      const e = lexEntry.get(id)!;
+      if ((e.score ?? 0) >= minLex) candidate.set(id, e);
+      void rank;
+    }
+  }
+
+  const fused = [...candidate.entries()].map(([id, e]) => {
+    const cr = cosRank.get(id);
+    const lr = lexRank.get(id);
+    const score = (cr !== undefined ? 1 / (k + cr) : 0) + (lr !== undefined ? 1 / (k + lr) : 0);
+    return { ...e, score };
+  });
+  fused.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  return fused;
+}
+
+/**
+ * Back-compat / strict-discipline wrapper: cosine-gated fusion — the result is the
+ * cosine hits, with the lexical leg only re-ranking them (no lexical-only admits).
+ */
 export function fuseCosineGated(
   cosineHits: readonly MemoryEntry[],
   lexicalHits: readonly MemoryEntry[],
   k: number = DEFAULT_RRF_K,
 ): MemoryEntry[] {
-  const lexRank = new Map<string, number>();
-  lexicalHits.forEach((e, i) => {
-    if (e.id && !lexRank.has(e.id)) lexRank.set(e.id, i + 1);
-  });
-  const fused = cosineHits.map((e, i) => {
-    const cosRank = i + 1;
-    const lr = e.id ? lexRank.get(e.id) : undefined;
-    const score = 1 / (k + cosRank) + (lr !== undefined ? 1 / (k + lr) : 0);
-    return { ...e, score };
-  });
-  fused.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  return fused;
+  return fuse(cosineHits, lexicalHits, { mode: 'cosine-gated', k });
 }

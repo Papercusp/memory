@@ -32,11 +32,38 @@ describe('HybridBackend (P-020)', () => {
     expect(out.map((x) => x.id)).toEqual(['exact', 'para']);
   });
 
-  it('returns empty when the cosine gate is empty (hard-negative — FP discipline)', async () => {
+  it('hard-negative: cosine floored empty + weak lexical overlap → empty (dual gate, floored-union default)', async () => {
     const cosine = fakeBackend('cosine', []); // floored upstream
-    const lexical = fakeBackend('lexical', [e('noise', 1)]); // lexical token-overlap noise
+    // Realistic hard-negative lexical: generic token overlap scores BELOW the
+    // identifier bar (0.5), so the union does not admit it.
+    const lexical = fakeBackend('lexical', [e('weak-overlap', 0.2)]);
     const hy = new HybridBackend(lexical, cosine);
     expect(await hy.search('kubernetes', { scope: 's', minScore: 0.45 })).toEqual([]);
+  });
+
+  it('floored-union: a STRONG lexical-only identifier hit IS admitted (captures exact-id the cosine leg missed)', async () => {
+    // The cosine leg missed the exact-id target entirely (only a paraphrase);
+    // the lexical leg matched it on the identifier token (score ≥ 0.5) → admitted.
+    const cosine = fakeBackend('cosine', [e('para', 0.55)]);
+    const lexical = fakeBackend('lexical', [e('CODEX_HOME', 1.0)]);
+    const hy = new HybridBackend(lexical, cosine);
+    const out = await hy.search('CODEX_HOME rotation', { scope: 's', limit: 6, minScore: 0.45 });
+    expect(out.map((x) => x.id).sort()).toEqual(['CODEX_HOME', 'para']);
+  });
+
+  it('floored-union: a WEAK lexical-only hit (below minLexScore) is NOT admitted', async () => {
+    const cosine = fakeBackend('cosine', [e('para', 0.55)]);
+    const lexical = fakeBackend('lexical', [e('weak', 0.3)]);
+    const hy = new HybridBackend(lexical, cosine);
+    const out = await hy.search('q', { scope: 's', minScore: 0.45 });
+    expect(out.map((x) => x.id)).toEqual(['para']); // weak lexical-only excluded
+  });
+
+  it('cosine-gated mode: a lexical-only hit is NEVER admitted, even when strong', async () => {
+    const cosine = fakeBackend('cosine', []); // floored empty
+    const lexical = fakeBackend('lexical', [e('CODEX_HOME', 1.0)]);
+    const hy = new HybridBackend(lexical, cosine, { fusionMode: 'cosine-gated' });
+    expect(await hy.search('CODEX_HOME', { scope: 's', minScore: 0.45 })).toEqual([]);
   });
 
   it('preserves a paraphrase (cosine finds it, lexical misses)', async () => {
