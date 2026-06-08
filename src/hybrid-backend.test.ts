@@ -1,0 +1,74 @@
+import { describe, it, expect, vi } from 'vitest';
+import { HybridBackend } from './hybrid-backend';
+import type { MemoryBackend, MemoryEntry } from './backend';
+
+const e = (id: string, score?: number): MemoryEntry => ({
+  id,
+  text: id,
+  scope: 's',
+  ...(score !== undefined ? { score } : {}),
+});
+
+function fakeBackend(name: string, searchResult: MemoryEntry[], over: Partial<MemoryBackend> = {}): MemoryBackend {
+  return {
+    name,
+    available: async () => ({ ok: true }),
+    remember: async () => ({ ids: [] }),
+    search: async () => searchResult,
+    list: async () => [],
+    get: async () => null,
+    forget: async () => {},
+    update: async () => {},
+    ...over,
+  } as MemoryBackend;
+}
+
+describe('HybridBackend (P-020)', () => {
+  it('fuses: an exact-id hit (in both legs) ranks above a paraphrase (cosine-only)', async () => {
+    const cosine = fakeBackend('cosine', [e('para', 0.6), e('exact', 0.5)]);
+    const lexical = fakeBackend('lexical', [e('exact', 9)]);
+    const hy = new HybridBackend(lexical, cosine);
+    const out = await hy.search('q', { scope: 's', limit: 6, minScore: 0.45 });
+    expect(out.map((x) => x.id)).toEqual(['exact', 'para']);
+  });
+
+  it('returns empty when the cosine gate is empty (hard-negative — FP discipline)', async () => {
+    const cosine = fakeBackend('cosine', []); // floored upstream
+    const lexical = fakeBackend('lexical', [e('noise', 1)]); // lexical token-overlap noise
+    const hy = new HybridBackend(lexical, cosine);
+    expect(await hy.search('kubernetes', { scope: 's', minScore: 0.45 })).toEqual([]);
+  });
+
+  it('preserves a paraphrase (cosine finds it, lexical misses)', async () => {
+    const cosine = fakeBackend('cosine', [e('para', 0.55)]);
+    const lexical = fakeBackend('lexical', []);
+    const hy = new HybridBackend(lexical, cosine);
+    expect((await hy.search('reworded', { scope: 's' })).map((x) => x.id)).toEqual(['para']);
+  });
+
+  it('degrades to cosine-only when the lexical leg throws', async () => {
+    const cosine = fakeBackend('cosine', [e('a', 0.6), e('b', 0.5)]);
+    const lexical = fakeBackend('lexical', [], { search: async () => { throw new Error('claude dir missing'); } });
+    const hy = new HybridBackend(lexical, cosine);
+    expect((await hy.search('q', { scope: 's' })).map((x) => x.id)).toEqual(['a', 'b']);
+  });
+
+  it('delegates writes to the cosine (canonical) leg — cross-backend by construction', async () => {
+    const remember = vi.fn(async () => ({ ids: ['1'] }));
+    const forget = vi.fn(async () => {});
+    const cosine = fakeBackend('cosine', [], { remember, forget });
+    const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
+    await hy.remember('fact', { scope: 's' });
+    await hy.forget('1');
+    expect(remember).toHaveBeenCalledOnce();
+    expect(forget).toHaveBeenCalledWith('1');
+  });
+
+  it('passes the FP floor through to the cosine leg', async () => {
+    const search = vi.fn(async () => [e('a', 0.6)]);
+    const cosine = fakeBackend('cosine', [], { search });
+    const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
+    await hy.search('q', { scope: 's', limit: 6, minScore: 0.42 });
+    expect(search.mock.calls[0]?.[1]).toMatchObject({ minScore: 0.42 });
+  });
+});
