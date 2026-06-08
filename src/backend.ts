@@ -84,6 +84,16 @@ export interface SearchOptions {
    */
   minScore?: number;
   minScoreRatio?: number;
+  /**
+   * HYBRID-ONLY overrides (memory-backend-improve-and-hybrid P-031). The hybrid
+   * backend fuses a cosine + a lexical leg; `fusionMode` picks the fusion shape
+   * and `minLexScore` is the lexical admission bar for a lexical-only hit in
+   * floored-union mode. Both fall back to the backend's constructor defaults;
+   * non-hybrid backends ignore them. Plumbed as search-time options so the
+   * P-031 sweep can tune them per-call without rebuilding the backend.
+   */
+  fusionMode?: 'floored-union' | 'cosine-gated';
+  minLexScore?: number;
 }
 
 export interface ListOptions {

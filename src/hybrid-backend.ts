@@ -98,7 +98,9 @@ export class HybridBackend implements MemoryBackend {
   }
 
   async search(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
-    const mode = this.opts.fusionMode ?? 'floored-union';
+    // Per-call overrides (the P-031 sweep) win over the constructor defaults.
+    const mode = opts.fusionMode ?? this.opts.fusionMode ?? 'floored-union';
+    const minLexScore = opts.minLexScore ?? this.opts.minLexScore;
     // The cosine leg carries the FP floor (opts.minScore). In cosine-gated mode an
     // empty cosine set means "nothing relevant" → return early; in floored-union
     // mode the lexical leg can still contribute strong identifier hits, so we run it.
@@ -113,7 +115,7 @@ export class HybridBackend implements MemoryBackend {
     const fused = fuse(cosineHits, lexicalHits, {
       k: this.opts.rrfK ?? DEFAULT_RRF_K,
       mode,
-      ...(this.opts.minLexScore !== undefined ? { minLexScore: this.opts.minLexScore } : {}),
+      ...(minLexScore !== undefined ? { minLexScore } : {}),
     });
     return opts.limit !== undefined ? fused.slice(0, opts.limit) : fused;
   }

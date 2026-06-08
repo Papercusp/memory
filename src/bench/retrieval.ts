@@ -24,6 +24,10 @@ export interface RetrievalOptions {
   minScore?: number;
   /** Relative score-ratio trim passed through to backend.search. */
   minScoreRatio?: number;
+  /** Hybrid-only: lexical admission bar passed through to backend.search (P-031 sweep). */
+  minLexScore?: number;
+  /** Hybrid-only: fusion mode passed through to backend.search (P-031 sweep). */
+  fusionMode?: 'floored-union' | 'cosine-gated';
   /** Progress callback (done, total). */
   onProgress?: (done: number, total: number) => void;
 }
@@ -66,6 +70,8 @@ export async function runGoldSet(
           limit,
           ...(opts.minScore !== undefined ? { minScore: opts.minScore } : {}),
           ...(opts.minScoreRatio !== undefined ? { minScoreRatio: opts.minScoreRatio } : {}),
+          ...(opts.minLexScore !== undefined ? { minLexScore: opts.minLexScore } : {}),
+          ...(opts.fusionMode !== undefined ? { fusionMode: opts.fusionMode } : {}),
         });
       } catch {
         hits = []; // an unavailable backend scores zero, it doesn't crash the run
