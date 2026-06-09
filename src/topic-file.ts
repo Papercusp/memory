@@ -125,7 +125,8 @@ export function serializeTopicFile(tf: TopicFile): string {
  */
 export function typeForKind(kind: string | undefined): ClaudeMemoryType {
   switch ((kind ?? '').toLowerCase()) {
-    case 'identity':
+    case 'user': // unified taxonomy (memory-taxonomy-and-debt-followups D-001)
+    case 'identity': // legacy mem0 kind
       return 'user';
     case 'preference':
     case 'correction':

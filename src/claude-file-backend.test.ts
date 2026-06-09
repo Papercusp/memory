@@ -109,6 +109,11 @@ describe('topic-file format', () => {
   });
 
   it('typeForKind maps durable kinds to durable types and unknown to project', () => {
+    // Unified taxonomy (memory-taxonomy-and-debt-followups D-001) — `user`
+    // must land in the durable `user` type, not the evictable default.
+    expect(typeForKind('user')).toBe('user');
+    expect(typeForKind('feedback')).toBe('feedback');
+    // Legacy mem0 kinds keep their durable mappings.
     expect(typeForKind('identity')).toBe('user');
     expect(typeForKind('preference')).toBe('feedback');
     expect(typeForKind('correction')).toBe('feedback');
