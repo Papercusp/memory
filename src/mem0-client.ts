@@ -613,3 +613,16 @@ export function invalidateMemoryClient(): void {
   // connection (e.g. on credential change / mode switch).
   void disposeLiveCanonicalStores();
 }
+
+/**
+ * Awaitable invalidate: like `invalidateMemoryClient`, but resolves only
+ * after every tracked canonical store's PG client has actually closed.
+ * Callers that immediately do something the open connections would block
+ * (the bench's `DROP SCHEMA … CASCADE` — fire-and-forget disposal races
+ * the drop into a 55P03 lock timeout) await this instead.
+ */
+export async function disposeMemoryClient(): Promise<void> {
+  _client = null;
+  _clientBuiltAt = 0;
+  await disposeLiveCanonicalStores();
+}

@@ -28,6 +28,7 @@ export {
   getMemoryClient,
   getResolvedMode,
   invalidateMemoryClient,
+  disposeMemoryClient,
 } from './mem0-client';
 
 // Injectable fact-extraction LLM seam (mem0-extraction-via-claude-session
