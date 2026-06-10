@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { HybridBackend } from './hybrid-backend';
-import type { MemoryBackend, MemoryEntry } from './backend';
+import type { MemoryBackend, MemoryEntry, RememberOptions, SearchOptions } from './backend';
 
 const e = (id: string, score?: number): MemoryEntry => ({
   id,
@@ -124,7 +124,7 @@ describe('HybridBackend (P-020)', () => {
 
   it('write-through stamps link_id = canonical id onto the lexical projection (for cross-leg dedup)', async () => {
     const cosine = fakeBackend('cosine', [], { remember: async () => ({ ids: ['canon-9'] }) });
-    const lexRemember = vi.fn(async () => ({ ids: ['l'] }));
+    const lexRemember = vi.fn(async (_text: string, _opts: RememberOptions) => ({ ids: ['l'] }));
     const lexical = fakeBackend('lexical', [], { remember: lexRemember });
     const hy = new HybridBackend(lexical, cosine);
     await hy.remember('a fact', { scope: 's', metadata: { kind: 'x' } });
@@ -133,7 +133,7 @@ describe('HybridBackend (P-020)', () => {
   });
 
   it('passes the FP floor through to the cosine leg', async () => {
-    const search = vi.fn(async () => [e('a', 0.6)]);
+    const search = vi.fn(async (_q: string, _opts: SearchOptions) => [e('a', 0.6)]);
     const cosine = fakeBackend('cosine', [], { search });
     const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
     await hy.search('q', { scope: 's', limit: 6, minScore: 0.42 });
