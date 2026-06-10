@@ -89,38 +89,58 @@ export function fuse(
   // CROSS-LEG IDENTITY: the cosine leg (canonical store) and the lexical leg
   // (its projection) assign DIFFERENT native ids to the SAME memory, so dedup by
   // a shared key, not the native id — else one fact surfaces twice (once per leg).
-  // Two shared keys, in priority order:
+  // Two linkage forms must BOTH resolve to the same slot:
   //   1. `metadata.link_id` — the canonical id the write-through stamps onto a
-  //      projection (covers FUTURE hybrid writes, where mem0 extraction may
-  //      reword the cosine text so it no longer matches the lexical text);
+  //      projection. mem0 extraction may REWORD the cosine text, so the cosine
+  //      side must be reachable by its OWN id (a text key alone misses this —
+  //      observed live: one hybrid write surfaced twice on recall).
   //   2. normalized verbatim TEXT — covers a MIGRATED corpus, where the same
-  //      fact was stored verbatim in both legs (identical text) WITHOUT mutating
-  //      the source files (so `~/.claude` is kept exactly as-is).
+  //      fact was stored verbatim in both legs (identical text) WITHOUT a
+  //      link_id stamp (so `~/.claude` is kept exactly as-is).
+  // So each COSINE entry registers BOTH aliases (own id + normalized text) to
+  // one slot; a lexical entry resolves via link_id first, then text.
   const norm = (t: string): string => t.trim().replace(/\s+/g, ' ');
-  const keyOf = (e: MemoryEntry): string =>
-    (typeof e.metadata?.link_id === 'string' ? (e.metadata.link_id as string) : undefined) ??
-    (e.text ? norm(e.text) : e.id);
 
-  // Lexical rank (1-based) + the lexical entry, keyed by cross-leg key (first wins).
+  // Candidate set + each candidate's cosine rank (undefined = lexical-only). The
+  // COSINE entry wins the slot when a memory is in both legs (it's canonical).
+  const slotOf = new Map<string, string>(); // alias → slot key
+  const cosRank = new Map<string, number>();
+  const candidate = new Map<string, MemoryEntry>();
+  cosineHits.forEach((e, i) => {
+    const slot = e.id || norm(e.text);
+    if (!slot) return;
+    if (!slotOf.has(slot)) slotOf.set(slot, slot);
+    const textAlias = e.text ? norm(e.text) : '';
+    if (textAlias && !slotOf.has(textAlias)) slotOf.set(textAlias, slot);
+    const key = slotOf.get(slot)!;
+    if (!cosRank.has(key)) cosRank.set(key, i + 1); // first (best) rank per memory
+    if (!candidate.has(key)) candidate.set(key, e);
+  });
+
+  const lexKeyOf = (e: MemoryEntry): string => {
+    const linkId = typeof e.metadata?.link_id === 'string' ? (e.metadata.link_id as string) : undefined;
+    const textAlias = e.text ? norm(e.text) : '';
+    // Resolve to a cosine slot when either alias matches; else key on the
+    // lexical entry's own identity (link_id keeps two projections of the same
+    // canonical row collapsed even when the cosine leg missed the query).
+    return (
+      (linkId !== undefined ? slotOf.get(linkId) : undefined) ??
+      (textAlias ? slotOf.get(textAlias) : undefined) ??
+      linkId ??
+      textAlias ??
+      e.id
+    );
+  };
+
+  // Lexical rank (1-based) + the lexical entry, keyed by cross-leg slot (first wins).
   const lexRank = new Map<string, number>();
   const lexEntry = new Map<string, MemoryEntry>();
   lexicalHits.forEach((e, i) => {
-    const key = keyOf(e);
+    const key = lexKeyOf(e);
     if (key && !lexRank.has(key)) {
       lexRank.set(key, i + 1);
       lexEntry.set(key, e);
     }
-  });
-
-  // Candidate set + each candidate's cosine rank (undefined = lexical-only). The
-  // COSINE entry wins the slot when a memory is in both legs (it's canonical).
-  const cosRank = new Map<string, number>();
-  const candidate = new Map<string, MemoryEntry>();
-  cosineHits.forEach((e, i) => {
-    const key = keyOf(e);
-    if (!key) return;
-    if (!cosRank.has(key)) cosRank.set(key, i + 1); // first (best) rank per memory
-    if (!candidate.has(key)) candidate.set(key, e);
   });
   if (mode === 'floored-union') {
     // Admit lexical-ONLY hits that clear the identifier-precision bar.

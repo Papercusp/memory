@@ -113,4 +113,35 @@ describe('fuse — cross-leg dedup via metadata.link_id', () => {
     const out = fuse([cos], [lex], { mode: 'floored-union', minLexScore: 0.5 });
     expect(out.map((e) => e.id).sort()).toEqual(['x', 'y']);
   });
+
+  it('REWORDED cosine text + link_id projection still collapses (live double-surface regression)', () => {
+    // mem0 extraction REWORDS the canonical text on write, so the cosine entry's
+    // text no longer matches the verbatim projection — the link_id must resolve
+    // against the cosine entry's OWN id, not its text. Observed live 2026-06-10:
+    // one hybrid write surfaced twice on recall (uuid row + file projection).
+    const cos: MemoryEntry = {
+      id: '1f534811-uuid',
+      text: 'The exporter authenticates using a rotating header, regenerated weekly', // reworded
+      scope: 's',
+      score: 0.7,
+    };
+    const lex: MemoryEntry = {
+      id: 'reference_exporter_auth_file',
+      text: 'The exporter authenticates with the rotating header; the value is regenerated weekly.', // verbatim
+      scope: 's',
+      score: 0.9,
+      metadata: { link_id: '1f534811-uuid' },
+    };
+    const out = fuse([cos], [lex], { mode: 'floored-union', minLexScore: 0.5 });
+    expect(out.length).toBe(1);             // ONE result, not the double-surface
+    expect(out[0].id).toBe('1f534811-uuid'); // canonical entry kept
+    expect(out[0].score).toBeCloseTo(1 / 61 + 1 / 61, 6); // both legs' rank boost
+  });
+
+  it('two lexical projections sharing a link_id collapse even when the cosine leg missed', () => {
+    const a = linked('file_a', 'canon-z', 0.9);
+    const b = linked('file_b', 'canon-z', 0.8);
+    const out = fuse([], [a, b], { mode: 'floored-union', minLexScore: 0.5 });
+    expect(out.map((x) => x.id)).toEqual(['file_a']); // first (best-ranked) projection wins
+  });
 });
