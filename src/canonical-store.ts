@@ -26,6 +26,19 @@
  * those — we do the same here (any non-string value other than known
  * payload-key strings is silently skipped). See the memory-harness-
  * scope-2026-05-24 plan for the audit that established this.
+ *
+ * Store-kind segregation (EI-366): mem0's Memory class creates a SECOND
+ * vector store for entity linking via `getEntityStore()`, distinguished
+ * only by a `<collection>_entities` collectionName. This store ignores
+ * collectionName for table selection (canonical rows are shared across
+ * embedder modes by design), which used to dump entity fragments
+ * ({ data, entityType, linkedMemoryIds }) into the same pool as real
+ * memories — 84% of the store was COMPOUND/PROPER junk surfacing in
+ * recall. The discriminator is payload shape: mem0 entity payloads
+ * ALWAYS carry `entityType`; memory payloads never do. search()/list()
+ * filter on it per store kind, so both kinds share the physical tables
+ * but never each other's result sets (and the pre-fix junk rows are
+ * segregated retroactively, no backfill needed).
  */
 
 import { Pool as PgPool } from 'pg';
@@ -51,8 +64,10 @@ export interface CanonicalStoreConfig {
   dbname: string;
   /** Schema holding `memory_canonical` + the vec tables (host-defined). */
   schema: string;
-  /** Ignored — mem0 always passes this; we don't use collection
-   *  segmentation because the canonical row carries scope in payload. */
+  /** Not used for table selection (the canonical row carries scope in
+   *  payload), but a `*_entities` suffix marks this instance as mem0's
+   *  ENTITY store — its search/list see only entity rows, every other
+   *  instance sees only memory rows. */
   collectionName?: string;
   /** Which model's vec table this instance reads/writes. */
   vecTable: 'memory_vec_openai' | 'memory_vec_local';
@@ -68,8 +83,21 @@ function toVectorLiteral(v: number[]): string {
   return `[${v.join(',')}]`;
 }
 
+/**
+ * The store-kind discriminator clause. Entity rows are the ones mem0's
+ * entity linking writes — their payload always carries `entityType`
+ * (see Memory._linkEntitiesForMemory in mem0ai/oss); real memory
+ * payloads never do.
+ */
+function storeKindCond(alias: string, kind: 'memory' | 'entity'): string {
+  const has = `${alias}payload ? 'entityType'`;
+  return kind === 'entity' ? has : `NOT (${has})`;
+}
+
 export class CanonicalVectorStore {
   private cfg: CanonicalStoreConfig;
+  /** 'entity' when mem0 constructed this instance as its entity store. */
+  private readonly storeKind: 'memory' | 'entity';
   private userId = '';
   // A small Pool, not a single Client: concurrent callers (parallel
   // memory writes, the bench's concurrent seeding) interleave queries,
@@ -80,6 +108,7 @@ export class CanonicalVectorStore {
 
   constructor(config: CanonicalStoreConfig) {
     this.cfg = config;
+    this.storeKind = config.collectionName?.endsWith('_entities') ? 'entity' : 'memory';
   }
 
   private async getClient(): Promise<PgPool> {
@@ -164,7 +193,7 @@ export class CanonicalVectorStore {
   ): Promise<VectorStoreResult[]> {
     const client = await this.getClient();
     const vecTable = `${this.cfg.schema}.${this.cfg.vecTable}`;
-    const conds: string[] = [];
+    const conds: string[] = [storeKindCond('c.', this.storeKind)];
     const params: unknown[] = [toVectorLiteral(query), topK];
     let idx = 3;
     if (filters) {
@@ -261,7 +290,7 @@ export class CanonicalVectorStore {
     topK = 100,
   ): Promise<[VectorStoreResult[], number]> {
     const client = await this.getClient();
-    const conds: string[] = [];
+    const conds: string[] = [storeKindCond('', this.storeKind)];
     const params: unknown[] = [];
     let idx = 1;
     if (filters) {
