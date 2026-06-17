@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { HybridBackend } from './hybrid-backend';
+import { NoopBackend, NOOP_DISABLED_REASON } from './noop-backend';
+import { MemoryUnavailableError } from './backend';
 import type { MemoryBackend, MemoryEntry, RememberOptions, SearchOptions } from './backend';
 
 const e = (id: string, score?: number): MemoryEntry => ({
