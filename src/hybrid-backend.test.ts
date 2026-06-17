@@ -168,4 +168,94 @@ describe('HybridBackend (P-020)', () => {
     const recalled = await clientB.search('nuqs', { scope: 's', minScore: 0.45 });
     expect(recalled.map((r) => r.text)).toEqual(['the user prefers nuqs']);
   });
+
+  // ── GAP 6: available() is a PROBE, not a writability guarantee ──────────────
+  // available() forwards to cosine.available() (hybrid-backend.ts:69). A green
+  // probe is NOT a promise that remember succeeds: the cosine leg can report
+  // available={ok:true} (e.g. PG reachable, schema present) yet its embedder is
+  // dead so remember THROWS. This pins the GAP-1 root at the backend layer — the
+  // documented contract that available() does not gate writes. (No defect: the
+  // probe is non-throwing by design; callers must still handle a write throw.)
+  it('available() GREEN does NOT guarantee remember succeeds (false-green probe)', async () => {
+    const cosine = fakeBackend('cosine', [], {
+      available: async () => ({ ok: true }),
+      remember: async () => {
+        throw new MemoryUnavailableError('embedder_dead');
+      },
+    });
+    const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
+    // The probe reports GREEN...
+    expect(await hy.available()).toEqual({ ok: true });
+    // ...yet the very next write THROWS — green probe ≠ writable backend.
+    await expect(hy.remember('fact', { scope: 's' })).rejects.toBeInstanceOf(
+      MemoryUnavailableError,
+    );
+  });
+
+  it('available() forwards the cosine leg verbatim (ok:false + reason passes through)', async () => {
+    const cosine = fakeBackend('cosine', [], {
+      available: async () => ({ ok: false, reason: 'pg_unreachable' }),
+    });
+    const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
+    // available() tracks the cosine leg (the write target / source of truth);
+    // the lexical leg's health is irrelevant to the probe.
+    expect(await hy.available()).toEqual({ ok: false, reason: 'pg_unreachable' });
+  });
+
+  // ── GAP 12: NoopBackend as the cosine leg ──────────────────────────────────
+  // A hybrid whose cosine leg is the deliberate "no store": available is
+  // {ok:false}, search returns [] (NOT a throw — the dedup/search path never
+  // probes available, so the Noop's empty search degrades cleanly), but remember
+  // THROWS MemoryUnavailableError (no caller is lied to about a fact storing).
+  describe('NoopBackend as the cosine leg (memory OFF)', () => {
+    it('available() reports {ok:false} with the disabled reason', async () => {
+      const hy = new HybridBackend(fakeBackend('lexical', []), new NoopBackend());
+      expect(await hy.available()).toEqual({ ok: false, reason: NOOP_DISABLED_REASON });
+    });
+
+    it('search returns [] (does NOT throw — bypasses the availability probe)', async () => {
+      const hy = new HybridBackend(fakeBackend('lexical', []), new NoopBackend());
+      // floored-union default: cosine is [] but NOT cosine-gated, so the lexical
+      // leg still runs; with an empty lexical leg the fused result is [].
+      await expect(hy.search('anything', { scope: 's', minScore: 0.45 })).resolves.toEqual([]);
+    });
+
+    it('remember THROWS MemoryUnavailableError — the write is NOT silently dropped', async () => {
+      const hy = new HybridBackend(fakeBackend('lexical', []), new NoopBackend());
+      await expect(hy.remember('fact', { scope: 's' })).rejects.toBeInstanceOf(
+        MemoryUnavailableError,
+      );
+    });
+  });
+
+  // ── GAP 13: per-call fusionMode override + cosine-gated early-return ────────
+  // A hybrid constructed floored-union, then CALLED with {fusionMode:'cosine-gated'}:
+  // the per-call override beats the constructor default (hybrid-backend.ts:112),
+  // and with an empty cosine set the cosine-gated branch early-returns []
+  // (hybrid-backend.ts:118) BEFORE the lexical leg can admit anything — so a
+  // strong lexical-only identifier hit is NOT admitted (override wins).
+  it('per-call fusionMode:cosine-gated beats a floored-union constructor + floors a strong lexical-only hit to []', async () => {
+    const cosine = fakeBackend('cosine', []); // floored empty
+    const lexical = fakeBackend('lexical', [e('CODEX_HOME', 1.0)]); // strong identifier hit
+    // Constructor says floored-union (which WOULD admit the strong lexical hit)...
+    const hy = new HybridBackend(lexical, cosine, { fusionMode: 'floored-union' });
+    // ...but the per-call override flips to cosine-gated → empty cosine early-returns [].
+    expect(
+      await hy.search('CODEX_HOME', { scope: 's', minScore: 0.45, fusionMode: 'cosine-gated' }),
+    ).toEqual([]);
+    // Control: with NO override the constructor's floored-union DOES admit it.
+    expect(
+      (await hy.search('CODEX_HOME', { scope: 's', minScore: 0.45 })).map((x) => x.id),
+    ).toEqual(['CODEX_HOME']);
+  });
+
+  it('cosine-gated early-return short-circuits the lexical leg entirely (it is never searched)', async () => {
+    const cosine = fakeBackend('cosine', []); // floored empty
+    const lexSearch = vi.fn(async () => [e('CODEX_HOME', 1.0)]);
+    const lexical = fakeBackend('lexical', [], { search: lexSearch });
+    const hy = new HybridBackend(lexical, cosine, { fusionMode: 'cosine-gated' });
+    expect(await hy.search('CODEX_HOME', { scope: 's', minScore: 0.45 })).toEqual([]);
+    // The early-return fires BEFORE the lexical search — no wasted lexical probe.
+    expect(lexSearch).not.toHaveBeenCalled();
+  });
 });

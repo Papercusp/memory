@@ -95,3 +95,63 @@ describe('CanonicalVectorStore store-kind segregation', () => {
     expect(JSON.parse(canonical!.params[1] as string)).toMatchObject({ entityType: 'COMPOUND' });
   });
 });
+
+describe('CanonicalVectorStore insert guards (GAP 9)', () => {
+  it('rejects a wrong-DIMENSION vector and emits NO query (cfg dims=3)', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    // embeddingModelDims is 3 (see makeStore); a 5-dim vector is corrupt and must
+    // be refused BEFORE any INSERT runs — a wrong-width row would poison the
+    // pgvector column for the whole model table.
+    await expect(
+      store.insert([[0.1, 0.2, 0.3, 0.4, 0.5]], ['id-1'], [{ user_id: 'u' }]),
+    ).rejects.toThrow(/dim 5 !== expected 3/);
+    // The throw is the WHOLE effect: no canonical upsert, no vec insert.
+    expect(queries).toHaveLength(0);
+  });
+
+  it('rejects a length-MISMATCH between vectors/ids/payloads and emits NO query', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    // Two vectors but one id — a caller bug that would otherwise mis-pair rows.
+    await expect(store.insert([VEC, VEC], ['only-one-id'], [{ user_id: 'u' }])).rejects.toThrow(
+      /length mismatch/,
+    );
+    expect(queries).toHaveLength(0);
+  });
+
+  it('a correct-dim insert DOES emit both the canonical upsert and the vec insert', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.insert([VEC], ['id-1'], [{ user_id: 'u' }]);
+    expect(queries.some((q) => q.sql.includes('memory_canonical'))).toBe(true);
+    expect(queries.some((q) => q.sql.includes('memory_vec_local'))).toBe(true);
+  });
+});
+
+describe('CanonicalVectorStore.deleteCol — the shared-table data-loss guard (GAP 9)', () => {
+  it('REFUSES to delete with no userId scope: warns and emits NO delete', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // No setUserId() — an unscoped deleteCol would DELETE the whole shared
+    // memory_canonical table (every user + harness). The guard must refuse.
+    await store.deleteCol();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('refusing to wipe'));
+    expect(queries.filter((q) => /DELETE/i.test(q.sql))).toHaveLength(0);
+    warn.mockRestore();
+  });
+
+  it('after setUserId, scopes the delete to that user_id ONLY (no shared-table wipe)', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await store.setUserId('scope-a');
+    await store.deleteCol();
+    // No refusal warning fired — the scope is set.
+    expect(warn).not.toHaveBeenCalled();
+    const deletes = queries.filter((q) => /DELETE/i.test(q.sql));
+    expect(deletes).toHaveLength(1);
+    // The delete is user_id-scoped — it can NEVER touch another tenant's rows.
+    expect(deletes[0].sql).toContain("payload->>'user_id' = $1");
+    expect(deletes[0].params).toEqual(['scope-a']);
+    // And it is NOT an unscoped table wipe.
+    expect(deletes[0].sql).not.toMatch(/DELETE FROM \S+\s*$/);
+    warn.mockRestore();
+  });
+});
