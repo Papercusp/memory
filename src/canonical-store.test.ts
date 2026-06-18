@@ -96,6 +96,31 @@ describe('CanonicalVectorStore store-kind segregation', () => {
   });
 });
 
+describe('CanonicalVectorStore archived-state exclusion (P-016)', () => {
+  it('search carries the archived exclusion condition alongside the kind clause', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.search(VEC, 5, { user_id: 'scope-a' });
+    expect(queries[0].sql).toContain("c.state != 'archived'");
+    // both conditions are present
+    expect(queries[0].sql).toContain("NOT (c.payload ? 'entityType')");
+  });
+
+  it('list carries the archived exclusion in BOTH the page and count queries', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.list({ user_id: 'scope-a' }, 10);
+    expect(queries).toHaveLength(2);
+    for (const q of queries) {
+      expect(q.sql).toContain("state != 'archived'");
+    }
+  });
+
+  it('search with no filters still excludes archived rows', async () => {
+    const { store, queries } = makeStore('operator_memory_openai');
+    await store.search(VEC, 5);
+    expect(queries[0].sql).toContain("c.state != 'archived'");
+  });
+});
+
 describe('CanonicalVectorStore insert guards (GAP 9)', () => {
   it('rejects a wrong-DIMENSION vector and emits NO query (cfg dims=3)', async () => {
     const { store, queries } = makeStore('operator_memory_local');

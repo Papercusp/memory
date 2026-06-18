@@ -193,7 +193,7 @@ export class CanonicalVectorStore {
   ): Promise<VectorStoreResult[]> {
     const client = await this.getClient();
     const vecTable = `${this.cfg.schema}.${this.cfg.vecTable}`;
-    const conds: string[] = [storeKindCond('c.', this.storeKind)];
+    const conds: string[] = [storeKindCond('c.', this.storeKind), `c.state != 'archived'`];
     const params: unknown[] = [toVectorLiteral(query), topK];
     let idx = 3;
     if (filters) {
@@ -290,7 +290,7 @@ export class CanonicalVectorStore {
     topK = 100,
   ): Promise<[VectorStoreResult[], number]> {
     const client = await this.getClient();
-    const conds: string[] = [storeKindCond('', this.storeKind)];
+    const conds: string[] = [storeKindCond('', this.storeKind), `state != 'archived'`];
     const params: unknown[] = [];
     let idx = 1;
     if (filters) {
