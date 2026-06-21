@@ -586,6 +586,23 @@ async function tryLoad(): Promise<MemoryClient | null> {
     });
     _clientMode = resolved.mode;
     _clientBuiltAt = Date.now();
+    // Eagerly WARM the lazy mem0 init + embedder OFF the hot path. mem0's
+    // `_ensureInitialized` fires on the FIRST op (search/add); under box load that
+    // cold-init can exceed the memory-tool deadline, so the first real search/remember
+    // after each (hourly TTL) rebuild times out — and a burst of concurrent ops during
+    // that window ALL time out (the "mem0 flaky all session" reports). A fire-and-forget
+    // warm-up pays that init here, in the background, so user-facing ops hit a warm
+    // client. Best-effort: a warm-up failure never affects the returned client (the next
+    // real op re-attempts + surfaces any error). The dummy scope returns nothing + writes
+    // nothing — it only triggers init + warms the embedder worker.
+    const clientToWarm = _client;
+    void (async () => {
+      try {
+        await clientToWarm.search('warmup', { filters: { user_id: '__mem0_warmup__' }, topK: 1, limit: 1 });
+      } catch {
+        /* best-effort warm-up — the next real op re-attempts and surfaces errors */
+      }
+    })();
     return _client;
   } catch (e) {
     const msg = (e as Error).message ?? String(e);
