@@ -115,6 +115,22 @@ async function disposeLiveCanonicalStores(): Promise<void> {
 }
 
 /**
+ * Merge-patch a memory row's METADATA in the canonical store (the store half of
+ * `Mem0Backend.update({ metadata })` — mem0's OSS update is text-only). Ensures the
+ * mem0 client is built (so a `CanonicalVectorStore` exists), then runs the vec-safe
+ * `payload || patch` merge via any live store — they all point at the one shared
+ * `memory_canonical` table, and `updatePayload` self-guards to memory (non-entity)
+ * rows. Returns whether a row matched (false ⇒ unknown id, surfaced as not-found).
+ * Throws if the store is unavailable (the backend's `available()` gates this first).
+ */
+export async function updateMemoryPayload(id: string, patch: Record<string, unknown>): Promise<boolean> {
+  await getMemoryClient(); // build (or reuse) the client so the canonical store is registered
+  const store = [..._liveCanonicalStores][0];
+  if (!store) throw new Error('mem0_unavailable');
+  return store.updatePayload(id, patch);
+}
+
+/**
  * mem0ai 3.x has NO `custom` embedder provider — its EmbedderFactory
  * switch only knows openai/ollama/lmstudio/google/azure_openai/langchain
  * and throws "Unsupported embedder provider: custom" otherwise. It

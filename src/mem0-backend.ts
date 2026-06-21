@@ -37,6 +37,7 @@ import {
 import {
   getMemoryClient,
   invalidateMemoryClient,
+  updateMemoryPayload,
   type Mem0Row,
   type MemoryClient,
 } from './mem0-client';
@@ -128,14 +129,18 @@ function mergeById(entries: MemoryEntry[]): MemoryEntry[] {
 export interface Mem0BackendDeps {
   /** Test seam — defaults to the real cached mem0 client accessor. */
   getClient?: () => Promise<MemoryClient | null>;
+  /** Test seam — the metadata merge-patch (defaults to the real canonical-store path). */
+  updatePayload?: (id: string, patch: Record<string, unknown>) => Promise<boolean>;
 }
 
 export class Mem0Backend implements MemoryBackend {
   readonly name = 'mem0';
   private readonly getClient: () => Promise<MemoryClient | null>;
+  private readonly updatePayload: (id: string, patch: Record<string, unknown>) => Promise<boolean>;
 
   constructor(deps: Mem0BackendDeps = {}) {
     this.getClient = deps.getClient ?? getMemoryClient;
+    this.updatePayload = deps.updatePayload ?? updateMemoryPayload;
   }
 
   async available(): Promise<MemoryAvailability> {
@@ -218,12 +223,19 @@ export class Mem0Backend implements MemoryBackend {
   }
 
   async update(id: string, patch: UpdatePatch): Promise<void> {
+    // Metadata merge-patch (scope/user_id, workspace_id, kind, anchors, …) — the
+    // canonical store does a vec-safe `payload || patch` merge (no re-embed). mem0's
+    // OSS update is text-only, so this rides our own store path, not client.update.
     if (patch.metadata !== undefined) {
-      throw new Error('mem0 backend does not support metadata patches (text-only update)');
+      const matched = await this.updatePayload(id, patch.metadata);
+      // Mirror the text path's not-found contract (mem0 throws "Memory with ID …
+      // not found"); the tool layer maps it to a graceful {ok:false}.
+      if (!matched) throw new Error(`Memory with ID ${id} not found`);
     }
-    if (patch.text === undefined) return;
-    const client = await this.client();
-    await client.update(id, patch.text);
+    if (patch.text !== undefined) {
+      const client = await this.client();
+      await client.update(id, patch.text);
+    }
   }
 
   /** mem0's LLM fact-extraction over a conversation window. */

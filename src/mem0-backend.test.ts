@@ -240,18 +240,29 @@ describe('Mem0Backend.forget', () => {
 });
 
 describe('Mem0Backend.update', () => {
-  it('THROWS on a metadata patch (mem0 OSS update is text-only, :221)', async () => {
+  it('a metadata patch merges via the canonical-store updatePayload (vec-safe, no client.update)', async () => {
     const update = vi.fn();
-    const be = new Mem0Backend({ getClient: async () => stubClient({ update }) });
-    await expect(be.update(UUID_A, { metadata: { kind: 'x' } })).rejects.toThrow(/metadata patches/);
+    const updatePayload = vi.fn(async () => true);
+    const be = new Mem0Backend({ getClient: async () => stubClient({ update }), updatePayload });
+    await be.update(UUID_A, { metadata: { kind: 'reference', workspace_id: 'papercusp-workspace' } });
+    expect(updatePayload).toHaveBeenCalledWith(UUID_A, { kind: 'reference', workspace_id: 'papercusp-workspace' });
+    // The metadata path never touches mem0's text-only update.
     expect(update).not.toHaveBeenCalled();
   });
 
-  it('a metadata patch throws even alongside a text patch (metadata checked first)', async () => {
-    const update = vi.fn();
-    const be = new Mem0Backend({ getClient: async () => stubClient({ update }) });
-    await expect(be.update(UUID_A, { text: 'new', metadata: { a: 1 } })).rejects.toThrow(/metadata patches/);
-    expect(update).not.toHaveBeenCalled();
+  it('a metadata patch on an unknown id throws the not-found contract', async () => {
+    const updatePayload = vi.fn(async () => false); // no row matched
+    const be = new Mem0Backend({ getClient: async () => stubClient({}), updatePayload });
+    await expect(be.update(UUID_A, { metadata: { kind: 'x' } })).rejects.toThrow(/not found/i);
+  });
+
+  it('text + metadata both apply (metadata merge, then the text update)', async () => {
+    const update = vi.fn(async () => ({}));
+    const updatePayload = vi.fn(async () => true);
+    const be = new Mem0Backend({ getClient: async () => stubClient({ update }), updatePayload });
+    await be.update(UUID_A, { text: 'new', metadata: { kind: 'project' } });
+    expect(updatePayload).toHaveBeenCalledWith(UUID_A, { kind: 'project' });
+    expect(update).toHaveBeenCalledWith(UUID_A, 'new');
   });
 
   it('a text patch delegates to client.update(id, text)', async () => {

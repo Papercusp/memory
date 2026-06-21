@@ -247,6 +247,30 @@ export class CanonicalVectorStore {
     await this.insert([vector], [id], [payload]);
   }
 
+  /**
+   * Patch a memory row's metadata WITHOUT re-embedding — a shallow merge of
+   * `patch` into the existing `payload` jsonb (`payload || patch`, so patch keys
+   * override and unspecified keys are preserved). This is the store half of the
+   * neutral `MemoryBackend.update({ metadata })` path (mem0's OSS text-only
+   * update can't touch metadata). VEC-SAFE: the embedding lives in the separate
+   * `memory_vec_*` tables keyed by `memory_id`, untouched here — scope (`user_id`),
+   * `workspace_id`, `kind`, anchors etc. are filter/display fields, not embedded,
+   * so a metadata fix needs no re-embed. Guarded to MEMORY rows (never an mem0
+   * entity-linking row, which carries `entityType`). Returns whether a row matched
+   * (false = unknown id → the not-found contract the backend surfaces).
+   */
+  async updatePayload(id: string, patch: Record<string, unknown>): Promise<boolean> {
+    if (!patch || typeof patch !== 'object' || Object.keys(patch).length === 0) return false;
+    const client = await this.getClient();
+    const res = await client.query(
+      `UPDATE ${this.cfg.schema}.memory_canonical
+          SET payload = payload || $2::jsonb, updated_at = now()
+        WHERE id = $1 AND NOT (payload ? 'entityType')`,
+      [id, JSON.stringify(patch)],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
   async delete(id: string): Promise<void> {
     const client = await this.getClient();
     // CASCADE removes the vec rows (in BOTH model tables) — deleting
