@@ -92,6 +92,28 @@ describe('HybridBackend (P-020)', () => {
     expect((await hy.search('q', { scope: 's' })).map((x) => x.id)).toEqual(['a', 'b']);
   });
 
+  // EI-2777: the lexical-leg call must survive a SYNCHRONOUS throw, not just an async
+  // rejection. The async-reject case (above) passed even before the fix because a
+  // trailing `.catch()` handles a rejected promise — but a sync throw from the method
+  // ACCESS (an undefined/misconfigured leg, or a leg missing `.search`) escapes `.catch()`
+  // and surfaced as the deterministic, search-only "reading 'search'" tool error (while
+  // remember()'s try/catch swallowed the identical fault). These two would FAIL on the
+  // old `.catch()` code and pass on the try/catch.
+  it('degrades to cosine-only when the lexical leg is undefined (EI-2777)', async () => {
+    const cosine = fakeBackend('cosine', [e('a', 0.6), e('b', 0.5)]);
+    const hy = new HybridBackend(undefined as unknown as MemoryBackend, cosine);
+    expect((await hy.search('q', { scope: 's' })).map((x) => x.id)).toEqual(['a', 'b']);
+  });
+
+  it('degrades to cosine-only when the lexical leg.search throws synchronously (EI-2777)', async () => {
+    const cosine = fakeBackend('cosine', [e('a', 0.6), e('b', 0.5)]);
+    const lexical = fakeBackend('lexical', [], {
+      search: (() => { throw new Error('sync boom — not a rejected promise'); }) as never,
+    });
+    const hy = new HybridBackend(lexical, cosine);
+    expect((await hy.search('q', { scope: 's' })).map((x) => x.id)).toEqual(['a', 'b']);
+  });
+
   it('writes the canonical id from the cosine leg; forget/update target it', async () => {
     const remember = vi.fn(async () => ({ ids: ['1'] }));
     const forget = vi.fn(async () => {});

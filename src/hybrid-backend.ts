@@ -118,10 +118,21 @@ export class HybridBackend implements MemoryBackend {
     if (cosineHits.length === 0 && mode === 'cosine-gated') return [];
     const depth = this.opts.lexicalDepth ?? (opts.limit ?? 6) * 3;
     // Lexical leg: a re-rank (gated mode) or a co-equal recall source (union mode);
-    // if it's unavailable, degrade cleanly to cosine-only.
-    const lexicalHits = await this.lexical
-      .search(query, { scope: opts.scope, limit: depth })
-      .catch(() => [] as MemoryEntry[]);
+    // if it's unavailable, degrade cleanly to cosine-only (the documented contract,
+    // header §"available()/degrades cleanly"). A try/catch — NOT a trailing `.catch()`
+    // on the call — because `.catch()` only handles an async REJECTION; a SYNCHRONOUS
+    // throw from the method access itself (an undefined/misconfigured lexical leg, or a
+    // leg missing `.search`) escapes it. That asymmetry was EI-2777: remember()'s lexical
+    // projection is in a try/catch (above) so a broken leg was swallowed there, but
+    // search()'s `.catch()` let the same fault surface as the deterministic, search-ONLY
+    // "Cannot read properties of undefined (reading 'search')". The try/catch makes the
+    // two paths symmetric, so a broken lexical leg degrades search to cosine-only too.
+    let lexicalHits: MemoryEntry[];
+    try {
+      lexicalHits = await this.lexical.search(query, { scope: opts.scope, limit: depth });
+    } catch {
+      lexicalHits = [];
+    }
     const fused = fuse(cosineHits, lexicalHits, {
       k: this.opts.rrfK ?? DEFAULT_RRF_K,
       mode,
