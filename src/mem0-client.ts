@@ -492,6 +492,9 @@ async function tryLoad(): Promise<MemoryClient | null> {
           collectionName,
           vecTable,
           embeddingModelDims: resolved.dims,
+          // mem0 `_autoInitialize` reads `vectorStore.config.dimension` to skip its
+          // live-embed detection probe (see embedderConfig note) — EI-4027.
+          dimension: resolved.dims,
         },
       };
     } else {
@@ -513,9 +516,17 @@ async function tryLoad(): Promise<MemoryClient | null> {
   // pre-built embed fn — both openai and local resolve to a
   // `(text) => number[]` on the operator side, so the store stays
   // vendor-agnostic and never holds an API key itself.
+  // Pass the embedding dimension EXPLICITLY so mem0's `_autoInitialize` skips its
+  // dimension-detection probe — a LIVE embed() call. Without it, a failing embed
+  // (e.g. the OpenAI embedder hitting 429 `insufficient_quota`) makes
+  // `_autoInitialize` THROW on every client build; in the bg-host that uncaught
+  // throw recurs each tick and wedges the event loop (EI-4027: git-sync +
+  // green-checkpoint + substrate routines all stall). `resolved.dims` is 384 for
+  // both shipped embedders. mem0 reads `embedder.config.embeddingDims` (and
+  // `vectorStore.config.dimension` below) to bypass the probe.
   const embedderConfig: Record<string, unknown> = {
     provider: 'custom',
-    config: { embed: resolved.embed },
+    config: { embed: resolved.embed, embeddingDims: resolved.dims },
   };
 
   // mem0 tracks add/update/delete event history in SQLite. Default is
