@@ -302,18 +302,24 @@ describe('Mem0Backend', () => {
     expect(client.delete).toHaveBeenCalledWith(UUID_A);
   });
 
-  it('update applies text, rejects metadata patches, no-ops on empty patch', async () => {
+  it('update applies text, merges metadata via updatePayload, no-ops on empty patch', async () => {
     const client = fakeClient();
-    const b = new Mem0Backend({ getClient: async () => client });
+    // Metadata patches now ride the canonical-store merge seam (vec-safe, no re-embed)
+    // instead of throwing — see mem0-backend update() and the memory:update tool.
+    const updatePayload = vi.fn(async () => true);
+    const b = new Mem0Backend({ getClient: async () => client, updatePayload });
 
     await b.update(UUID_A, { text: 'new text' });
     expect(client.update).toHaveBeenCalledWith(UUID_A, 'new text');
 
-    await expect(b.update(UUID_A, { metadata: { x: 1 } })).rejects.toThrow(/metadata/);
+    await b.update(UUID_A, { metadata: { x: 1 } });
+    expect(updatePayload).toHaveBeenCalledWith(UUID_A, { x: 1 });
 
     vi.mocked(client.update as ReturnType<typeof vi.fn>).mockClear();
+    updatePayload.mockClear();
     await b.update(UUID_A, {});
     expect(client.update).not.toHaveBeenCalled();
+    expect(updatePayload).not.toHaveBeenCalled();
   });
 
   it('rememberConversation passes the window through to add', async () => {

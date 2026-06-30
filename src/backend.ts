@@ -107,9 +107,10 @@ export interface UpdatePatch {
   /** Replacement fact body. */
   text?: string;
   /**
-   * Metadata merge-patch. OPTIONAL for backends — mem0's OSS update is
-   * text-only and THROWS on a metadata patch; check your backend before
-   * relying on it.
+   * Metadata merge-patch. OPTIONAL for backends. mem0's OSS `update()` is
+   * text-only, so the Mem0Backend rides the canonical-store merge path for
+   * metadata (vec-safe `payload || patch`, no re-embed); other backends may
+   * not implement it — check your backend before relying on it.
    */
   metadata?: Record<string, unknown>;
 }

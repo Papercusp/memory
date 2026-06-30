@@ -15,7 +15,8 @@
  *     events (`ADD`/`UPDATE`/`NONE`/`DELETE`); `remember` returns the
  *     ids of `ADD` rows only — newly created entries (the contract's
  *     0..N semantics);
- *   - mem0's OSS `update()` is text-only, so a metadata patch throws.
+ *   - mem0's OSS `update()` is text-only, so a metadata patch rides the
+ *     canonical-store merge path (vec-safe `payload || patch`) instead.
  *
  * The mem0-internal machinery (client TTL/poison-cache, embedder
  * cascade, canonical store, re-embed) stays in ./mem0-client and
