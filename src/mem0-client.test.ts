@@ -1,5 +1,9 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { patchEmbedderFactory, _setCurrentEmbedFnForTest } from './mem0-client';
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 /**
  * Regression guard for the mem0ai 3.x compatibility fix (commit 879fc733).
@@ -70,20 +74,28 @@ describe('resolveExtractionLlmConfig — stale-key cascade (memory-backend-bench
   });
 
   it('falls back to openai when the anthropic key is auth-rejected', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const cfg = await resolveExtractionLlmConfig(
       { anthropicKey: 'sk-ant-stale', openaiKey: 'sk-oai' },
       async () => false,
     );
     expect(cfg).toMatchObject({ provider: 'openai' });
     expect((cfg!.config as { model: string }).model).toBe('gpt-4o-mini');
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('falling back to OpenAI gpt-4o-mini for fact extraction'),
+    );
   });
 
   it('keeps the dead anthropic key when nothing else exists (search/verbatim still work)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const cfg = await resolveExtractionLlmConfig(
       { anthropicKey: 'sk-ant-stale', openaiKey: '' },
       async () => false,
     );
     expect(cfg).toMatchObject({ provider: 'anthropic' });
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('mem0 fact extraction WILL fail until the key is rotated'),
+    );
   });
 
   it('openai-only and no-keys cases unchanged', async () => {
