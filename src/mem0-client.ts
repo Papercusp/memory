@@ -457,7 +457,15 @@ async function tryLoad(): Promise<MemoryClient | null> {
   // bookkeeping (its DEFAULT_MEMORY_CONFIG reads it). Our
   // CanonicalVectorStore ignores it — scope lives in payload.user_id.
   const collectionName = `${MEM0_COLLECTION_PREFIX}_${resolved.mode}`;
-  const vecTable = resolved.mode === 'openai' ? 'memory_vec_openai' : 'memory_vec_local';
+  // Per-embedder-model vec table = the embedding SPACE (embedding-space-vs-dimension
+  // / EI-8913). Each mode writes to its own table so vectors from different models
+  // never mix. 'gemma' = EmbeddingGemma-300m @ MRL-384 (migration 534).
+  const vecTable =
+    resolved.mode === 'openai'
+      ? 'memory_vec_openai'
+      : resolved.mode === 'gemma'
+        ? 'memory_vec_gemma'
+        : 'memory_vec_local';
 
   // Vector-store selection. Prefer the canonical store (migration 081)
   // when pgvector is present; fall back to mem0's in-process `memory`

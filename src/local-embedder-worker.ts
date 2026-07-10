@@ -97,21 +97,41 @@ function ensureWorker(): Promise<void> {
   return _workerReady;
 }
 
+/** Per-embed options for the worker. Omitted fields keep the BGE-small
+ *  defaults (model `Xenova/bge-small-en-v1.5`, mean pooling, normalized) so
+ *  existing callers are unchanged; EmbeddingGemma passes `model` +
+ *  `normalize: false` (MRL truncate-then-normalize happens in the caller). */
+export interface EmbedViaWorkerOpts {
+  model?: string;
+  pooling?: 'mean' | 'cls' | 'none';
+  normalize?: boolean;
+}
+
 /**
  * Embed `text` via the persistent worker thread. Returns a vector
  * (Array<number>) sized to the loaded model's output dimension.
  *
+ * The worker caches one pipeline PER model, so mixing models (BGE + Gemma) in
+ * one process is safe — each `model` gets its own warm pipeline.
+ *
  * Throws when worker_threads is unavailable or the worker has failed
  * — callers should fall back to inline embedding in that case.
  */
-export async function embedViaWorker(text: string): Promise<number[]> {
+export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}): Promise<number[]> {
   await ensureWorker();
   if (!_worker) throw new Error('worker not initialized');
 
   const id = _nextId++;
   return new Promise<number[]>((resolveEmbed, rejectEmbed) => {
     _pending.set(id, { resolve: resolveEmbed, reject: rejectEmbed });
-    _worker!.postMessage({ kind: 'embed', id, text });
+    _worker!.postMessage({
+      kind: 'embed',
+      id,
+      text,
+      model: opts.model,
+      pooling: opts.pooling,
+      normalize: opts.normalize,
+    });
   });
 }
 

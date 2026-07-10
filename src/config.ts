@@ -24,7 +24,7 @@ export type EmbedFn = (text: string) => Promise<number[]>;
  * per-model vec table; `dims` sizes the canonical column).
  */
 export type ResolvedEmbedder =
-  | { mode: 'openai' | 'local'; dims: number; embed: EmbedFn }
+  | { mode: 'openai' | 'local' | 'gemma'; dims: number; embed: EmbedFn }
   | { mode: 'disabled'; reason?: string };
 
 /** LLM credentials for mem0's fact-extraction step. */
@@ -60,7 +60,7 @@ export interface MemoryHost {
    * current preference. Throws if that mode's credentials/packages aren't
    * available.
    */
-  buildEmbedderForMode: (mode: 'openai' | 'local') => Promise<EmbedFn>;
+  buildEmbedderForMode: (mode: 'openai' | 'local' | 'gemma') => Promise<EmbedFn>;
 
   /**
    * Optional: adaptive extraction instructions fed to mem0's

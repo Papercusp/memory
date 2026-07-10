@@ -4,7 +4,8 @@
  * main event loop.
  *
  * Protocol (main → worker):
- *   { kind: 'embed', id: number, text: string }
+ *   { kind: 'embed', id: number, text: string,
+ *     model?: string, pooling?: string, normalize?: boolean }
  *
  * Protocol (worker → main):
  *   { kind: 'ready' }                                  on init complete
@@ -17,28 +18,37 @@
 
 import { parentPort } from 'node:worker_threads';
 
-const MODEL = 'Xenova/bge-small-en-v1.5';
+const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
 
-let pipelinePromise = null;
+// One warm pipeline PER model id, so a process mixing BGE (default local) and
+// EmbeddingGemma (via an explicit model) keeps both loaded rather than
+// thrashing a single-model cache.
+const pipelinesByModel = new Map();
 
-async function getPipeline() {
-  if (!pipelinePromise) {
+async function getPipeline(model) {
+  const key = model || DEFAULT_MODEL;
+  let p = pipelinesByModel.get(key);
+  if (!p) {
     // Dynamic import keeps the worker spawn cheap when @huggingface/transformers
     // isn't installed — the package only loads on first embed.
-    const transformers = await import('@huggingface/transformers');
-    pipelinePromise = transformers.pipeline('feature-extraction', MODEL);
+    p = import('@huggingface/transformers').then((t) => t.pipeline('feature-extraction', key));
+    pipelinesByModel.set(key, p);
   }
-  return pipelinePromise;
+  return p;
 }
 
 parentPort.on('message', async (msg) => {
   if (!msg || typeof msg !== 'object') return;
   if (msg.kind !== 'embed') return;
 
-  const { id, text } = msg;
+  const { id, text, model } = msg;
+  // BGE-small defaults (mean pooling, normalized) when unspecified; Gemma passes
+  // normalize:false and truncate-then-normalizes in the caller (MRL).
+  const pooling = msg.pooling || 'mean';
+  const normalize = msg.normalize === undefined ? true : msg.normalize;
   try {
-    const pipe = await getPipeline();
-    const result = await pipe(text, { pooling: 'mean', normalize: true });
+    const pipe = await getPipeline(model);
+    const result = await pipe(text, { pooling, normalize });
     parentPort.postMessage({
       kind: 'embed_ok',
       id,

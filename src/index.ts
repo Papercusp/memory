@@ -118,4 +118,13 @@ export {
   _resetWorker,
 } from './local-embedder-worker';
 
+export {
+  buildGemmaEmbedder,
+  gemmaPrompt,
+  mrlTruncate,
+  GEMMA_MODEL,
+  GEMMA_TARGET_DIMS,
+  type GemmaEmbedKind,
+} from './gemma-embedder';
+
 export { CanonicalVectorStore } from './canonical-store';
