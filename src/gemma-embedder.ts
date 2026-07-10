@@ -31,7 +31,7 @@
  * (migration 534), selected by `ResolvedEmbedder.mode === 'gemma'`.
  */
 
-import { embedViaWorker } from './local-embedder-worker';
+import { embedViaWorker, ORT_SESSION_OPTIONS } from './local-embedder-worker';
 
 /** Transformers.js/ONNX build of EmbeddingGemma-300m. */
 export const GEMMA_MODEL = 'onnx-community/embeddinggemma-300m-ONNX';
@@ -80,7 +80,7 @@ const dynamicImport = new Function(
 ) as <T>(specifier: string) => Promise<T>;
 
 type TransformersModule = {
-  pipeline: (task: string, model: string) => Promise<Pipeline>;
+  pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<Pipeline>;
 };
 type Pipeline = (text: string, opts: unknown) => Promise<{ data: Float32Array }>;
 
@@ -115,7 +115,10 @@ export function buildGemmaEmbedder(opts: { kind: GemmaEmbedKind }): (text: strin
     // Inline (main-thread) fallback.
     if (!pipelinePromise) {
       const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
-      pipelinePromise = transformers.pipeline('feature-extraction', GEMMA_MODEL);
+      // Same thread-cap rationale as the worker path (WI-3792 spin-pool storm).
+      pipelinePromise = transformers.pipeline('feature-extraction', GEMMA_MODEL, {
+        session_options: ORT_SESSION_OPTIONS,
+      });
     }
     const pipe = await pipelinePromise;
     const result = await pipe(prompted, { pooling: 'mean', normalize: false });

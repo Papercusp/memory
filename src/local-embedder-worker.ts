@@ -164,9 +164,16 @@ const LOCAL_EMBEDDER_MODEL = 'Xenova/bge-small-en-v1.5';
 const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
 
 type TransformersModule = {
-  pipeline: (task: string, model: string) => Promise<Pipeline>;
+  pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<Pipeline>;
 };
 type Pipeline = (text: string, opts: unknown) => Promise<{ data: Float32Array }>;
+
+/** ONNX Runtime defaults intraOp threads to EVERY core and spin-waits them —
+ *  on a 128-core host each embedding-loading process grew a ~128-thread spin
+ *  pool (loadavg 2000-3000 host stutter, WI-3792). Cap it: embeds are
+ *  latency-tolerant background work. Mirrored in local-embedder-worker.script.mjs
+ *  (plain-JS worker, can't import this) — keep the two in sync. */
+export const ORT_SESSION_OPTIONS = { intraOpNumThreads: 4, interOpNumThreads: 1 } as const;
 
 // Dodge the bundler's static analysis so the optional @huggingface
 // dependency is only required when local mode is actually selected.
@@ -203,7 +210,9 @@ export async function buildLocalEmbedder(): Promise<(text: string) => Promise<nu
     // Inline (main-thread) fallback path.
     if (!pipelinePromise) {
       const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
-      pipelinePromise = transformers.pipeline('feature-extraction', LOCAL_EMBEDDER_MODEL);
+      pipelinePromise = transformers.pipeline('feature-extraction', LOCAL_EMBEDDER_MODEL, {
+        session_options: ORT_SESSION_OPTIONS,
+      });
     }
     const pipe = await pipelinePromise;
     const result = await pipe(text, { pooling: 'mean', normalize: true });
