@@ -36,13 +36,15 @@ import { memoryHost, memorySchema } from './config';
 
 const EMBEDDER_DIM = 384;
 
-type ResolvedMode = 'openai' | 'local';
+type ResolvedMode = 'openai' | 'local' | 'gemma';
 
 /** Map a mode to its (unqualified) vec table — fixed lookup (no interpolation
- *  of caller input into SQL identifiers); schema is prefixed at use. */
+ *  of caller input into SQL identifiers); schema is prefixed at use.
+ *  'gemma' = EmbeddingGemma-300m @ MRL-384 (migration 534). */
 const VEC_TABLE: Record<ResolvedMode, string> = {
   openai: 'memory_vec_openai',
   local: 'memory_vec_local',
+  gemma: 'memory_vec_gemma',
 };
 
 interface PgFields {
