@@ -5,7 +5,7 @@
  *
  * Protocol (main → worker):
  *   { kind: 'embed', id: number, text: string,
- *     model?: string, pooling?: string, normalize?: boolean }
+ *     model?: string, pooling?: string, normalize?: boolean, output?: string }
  *
  * Protocol (worker → main):
  *   { kind: 'ready' }                                  on init complete
@@ -58,6 +58,20 @@ parentPort.on('message', async (msg) => {
   const normalize = msg.normalize === undefined ? true : msg.normalize;
   try {
     const pipe = await getPipeline(model);
+    // Models whose ONNX export bakes pooling+normalize INTO the graph expose a
+    // single pre-pooled output (e.g. harrier's 'sentence_embedding') and have
+    // no last_hidden_state for the pipeline's pooling path — `output` names
+    // that graph output; tokenize + run the model directly and return it.
+    if (msg.output) {
+      const enc = pipe.tokenizer(text, { padding: true, truncation: true });
+      const out = await pipe.model(enc);
+      const tensor = out[msg.output];
+      if (!tensor) {
+        throw new Error(`model output '${msg.output}' missing (has: ${Object.keys(out).join(', ')})`);
+      }
+      parentPort.postMessage({ kind: 'embed_ok', id, vector: Array.from(tensor.data) });
+      return;
+    }
     const result = await pipe(text, { pooling, normalize });
     parentPort.postMessage({
       kind: 'embed_ok',

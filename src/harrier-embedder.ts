@@ -8,10 +8,12 @@
  * 1. MODEL — `onnx-community/harrier-oss-v1-0.6b-ONNX` (Transformers.js/ONNX
  *    build of microsoft/harrier-oss-v1-0.6b), natively 1024-dim.
  *
- * 2. POOLING — LAST-TOKEN, not mean: the pipeline is asked for per-token
- *    output (`pooling: 'none'`) and `lastTokenPool` slices the final token's
- *    hidden state. Mean-pooling this model scores garbage — the pooling
- *    config is part of the space.
+ * 2. POOLING — LAST-TOKEN + L2 norm, and this export bakes BOTH into the ONNX
+ *    graph (sentence-transformers head: /model/st/pool_0/lasttoken_* +
+ *    /model/st/normalize_1/*). The graph's ONLY output is the pre-pooled
+ *    `sentence_embedding` — there is NO last_hidden_state output, so the
+ *    pipeline's JS-side pooling path cannot run at all. We read the graph
+ *    output directly via `embedViaWorker`'s `output` option.
  *
  * 3. PROMPTS — asymmetric, Qwen3-embedding style: queries get
  *    `Instruct: {task}\nQuery: {q}` (model-card prompt_name=web_search_query);
@@ -33,6 +35,8 @@ import { mrlTruncate } from './gemma-embedder';
 export const HARRIER_MODEL = 'onnx-community/harrier-oss-v1-0.6b-ONNX';
 /** Native output width — memory-side storage uses this (P-014). */
 export const HARRIER_NATIVE_DIMS = 1024;
+/** The export's sole graph output: last-token pooled + L2-normalized. */
+export const HARRIER_GRAPH_OUTPUT = 'sentence_embedding';
 /** The model-card web_search_query instruction (prompt_name=web_search_query). */
 export const HARRIER_QUERY_TASK =
   'Given a web search query, retrieve relevant passages that answer the query';
@@ -49,17 +53,13 @@ export function harrierPrompt(kind: HarrierEmbedKind, text: string): string {
   return kind === 'query' ? `Instruct: ${HARRIER_QUERY_TASK}\nQuery: ${text}` : text;
 }
 
-/**
- * Last-token pooling over a FLATTENED per-token output ([seq, dims] row-major,
- * which is what `pooling: 'none'` yields for a single text): the last `dims`
- * slice is the final token's hidden state. Throws on a length that isn't a
- * whole number of tokens — a wrong-dims bug must be loud, never mis-sliced.
- */
-export function lastTokenPool(flat: number[], dims: number = HARRIER_NATIVE_DIMS): number[] {
-  if (flat.length < dims || flat.length % dims !== 0) {
-    throw new Error(`lastTokenPool: length ${flat.length} is not a multiple of dims ${dims}`);
+/** A wrong-width vector means the graph output isn't what we think it is —
+ *  fail loudly rather than store vectors from a mis-read space. */
+function assertNativeDims(vec: number[]): number[] {
+  if (vec.length !== HARRIER_NATIVE_DIMS) {
+    throw new Error(`harrier ${HARRIER_GRAPH_OUTPUT}: expected ${HARRIER_NATIVE_DIMS} dims, got ${vec.length}`);
   }
-  return flat.slice(flat.length - dims);
+  return vec;
 }
 
 // Dodge bundler static analysis — @huggingface/transformers is an optional,
@@ -71,28 +71,38 @@ const dynamicImport = new Function(
 
 const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
 
-type TransformersModule = {
-  pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<Pipeline>;
+type Tensor = { data: Float32Array };
+/** The pipeline object doubles as tokenizer+model holder — the direct-call
+ *  path uses those (mirroring the worker's `output` branch) since the
+ *  pipeline's own pooling path cannot run on this export. */
+type RawPipeline = {
+  tokenizer: (text: string, opts?: Record<string, unknown>) => Record<string, unknown>;
+  model: (inputs: Record<string, unknown>) => Promise<Record<string, Tensor>>;
 };
-type Pipeline = (text: string, opts: unknown) => Promise<{ data: Float32Array }>;
+type TransformersModule = {
+  pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<RawPipeline>;
+};
 
 /**
  * Build a harrier embedder closure `(text) => number[]` for a fixed embed
- * `kind`: last-token pooled, L2-normalized, `dims`-wide (native 1024 default;
- * pass 384 for the exploratory truncated variant — truncate-then-normalize
- * via `mrlTruncate`, which at native width is a plain L2 norm).
+ * `kind`: last-token pooled + L2-normalized (in-graph), `dims`-wide (native
+ * 1024 default; pass 384 for the exploratory truncated variant —
+ * truncate-then-normalize via `mrlTruncate`, which at native width is a
+ * no-op renorm of an already-unit vector).
  *
  * Prefers the worker-thread path (0.6B params — inference blocks the main
  * loop far worse than gemma-300m); falls back to an inline main-thread
- * pipeline when worker_threads is unavailable. Fallback is sticky per closure.
- * Both paths cap ORT threads (the WI-3792 spin-pool storm).
+ * model call when worker_threads is unavailable, with a transition-only
+ * warn carrying the worker's real error (a swallowed model/output error
+ * otherwise reads as a silent 2.4GB duplicate load). Fallback is sticky per
+ * closure. Both paths cap ORT threads (the WI-3792 spin-pool storm).
  */
 export function buildHarrierEmbedder(opts: {
   kind: HarrierEmbedKind;
   dims?: number;
 }): (text: string) => Promise<number[]> {
   const { kind, dims = HARRIER_NATIVE_DIMS } = opts;
-  let pipelinePromise: Promise<Pipeline> | null = null;
+  let pipelinePromise: Promise<RawPipeline> | null = null;
   let workerDisabled = false;
 
   return async (text: string): Promise<number[]> => {
@@ -100,18 +110,20 @@ export function buildHarrierEmbedder(opts: {
 
     if (!workerDisabled) {
       try {
-        const flat = await embedViaWorker(prompted, {
+        const full = await embedViaWorker(prompted, {
           model: HARRIER_MODEL,
-          pooling: 'none',
-          normalize: false,
+          output: HARRIER_GRAPH_OUTPUT,
         });
-        return mrlTruncate(lastTokenPool(flat, HARRIER_NATIVE_DIMS), dims);
-      } catch {
+        return mrlTruncate(assertNativeDims(full), dims);
+      } catch (err) {
         workerDisabled = true;
+        console.warn(
+          `harrier embed worker path failed, falling back to inline: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     }
 
-    // Inline (main-thread) fallback.
+    // Inline (main-thread) fallback — same direct model call as the worker.
     if (!pipelinePromise) {
       const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
       pipelinePromise = transformers.pipeline('feature-extraction', HARRIER_MODEL, {
@@ -119,7 +131,14 @@ export function buildHarrierEmbedder(opts: {
       });
     }
     const pipe = await pipelinePromise;
-    const result = await pipe(prompted, { pooling: 'none', normalize: false });
-    return mrlTruncate(lastTokenPool(Array.from(result.data), HARRIER_NATIVE_DIMS), dims);
+    const enc = pipe.tokenizer(prompted, { padding: true, truncation: true });
+    const out = await pipe.model(enc);
+    const tensor = out[HARRIER_GRAPH_OUTPUT];
+    if (!tensor) {
+      throw new Error(
+        `harrier model output '${HARRIER_GRAPH_OUTPUT}' missing (has: ${Object.keys(out).join(', ')})`,
+      );
+    }
+    return mrlTruncate(assertNativeDims(Array.from(tensor.data)), dims);
   };
 }

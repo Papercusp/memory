@@ -70,7 +70,7 @@ export interface CanonicalStoreConfig {
    *  instance sees only memory rows. */
   collectionName?: string;
   /** Which model's vec table this instance reads/writes. */
-  vecTable: 'memory_vec_openai' | 'memory_vec_local' | 'memory_vec_gemma';
+  vecTable: 'memory_vec_openai' | 'memory_vec_local' | 'memory_vec_gemma' | 'memory_vec_harrier';
   /** Sanity check — refuses to insert vectors with the wrong length. */
   embeddingModelDims: number;
 }

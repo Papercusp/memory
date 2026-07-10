@@ -34,17 +34,26 @@
 
 import { memoryHost, memorySchema } from './config';
 
-const EMBEDDER_DIM = 384;
-
-type ResolvedMode = 'openai' | 'local' | 'gemma';
+type ResolvedMode = 'openai' | 'local' | 'gemma' | 'harrier';
 
 /** Map a mode to its (unqualified) vec table — fixed lookup (no interpolation
  *  of caller input into SQL identifiers); schema is prefixed at use.
- *  'gemma' = EmbeddingGemma-300m @ MRL-384 (migration 534). */
+ *  'gemma' = EmbeddingGemma-300m @ MRL-384 (migration 534);
+ *  'harrier' = harrier-oss-0.6b @ native-1024 (migration 547). */
 const VEC_TABLE: Record<ResolvedMode, string> = {
   openai: 'memory_vec_openai',
   local: 'memory_vec_local',
   gemma: 'memory_vec_gemma',
+  harrier: 'memory_vec_harrier',
+};
+
+/** Per-mode vector width — the wrong-width guard must match the TARGET
+ *  mode's space (harrier is 1024; everything else 384). */
+const MODE_DIMS: Record<ResolvedMode, number> = {
+  openai: 384,
+  local: 384,
+  gemma: 384,
+  harrier: 1024,
 };
 
 interface PgFields {
@@ -137,7 +146,7 @@ export async function reembedMemories(
       }
       try {
         const vec = await embed(data);
-        if (vec.length !== EMBEDDER_DIM) {
+        if (vec.length !== MODE_DIMS[toMode]) {
           progress.errors += 1;
           opts.progress?.(progress);
           continue;

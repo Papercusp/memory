@@ -264,7 +264,7 @@ type Mem0Module = {
 // returns null before the client is built), but the public
 // `getResolvedMode()` type keeps it so callers can branch on it — see the
 // operator's memoryPreflight().
-type ResolvedMode = 'openai' | 'local' | 'gemma' | 'disabled';
+type ResolvedMode = 'openai' | 'local' | 'gemma' | 'harrier' | 'disabled';
 
 const dynamicImport = new Function(
   'specifier',
@@ -459,13 +459,16 @@ async function tryLoad(): Promise<MemoryClient | null> {
   const collectionName = `${MEM0_COLLECTION_PREFIX}_${resolved.mode}`;
   // Per-embedder-model vec table = the embedding SPACE (embedding-space-vs-dimension
   // / EI-8913). Each mode writes to its own table so vectors from different models
-  // never mix. 'gemma' = EmbeddingGemma-300m @ MRL-384 (migration 534).
+  // never mix. 'gemma' = EmbeddingGemma-300m @ MRL-384 (migration 534);
+  // 'harrier' = harrier-oss-0.6b @ native-1024 (migration 547).
   const vecTable =
     resolved.mode === 'openai'
       ? 'memory_vec_openai'
       : resolved.mode === 'gemma'
         ? 'memory_vec_gemma'
-        : 'memory_vec_local';
+        : resolved.mode === 'harrier'
+          ? 'memory_vec_harrier'
+          : 'memory_vec_local';
 
   // Vector-store selection. Prefer the canonical store (migration 081)
   // when pgvector is present; fall back to mem0's in-process `memory`

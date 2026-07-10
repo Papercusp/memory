@@ -131,9 +131,9 @@ export {
 export {
   buildHarrierEmbedder,
   harrierPrompt,
-  lastTokenPool,
   HARRIER_MODEL,
   HARRIER_NATIVE_DIMS,
+  HARRIER_GRAPH_OUTPUT,
   HARRIER_QUERY_TASK,
   type HarrierEmbedKind,
 } from './harrier-embedder';

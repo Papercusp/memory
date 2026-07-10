@@ -100,11 +100,16 @@ function ensureWorker(): Promise<void> {
 /** Per-embed options for the worker. Omitted fields keep the BGE-small
  *  defaults (model `Xenova/bge-small-en-v1.5`, mean pooling, normalized) so
  *  existing callers are unchanged; EmbeddingGemma passes `model` +
- *  `normalize: false` (MRL truncate-then-normalize happens in the caller). */
+ *  `normalize: false` (MRL truncate-then-normalize happens in the caller).
+ *  `output` bypasses the pipeline's pooling path entirely and returns the
+ *  named graph output from a direct model call — for exports that bake
+ *  pooling+normalize into the ONNX graph (harrier's 'sentence_embedding');
+ *  `pooling`/`normalize` are ignored when it is set. */
 export interface EmbedViaWorkerOpts {
   model?: string;
   pooling?: 'mean' | 'cls' | 'none';
   normalize?: boolean;
+  output?: string;
 }
 
 /**
@@ -131,6 +136,7 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
       model: opts.model,
       pooling: opts.pooling,
       normalize: opts.normalize,
+      output: opts.output,
     });
   });
 }
