@@ -128,4 +128,16 @@ export {
   type GemmaEmbedKind,
 } from './gemma-embedder';
 
+export {
+  buildSidecarFirstEmbedder,
+  sidecarEmbedBatch,
+  resolveEmbedSidecarUrl,
+  EMBED_SIDECAR_URL_ENV,
+  DEFAULT_SIDECAR_TIMEOUT_MS,
+  DEFAULT_REPROBE_AFTER_MS,
+  type SidecarFirstEmbedderOpts,
+  type SidecarEmbedBatchOpts,
+  type SidecarEmbedResponse,
+} from './sidecar-embedder';
+
 export { CanonicalVectorStore } from './canonical-store';
