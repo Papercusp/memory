@@ -264,7 +264,7 @@ type Mem0Module = {
 // returns null before the client is built), but the public
 // `getResolvedMode()` type keeps it so callers can branch on it — see the
 // operator's memoryPreflight().
-type ResolvedMode = 'openai' | 'local' | 'disabled';
+type ResolvedMode = 'openai' | 'local' | 'gemma' | 'disabled';
 
 const dynamicImport = new Function(
   'specifier',
