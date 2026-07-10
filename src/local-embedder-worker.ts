@@ -160,7 +160,7 @@ export function getWorkerState(): {
   };
 }
 
-const LOCAL_EMBEDDER_MODEL = 'Xenova/bge-small-en-v1.5';
+export const LOCAL_EMBEDDER_MODEL = 'Xenova/bge-small-en-v1.5';
 const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
 
 type TransformersModule = {
