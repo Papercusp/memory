@@ -83,9 +83,16 @@ async function loadPgFields(): Promise<PgFields> {
 }
 
 /**
- * Walk every canonical fact that has a SOURCE-mode vector, embed its body
- * under the target embedder, and upsert the row into the target vec table.
- * Existing target rows for the same `memory_id` are overwritten.
+ * Walk every canonical fact that has a SOURCE-mode vector but does NOT yet
+ * have a TARGET-mode vector, embed its body under the target embedder, and
+ * insert the row into the target vec table. This is DELTA-ONLY by design
+ * (WI-4092): re-running (or re-firing after a partial/interrupted pass) only
+ * ever processes the remaining gap, not the whole corpus — a corpus that
+ * grows into the thousands would otherwise re-embed every already-migrated
+ * row on every call and blow the route's request timeout well before
+ * reaching the rows that actually still need it. The `ON CONFLICT DO UPDATE`
+ * on the upsert is a race-safety net only (a row inserted concurrently
+ * between the SELECT and this row's INSERT), not the primary mechanism.
  *
  * Returns progress counts; throws on fatal errors (PG unavailable, embedder
  * build failure).
