@@ -129,13 +129,17 @@ export async function reembedMemories(
     // openai/local cascade).
     const embed = await memoryHost().buildEmbedderForMode(toMode);
 
-    // Source = canonical facts that already carry a source-mode vector. The
-    // canonical + vec tables exist from migration 081 (applied at embedded-PG
-    // boot) — no DDL here.
+    // Source = canonical facts that already carry a source-mode vector but
+    // NOT yet a target-mode one (WI-4092: delta-only — see the doc comment
+    // above). The canonical + vec tables exist from migration 081 (applied
+    // at embedded-PG boot) — no DDL here.
     const rows = await client.query<{ id: string; payload: Record<string, unknown> }>(
       `SELECT c.id, c.payload
          FROM ${schema}.memory_canonical c
-         JOIN ${fromTable} v ON v.memory_id = c.id`,
+         JOIN ${fromTable} v ON v.memory_id = c.id
+        WHERE NOT EXISTS (
+          SELECT 1 FROM ${toTable} t WHERE t.memory_id = c.id
+        )`,
     );
     const progress: ReembedProgress = {
       totalSource: rows.rowCount ?? 0,

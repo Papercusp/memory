@@ -124,6 +124,11 @@ describe('reembedMemories — happy path (GAP 5)', () => {
     const select = captured.find((q) => /SELECT/i.test(q.sql));
     expect(select?.sql).toContain('harness_shared.memory_canonical');
     expect(select?.sql).toContain('harness_shared.memory_vec_openai');
+    // WI-4092: delta-only — the SELECT excludes rows that already have a
+    // target-mode vector, so a switch (or a re-fire after a partial pass on
+    // a large corpus) only ever processes the remaining gap.
+    expect(select?.sql).toMatch(/NOT EXISTS/i);
+    expect(select?.sql).toContain('harness_shared.memory_vec_local');
     const inserts = captured.filter((q) => /INSERT/i.test(q.sql));
     expect(inserts).toHaveLength(3);
     expect(inserts[0].sql).toContain('harness_shared.memory_vec_local');
