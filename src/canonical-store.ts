@@ -113,6 +113,96 @@ function storeKindCond(alias: string, kind: 'memory' | 'entity'): string {
   return kind === 'entity' ? has : `NOT (${has})`;
 }
 
+/**
+ * Temporal-lite validity (memory-temporal-lite-validity-windows-2026-07-11
+ * P-002/P-006, migration 578). mem0 forwards our tool-layer read options as
+ * FILTER keys, but `as_of` / `include_superseded` are TEMPORAL controls, not
+ * payload-equality filters — split them out before the payload post-filter
+ * loop (left in, they'd silently match nothing: no payload carries them).
+ */
+interface TemporalControls {
+  /** Point-in-time read: valid_at (NULL ⇒ created_at) <= as_of < invalid_at. */
+  asOf?: string;
+  /** Opt-in: include rows whose validity window has closed. */
+  includeSuperseded: boolean;
+}
+
+function splitTemporalControls(filters?: SearchFilters): {
+  temporal: TemporalControls;
+  rest: SearchFilters | undefined;
+} {
+  if (!filters) return { temporal: { includeSuperseded: false }, rest: undefined };
+  const { as_of, include_superseded, ...rest } = filters as {
+    as_of?: unknown;
+    include_superseded?: unknown;
+  } & SearchFilters;
+  const asOfMs = typeof as_of === 'string' || typeof as_of === 'number' ? new Date(as_of).getTime() : NaN;
+  return {
+    temporal: {
+      ...(Number.isFinite(asOfMs) ? { asOf: new Date(asOfMs).toISOString() } : {}),
+      includeSuperseded:
+        include_superseded === true ||
+        include_superseded === 1 ||
+        include_superseded === '1' ||
+        include_superseded === 'true',
+    },
+    rest,
+  };
+}
+
+/**
+ * The default current-rows clause (memory kind only — entity rows are mem0's
+ * lifecycle, exempt by design). With `asOf` it becomes the point-in-time
+ * window; `includeSuperseded` drops it entirely. Returns the SQL condition
+ * (may push a param) or null for no condition.
+ */
+function validityCond(
+  alias: string,
+  temporal: TemporalControls,
+  params: unknown[],
+  nextIdx: () => number,
+): string | null {
+  if (temporal.asOf !== undefined) {
+    const i = nextIdx();
+    params.push(temporal.asOf);
+    return `COALESCE(${alias}valid_at, ${alias}created_at) <= $${i}::timestamptz AND (${alias}invalid_at IS NULL OR ${alias}invalid_at > $${i}::timestamptz)`;
+  }
+  if (temporal.includeSuperseded) return null;
+  return `(${alias}invalid_at IS NULL OR ${alias}invalid_at > now())`;
+}
+
+/**
+ * Fold the validity window into a result row's payload so it survives mem0's
+ * payload→metadata mapping (unknown payload keys land in result metadata —
+ * the same ride `kind` takes). Attached ONLY when the row carries a
+ * non-trivial window (or a point-in-time read asked): the 9.8k pre-migration
+ * rows are all-NULL ⇒ trivially 'current', and attaching nothing keeps their
+ * result shape byte-identical.
+ */
+function foldValidity(
+  payload: Record<string, unknown>,
+  row: { valid_at?: unknown; invalid_at?: unknown; superseded_by?: unknown },
+  temporal: TemporalControls,
+): Record<string, unknown> {
+  const validAt = row.valid_at ?? null;
+  const invalidAt = row.invalid_at ?? null;
+  const supersededBy = row.superseded_by ?? null;
+  if (validAt === null && invalidAt === null && supersededBy === null && temporal.asOf === undefined) {
+    return payload;
+  }
+  const refMs = temporal.asOf !== undefined ? new Date(temporal.asOf).getTime() : Date.now();
+  const invalidMs = invalidAt !== null ? new Date(String(invalidAt)).getTime() : null;
+  return {
+    ...payload,
+    validity: {
+      valid_at: validAt,
+      invalid_at: invalidAt,
+      superseded_by: supersededBy,
+      status: invalidMs !== null && invalidMs <= refMs ? 'superseded' : 'current',
+    },
+  };
+}
+
 export class CanonicalVectorStore {
   private cfg: CanonicalStoreConfig;
   /** 'entity' when mem0 constructed this instance as its entity store. */
