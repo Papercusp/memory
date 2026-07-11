@@ -180,3 +180,83 @@ describe('CanonicalVectorStore.deleteCol — the shared-table data-loss guard (G
     warn.mockRestore();
   });
 });
+
+describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () => {
+  /** Fake pool whose query resolves the given rows (payloads included). */
+  function makeLexStore(rows: Array<{ id: string; payload: Record<string, unknown> }>) {
+    const queries: CapturedQuery[] = [];
+    const fakePool = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        return { rows, rowCount: rows.length };
+      }),
+      on: () => {},
+    };
+    const { store } = makeStore('operator_memory_local');
+    (store as unknown as { pool: unknown }).pool = fakePool;
+    return { store, queries };
+  }
+
+  it('emits a token-ILIKE query over the canonical text with kind + archived + scope guards — and NO vec-table join', async () => {
+    const { store, queries } = makeLexStore([]);
+    await store.lexicalSearch('embed sidecar concurrency', 5, { user_id: 'scope-a' });
+    expect(queries).toHaveLength(1);
+    const q = queries[0];
+    expect(q.sql).toContain("NOT (payload ? 'entityType')");
+    expect(q.sql).toContain("state != 'archived'");
+    expect(q.sql).toContain("payload->>'user_id' = $1");
+    expect(q.sql).toContain("payload->>'data' ILIKE");
+    expect(q.sql).not.toContain('memory_vec'); // never touches an embedding table
+    expect(q.params).toContain('scope-a');
+    expect(q.params).toContain('%embed%');
+    expect(q.params).toContain('%sidecar%');
+    expect(q.params).toContain('%concurrency%');
+  });
+
+  it('escapes the LIKE single-char wildcard in tokens (user_id matches literally)', async () => {
+    const { store, queries } = makeLexStore([]);
+    await store.lexicalSearch('user_id', 5);
+    expect(queries[0].params).toContain('%user\\_id%');
+  });
+
+  it('a query with no usable tokens returns [] WITHOUT querying', async () => {
+    const { store, queries } = makeLexStore([]);
+    expect(await store.lexicalSearch('a b ??', 5)).toEqual([]);
+    expect(queries).toHaveLength(0);
+  });
+
+  it('scores by token-overlap fraction and orders descending', async () => {
+    const { store } = makeLexStore([
+      { id: 'one-token', payload: { data: 'the embed pipeline', user_id: 'u' } },
+      { id: 'both-tokens', payload: { data: 'embed sidecar is warm', user_id: 'u' } },
+    ]);
+    const out = await store.lexicalSearch('embed sidecar', 5, { user_id: 'u' });
+    expect(out.map((r) => r.id)).toEqual(['both-tokens', 'one-token']);
+    expect(out[0].score).toBe(1);
+    expect(out[1].score).toBe(0.5);
+  });
+
+  it('slices to topK after scoring', async () => {
+    const { store } = makeLexStore([
+      { id: 'a', payload: { data: 'embed one' } },
+      { id: 'b', payload: { data: 'embed two' } },
+      { id: 'c', payload: { data: 'embed three' } },
+    ]);
+    expect(await store.lexicalSearch('embed', 2)).toHaveLength(2);
+  });
+});
+
+describe('lexicalTokens', () => {
+  it('lowercases, drops short tokens, dedupes, caps at 8', () => {
+    expect(lexicalTokens('The EMBED embed of a x!')).toEqual(['the', 'embed']);
+    const many = lexicalTokens('alpha bravo charlie delta echo foxtrot golf hotel india juliet');
+    expect(many).toHaveLength(8);
+  });
+
+  it('keeps identifier-ish tokens intact (underscores/hyphens)', () => {
+    expect(lexicalTokens('PAPERCUSP_MEMORY_TOOL_TIMEOUT_MS op-deadline')).toEqual([
+      'papercusp_memory_tool_timeout_ms',
+      'op-deadline',
+    ]);
+  });
+});
