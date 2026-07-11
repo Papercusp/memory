@@ -50,6 +50,51 @@ const DEFAULT_SEARCH_LIMIT = 8;
 const LIST_TOP_K = 5000;
 
 /**
+ * Search-time memory decay (recency ranking bias) — the OSS-side
+ * equivalent of mem0 platform's "Memory Decay", which does NOT exist in
+ * mem0ai OSS ≤3.0.3 (the OSS dist has no decay/recency code; it is a
+ * hosted-platform feature). Applied as a pure RE-ORDERING bias after the
+ * relevance floor: an entry's sort key is `score × recencyFactor(age)`,
+ * but its REPORTED score stays the raw mem0 combined score, so every
+ * score-threshold consumer (P-016 dedup-on-write, the P-001/D-003
+ * relevance floor, orient's recall floor) keeps its calibration — decay
+ * changes what ranks first, never what qualifies.
+ *
+ * The factor is bounded below by DECAY_FLOOR, so an old-but-strong match
+ * loses at most (1 − floor) of its sort key: decay nudges near-ties
+ * toward fresh memories; it never buries a clearly better old one.
+ */
+function decayEnabled(): boolean {
+  return process.env.PAPERCUSP_MEMORY_DECAY !== '0';
+}
+function decayHalfLifeDays(): number {
+  const v = Number(process.env.PAPERCUSP_MEMORY_DECAY_HALF_LIFE_DAYS);
+  return Number.isFinite(v) && v > 0 ? v : 30;
+}
+function decayFloor(): number {
+  const v = Number(process.env.PAPERCUSP_MEMORY_DECAY_FLOOR);
+  return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.9;
+}
+/** Multiplicative sort-key factor in [floor, 1]; 1 when age is unknown. */
+export function recencyFactor(tsMs: number | null, nowMs: number): number {
+  if (tsMs === null) return 1;
+  const ageDays = Math.max(0, (nowMs - tsMs) / 86_400_000);
+  const floor = decayFloor();
+  return floor + (1 - floor) * Math.pow(0.5, ageDays / decayHalfLifeDays());
+}
+/** Freshness timestamp of a mem0 search row (updatedAt, else createdAt). */
+function rowTimestampMs(row: Mem0Row): number | null {
+  for (const key of ['updatedAt', 'createdAt'] as const) {
+    const raw = row[key];
+    if (typeof raw === 'string' || typeof raw === 'number') {
+      const t = new Date(raw).getTime();
+      if (Number.isFinite(t)) return t;
+    }
+  }
+  return null;
+}
+
+/**
  * Read one result row's event. mem0's add() has TWO wire shapes: the
  * infer (LLM-extraction) path reports a top-level `event`, while the
  * `infer: false` path nests it as `metadata.event` (verified against
@@ -167,7 +212,28 @@ export class Mem0Backend implements MemoryBackend {
       metadata,
       ...(opts.verbatim ? { infer: false } : {}),
     });
-    return { ids: extractAddedIds(result), storedEvents: extractStoredEventCount(result) };
+    const ids = extractAddedIds(result);
+    // Entity-linking parity for verbatim writes (owner directive
+    // 2026-07-10: enable mem0 v3 entity linking). mem0's `infer: false`
+    // branch early-returns BEFORE its Phase-7 entity linking, so verbatim
+    // rows — memory:remember's default — would never join the entity
+    // graph that search()'s entity boost ranks against, while
+    // extraction-path and update() rows do. Call the same per-memory
+    // linker mem0's update() uses. It is a private API, hence
+    // feature-detected and best-effort: a mem0 upgrade that renames it
+    // makes this a silent no-op, and a linking failure never fails the
+    // write (mirrors mem0's own non-fatal entity-store posture).
+    if (opts.verbatim && ids.length > 0) {
+      const linker = (client as {
+        _linkEntitiesForMemory?: (memoryId: string, text: string, filters: Record<string, string>) => Promise<void>;
+      })._linkEntitiesForMemory;
+      if (typeof linker === 'function') {
+        for (const id of ids) {
+          await linker.call(client, id, text, { user_id: opts.scope }).catch(() => {});
+        }
+      }
+    }
+    return { ids, storedEvents: extractStoredEventCount(result) };
   }
 
   async search(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
@@ -180,6 +246,9 @@ export class Mem0Backend implements MemoryBackend {
     // scoping structurally avoids. A re-rank pass would only matter if one scope
     // ever neared ~1k entries (not the case today). An empty scope produces zero
     // pulls (scopesOf drops blanks), never an unscoped full-table scan.
+    // id → freshness ts for the decay re-order below (collected from the raw
+    // rows because `toEntry` deliberately drops mem0's createdAt/updatedAt).
+    const tsById = new Map<string, number | null>();
     const pulls = scopesOf(opts.scope).map(async (scope) => {
       // mem0's Memory.search reads `topK` (default 20) and IGNORES a
       // `limit` key — passing only `limit` silently over-fetched and
@@ -187,14 +256,26 @@ export class Mem0Backend implements MemoryBackend {
       // memory-backend-benchmark P-007 run). Keep `limit` for any
       // non-mem0 MemoryClient test doubles.
       const r = await client.search(query, { filters: { user_id: scope }, topK: limit, limit });
-      return (r.results ?? []).map((row) => toEntry(row, scope));
+      return (r.results ?? []).map((row) => {
+        tsById.set(row.id, rowTimestampMs(row));
+        return toEntry(row, scope);
+      });
     });
     const ranked = mergeById((await Promise.all(pulls)).flat()).sort(
       (a, b) => (b.score ?? 0) - (a.score ?? 0),
     );
     // Relevance floor (P-001 / D-003): drop hits too weak to be real matches, so
     // an out-of-corpus query returns nothing instead of nearest-neighbour noise.
-    return applyScoreFloor(ranked, { minScore: opts.minScore, minScoreRatio: opts.minScoreRatio });
+    const floored = applyScoreFloor(ranked, { minScore: opts.minScore, minScoreRatio: opts.minScoreRatio });
+    if (!decayEnabled()) return floored;
+    // Memory decay (recency ranking bias) — re-order AFTER the floor so the
+    // admitted set is identical with decay on or off; see recencyFactor.
+    const now = Date.now();
+    return [...floored].sort(
+      (a, b) =>
+        (b.score ?? 0) * recencyFactor(tsById.get(b.id) ?? null, now) -
+        (a.score ?? 0) * recencyFactor(tsById.get(a.id) ?? null, now),
+    );
   }
 
   async list(opts: ListOptions): Promise<MemoryEntry[]> {
