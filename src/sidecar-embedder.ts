@@ -1,26 +1,32 @@
 /**
  * Sidecar-first embedder client (P-003, plan
- * shared-embedding-sidecar-and-enrichment-2026-07-10).
+ * shared-embedding-sidecar-and-enrichment-2026-07-10; sidecar-REQUIRED since
+ * WI-4021, owner directive 2026-07-11).
  *
- * The consumer-side seam for the shared embedding sidecar: an EmbedFn that
- * tries the loopback sidecar (D-004 wire — POST {url}/embed { model, kind,
- * texts }) and AUTOMATICALLY falls back to the caller-supplied in-process
- * embedder when the sidecar is down. Embedding is never 'disabled' by a
- * sidecar outage (D-003) — worst case is exactly today's in-process behavior.
+ * The consumer-side seam for the shared embedding sidecar: an EmbedFn over the
+ * loopback sidecar (D-004 wire — POST {url}/embed { model, kind, texts }).
  *
- * Vectors from the two paths are BIT-IDENTICAL by construction (D-002): the
- * sidecar wraps the SAME @papercusp/memory builders (model, prompts, MRL
- * truncation, ORT runtime) the fallback uses — same space, so a mid-stream
- * failover never mixes spaces.
+ * AVAILABILITY CONTRACT (v2 — D-003 retired): when a sidecar URL is
+ * configured, the sidecar is REQUIRED. A failure is retried briefly (the
+ * sidecar is systemd-supervised with Restart=always, so a crash window is
+ * seconds) and then THROWN — never silently absorbed by an in-process model
+ * load. The old D-003 in-process failover let a stalling sidecar drag every
+ * embedding host into duplicate in-process model loads (the 2026-07-11
+ * "mem0 down" flap incident) and hid sidecar sickness instead of surfacing
+ * it; memory writes survive a real outage via the write-ahead journal
+ * (memory-write-journal-auto-recovery-2026-07-11), reads fail loudly.
  *
- * Down-handling: any sidecar failure (connect refused, timeout, non-200, bad
- * shape) marks the sidecar down for `reprobeAfterMs` (default 30s); embeds in
- * that window go straight to the fallback with zero sidecar round-trips. After
- * the cooldown the next embed simply tries the sidecar again — the embed IS
- * the probe (a separate healthz round-trip would buy nothing the embed itself
- * doesn't prove). The default per-embed budget is generous (15s) because a
- * freshly-spawned sidecar may still be warm-loading the model on its first
- * request; a budget trip just means one cooldown on the fallback path.
+ * The caller-supplied in-process builder is used ONLY when NO sidecar is
+ * configured (url null — desktop installs, tests, bench rigs): there it is
+ * the sole engine, not a fallback. Vectors are BIT-IDENTICAL either way
+ * (D-002): the sidecar wraps the SAME @papercusp/memory builders (model,
+ * prompts, MRL truncation, ORT runtime) — same space on every path.
+ *
+ * Retry shape: one total `timeoutMs` budget (default 15s — a freshly
+ * restarted sidecar may still be warm-loading) spans ALL attempts, so a
+ * slow-but-alive sidecar is never hammered past its budget; fast failures
+ * (connect refused during a restart) get up to `maxAttempts` tries with short
+ * linear backoff inside that budget.
  *
  * Plain `fetch`, zero new dependencies — this library is deliberately dep-free
  * (pg only); the server lives in operator-core, never here.
@@ -56,7 +62,9 @@ export interface SidecarEmbedResponse {
 }
 
 export const DEFAULT_SIDECAR_TIMEOUT_MS = 15_000;
-export const DEFAULT_REPROBE_AFTER_MS = 30_000;
+/** Attempts per embed when the sidecar is required (fast failures only — the
+ *  shared `timeoutMs` budget caps total wall time regardless). */
+export const DEFAULT_SIDECAR_MAX_ATTEMPTS = 3;
 
 /**
  * One D-004 wire call. Throws on ANY failure (network, timeout, non-200,
@@ -95,91 +103,108 @@ export async function sidecarEmbedBatch(url: string, opts: SidecarEmbedBatchOpts
 }
 
 export interface SidecarFirstEmbedderOpts {
-  /** Sidecar-side model name ('gemma' | 'local'). */
+  /** Sidecar-side model name ('gemma' | 'local' | 'harrier'). */
   model: string;
   /** Asymmetric task side — the sidecar owns the actual prompt text (D-004). */
   kind: GemmaEmbedKind;
-  /** Lazy builder for the in-process fallback embedder (built at most once,
-   *  on first need — never eagerly, so the sidecar-served happy path loads no
-   *  local model). */
+  /** Lazy builder for the in-process embedder — used ONLY when no sidecar is
+   *  configured (url null), where it is the sole engine. When a url is set it
+   *  is never built: the sidecar is required (WI-4021, D-003 retired). */
   fallback: () => EmbedFn | Promise<EmbedFn>;
   /** Sidecar base URL; defaults to resolveEmbedSidecarUrl(). null/absent ⇒
-   *  pure fallback. */
+   *  pure in-process. */
   url?: string | null;
+  /** TOTAL budget per embed across every attempt (default 15s). */
   timeoutMs?: number;
-  /** How long a sidecar failure parks embeds on the fallback before retrying. */
-  reprobeAfterMs?: number;
+  /** Attempts within the budget on sidecar failure (default 3). */
+  maxAttempts?: number;
   fetchFn?: typeof fetch;
   /** Clock seam for tests. */
   now?: () => number;
+  /** Backoff-sleep seam for tests. */
+  sleepFn?: (ms: number) => Promise<void>;
   /** Down/up transition logging seam (default console.warn, transition-only). */
   onTransition?: (state: 'down' | 'up', detail: string) => void;
 }
 
 /**
- * Build a sidecar-first EmbedFn: sidecar when it answers, in-process fallback
- * when it doesn't, cooldown between retries. Same closure shape as
- * buildGemmaEmbedder/buildLocalEmbedder so it drops into every existing
- * embedder seam.
+ * Build a sidecar-first EmbedFn. With a url: sidecar-REQUIRED — brief retries
+ * inside one total budget, then throw (`sidecar_required_unavailable`); the
+ * in-process builder is never touched. Without a url: the plain in-process
+ * embedder. Same closure shape as buildGemmaEmbedder/buildLocalEmbedder so it
+ * drops into every existing embedder seam.
  */
 export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): EmbedFn {
   const url = opts.url === undefined ? resolveEmbedSidecarUrl() : opts.url;
   const now = opts.now ?? Date.now;
-  const reprobeAfterMs = opts.reprobeAfterMs ?? DEFAULT_REPROBE_AFTER_MS;
+  const sleep = opts.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_SIDECAR_TIMEOUT_MS;
+  const maxAttempts = Math.max(1, opts.maxAttempts ?? DEFAULT_SIDECAR_MAX_ATTEMPTS);
   const onTransition =
     opts.onTransition ??
     ((state: 'down' | 'up', detail: string) =>
       console.warn(`[sidecar-embedder] ${opts.model}:${opts.kind} sidecar ${state}: ${detail}`));
 
-  let fallbackPromise: Promise<EmbedFn> | null = null;
-  const getFallback = (): Promise<EmbedFn> => {
-    // A failed fallback build is not memoized — the next embed retries it.
-    if (!fallbackPromise) {
-      fallbackPromise = Promise.resolve()
-        .then(() => opts.fallback())
-        .catch((e) => {
-          fallbackPromise = null;
-          throw e;
-        });
-    }
-    return fallbackPromise;
-  };
-
   if (!url) {
-    // No sidecar configured: the seam degenerates to the plain in-process
-    // embedder with zero per-call overhead.
+    // No sidecar configured: the plain in-process embedder is the sole engine
+    // (desktop installs, tests, bench rigs) with zero per-call overhead. A
+    // failed build is not memoized — the next embed retries it.
+    let fallbackPromise: Promise<EmbedFn> | null = null;
+    const getFallback = (): Promise<EmbedFn> => {
+      if (!fallbackPromise) {
+        fallbackPromise = Promise.resolve()
+          .then(() => opts.fallback())
+          .catch((e) => {
+            fallbackPromise = null;
+            throw e;
+          });
+      }
+      return fallbackPromise;
+    };
     return async (text: string) => (await getFallback())(text);
   }
 
-  let downUntil = 0;
   let wasDown = false;
 
   return async (text: string): Promise<number[]> => {
-    if (now() >= downUntil) {
+    const deadline = now() + timeoutMs;
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const remaining = deadline - now();
+      if (remaining <= 0) break;
       try {
         const res = await sidecarEmbedBatch(url, {
           model: opts.model,
           kind: opts.kind,
           texts: [text],
-          timeoutMs: opts.timeoutMs,
+          timeoutMs: remaining,
           fetchFn: opts.fetchFn,
         });
         if (wasDown) {
           wasDown = false;
-          onTransition('up', 'sidecar answering again');
+          onTransition('up', `sidecar answering again (attempt ${attempt})`);
         }
         return res.vectors[0];
       } catch (e) {
-        downUntil = now() + reprobeAfterMs;
+        lastErr = e;
         if (!wasDown) {
           wasDown = true;
           onTransition(
             'down',
-            `${e instanceof Error ? e.message : String(e)} — embedding continues IN-PROCESS (D-003), retry in ${Math.round(reprobeAfterMs / 1000)}s`,
+            `${e instanceof Error ? e.message : String(e)} — sidecar is REQUIRED (no in-process fallback, WI-4021); retrying within budget`,
           );
         }
+        // Short linear backoff before the next attempt — but only when enough
+        // budget remains for the backoff AND a meaningful retry.
+        const backoffMs = 250 * attempt;
+        if (attempt < maxAttempts && deadline - now() > backoffMs + 250) await sleep(backoffMs);
+        else break;
       }
     }
-    return (await getFallback())(text);
+    throw new Error(
+      `sidecar_required_unavailable: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
+        `(${url}, ${opts.model}:${opts.kind}, budget ${timeoutMs}ms) — embedding requires the sidecar; ` +
+        'writes are parked in the memory write journal and auto-recover when it returns',
+    );
   };
 }

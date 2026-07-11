@@ -1,14 +1,17 @@
 /**
- * P-003 (shared-embedding-sidecar-and-enrichment-2026-07-10): the sidecar-first
- * client seam. Contracts under test:
+ * P-003 (shared-embedding-sidecar-and-enrichment-2026-07-10; sidecar-REQUIRED
+ * since WI-4021): the sidecar-first client seam. Contracts under test:
  *  - up-path: vectors come from the sidecar over the exact D-004 wire body;
- *  - down-path: ANY sidecar failure falls back to the in-process embedder
- *    (D-003 — never throws, never 'disabled'), with a cooldown so the down
- *    window costs ZERO extra sidecar round-trips;
- *  - re-probe: after the cooldown the next embed retries the sidecar;
+ *  - required-path: with a url configured, ANY sidecar failure is retried
+ *    briefly inside ONE total budget and then THROWN
+ *    (sidecar_required_unavailable) — the in-process builder is NEVER built
+ *    (D-003 retired: no silent in-process failover);
+ *  - blip recovery: a restart-window failure recovers on a retry attempt
+ *    within the same call, with down/up transitions reported once each;
+ *  - no-url path: the in-process embedder is the sole engine (not a fallback);
  *  - identical-vector pin (D-002, seam-level): the two paths return the SAME
- *    vector for the same text — the failover is invisible to consumers. (The
- *    live bit-identical proof against a real model runs in the P-005 smoke.)
+ *    vector for the same text. (The live bit-identical proof against a real
+ *    model runs in the P-005 smoke.)
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import * as http from 'node:http';
@@ -124,33 +127,34 @@ describe('buildSidecarFirstEmbedder', () => {
     expect(fallbackBuilds).toBe(0);
   });
 
-  it('down-path: falls back in-process, and the cooldown window skips the sidecar entirely', async () => {
+  it('required-path: persistent failure retries within the budget then THROWS — fallback never built', async () => {
     let fetchAttempts = 0;
     const failingFetch: typeof fetch = async () => {
       fetchAttempts++;
       throw new Error('connect ECONNREFUSED');
     };
-    let t = 1_000_000;
+    let fallbackBuilds = 0;
     const transitions: string[] = [];
     const embed = buildSidecarFirstEmbedder({
       model: 'gemma',
       kind: 'document',
       url: 'http://127.0.0.1:1', // never reached — fetchFn injected
-      fallback: () => async (text: string) => [text.length, 0, 0],
+      fallback: () => {
+        fallbackBuilds++;
+        return async (text: string) => [text.length, 0, 0];
+      },
       fetchFn: failingFetch,
-      now: () => t,
-      reprobeAfterMs: 30_000,
+      sleepFn: async () => {}, // no real backoff waits in tests
       onTransition: (state) => transitions.push(state),
     });
 
-    expect(await embed('abc')).toEqual([3, 0, 0]); // failure #1 → fallback
-    t += 1_000; // still inside the cooldown
-    expect(await embed('abcd')).toEqual([4, 0, 0]);
-    expect(fetchAttempts).toBe(1); // cooldown = zero extra sidecar round-trips
-    expect(transitions).toEqual(['down']); // transition-only, not per-embed
+    await expect(embed('abc')).rejects.toThrow(/sidecar_required_unavailable/);
+    expect(fetchAttempts).toBe(3); // DEFAULT_SIDECAR_MAX_ATTEMPTS
+    expect(fallbackBuilds).toBe(0); // in-process is NEVER a fallback (WI-4021)
+    expect(transitions).toEqual(['down']); // transition-only, not per-attempt
   });
 
-  it('re-probe: after the cooldown the sidecar is retried and recovery is reported', async () => {
+  it('blip recovery: a restart-window failure recovers on a retry within the same call', async () => {
     const stub = await startStubSidecar();
     closers.push(stub.close);
     let failNext = true;
@@ -161,26 +165,43 @@ describe('buildSidecarFirstEmbedder', () => {
       }
       return fetch(...args);
     };
-    let t = 1_000_000;
     const transitions: string[] = [];
     const embed = buildSidecarFirstEmbedder({
       model: 'gemma',
       kind: 'query',
       url: stub.url,
-      fallback: () => async () => [7, 7, 7],
+      fallback: () => {
+        throw new Error('must not build the in-process embedder');
+      },
       fetchFn: flakyFetch,
-      now: () => t,
-      reprobeAfterMs: 30_000,
+      sleepFn: async () => {},
       onTransition: (state) => transitions.push(state),
     });
 
-    expect(await embed('x')).toEqual([7, 7, 7]); // down → fallback
-    t += 30_001; // cooldown elapsed
-    expect(await embed('x')).toEqual(PINNED_VECTOR); // re-probe succeeds
+    expect(await embed('x')).toEqual(PINNED_VECTOR); // attempt 2 serves it
     expect(transitions).toEqual(['down', 'up']);
   });
 
-  it('no url configured: pure fallback, no fetch at all', async () => {
+  it('stops retrying once the budget cannot fit another attempt', async () => {
+    let fetchAttempts = 0;
+    const failingFetch: typeof fetch = async () => {
+      fetchAttempts++;
+      throw new Error('boom');
+    };
+    const embed = buildSidecarFirstEmbedder({
+      model: 'gemma',
+      kind: 'query',
+      url: 'http://127.0.0.1:1',
+      fallback: () => async () => [1],
+      fetchFn: failingFetch,
+      timeoutMs: 100, // too small for the 250ms backoff + a meaningful retry
+      onTransition: () => {},
+    });
+    await expect(embed('x')).rejects.toThrow(/sidecar_required_unavailable/);
+    expect(fetchAttempts).toBe(1);
+  });
+
+  it('no url configured: pure in-process engine, no fetch at all', async () => {
     let fetched = 0;
     const spyFetch: typeof fetch = async () => {
       fetched++;

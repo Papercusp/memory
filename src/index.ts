@@ -144,7 +144,7 @@ export {
   resolveEmbedSidecarUrl,
   EMBED_SIDECAR_URL_ENV,
   DEFAULT_SIDECAR_TIMEOUT_MS,
-  DEFAULT_REPROBE_AFTER_MS,
+  DEFAULT_SIDECAR_MAX_ATTEMPTS,
   type SidecarFirstEmbedderOpts,
   type SidecarEmbedBatchOpts,
   type SidecarEmbedResponse,
