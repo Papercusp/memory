@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Mem0Backend, extractAddedIds, extractStoredEventCount } from './mem0-backend';
 import { MemoryUnavailableError } from './backend';
 import type { MemoryClient } from './mem0-client';
@@ -415,5 +415,134 @@ describe('Mem0Backend.rememberConversation', () => {
     await expect(
       be.rememberConversation([{ role: 'user', content: 'hi' }], { scope: 'userA' }),
     ).rejects.toBeInstanceOf(MemoryUnavailableError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Memory decay (recency ranking bias) — search-time re-ordering only.
+// The OSS equivalent of mem0 platform's Memory Decay (absent from mem0ai
+// ≤3.0.3 OSS). Scores stay RAW so threshold consumers keep calibration.
+// ---------------------------------------------------------------------------
+describe('Mem0Backend.search — memory decay (recency ranking bias)', () => {
+  const DAY = 86_400_000;
+  const iso = (agoMs: number): string => new Date(Date.now() - agoMs).toISOString();
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('re-orders a near-tie toward the fresher memory, scores unchanged', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient(
+      {
+        userA: [
+          { id: 'old', memory: 'x', score: 0.8, updatedAt: iso(60 * DAY) } as Row,
+          { id: 'fresh', memory: 'y', score: 0.76, updatedAt: iso(0) } as Row,
+        ],
+      },
+      calls,
+    );
+    const be = new Mem0Backend({ getClient: async () => client });
+    const out = await be.search('q', { scope: 'userA', limit: 6 });
+    // sort keys (floor .9, half-life 30d): old .8×.925=.74 < fresh .76×1=.76
+    expect(out.map((e) => e.id)).toEqual(['fresh', 'old']);
+    // reported scores are the RAW mem0 scores — decay never rewrites them
+    expect(out.map((e) => e.score)).toEqual([0.76, 0.8]);
+  });
+
+  it('is bounded: a clearly stronger old match stays ahead of a weak fresh one', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient(
+      {
+        userA: [
+          { id: 'old', memory: 'x', score: 0.9, updatedAt: iso(365 * DAY) } as Row,
+          { id: 'fresh', memory: 'y', score: 0.7, updatedAt: iso(0) } as Row,
+        ],
+      },
+      calls,
+    );
+    const be = new Mem0Backend({ getClient: async () => client });
+    const out = await be.search('q', { scope: 'userA', limit: 6 });
+    // even fully decayed, old's key is ≥ .9×.9=.81 > fresh's .7
+    expect(out.map((e) => e.id)).toEqual(['old', 'fresh']);
+  });
+
+  it('PAPERCUSP_MEMORY_DECAY=0 disables the re-ordering', async () => {
+    vi.stubEnv('PAPERCUSP_MEMORY_DECAY', '0');
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient(
+      {
+        userA: [
+          { id: 'old', memory: 'x', score: 0.8, updatedAt: iso(60 * DAY) } as Row,
+          { id: 'fresh', memory: 'y', score: 0.76, updatedAt: iso(0) } as Row,
+        ],
+      },
+      calls,
+    );
+    const be = new Mem0Backend({ getClient: async () => client });
+    const out = await be.search('q', { scope: 'userA', limit: 6 });
+    expect(out.map((e) => e.id)).toEqual(['old', 'fresh']);
+  });
+
+  it('rows without timestamps rank by raw score (factor 1)', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient(
+      {
+        userA: [
+          { id: 'a', memory: 'x', score: 0.8 },
+          { id: 'b', memory: 'y', score: 0.76 },
+        ],
+      },
+      calls,
+    );
+    const be = new Mem0Backend({ getClient: async () => client });
+    const out = await be.search('q', { scope: 'userA', limit: 6 });
+    expect(out.map((e) => e.id)).toEqual(['a', 'b']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Entity-linking parity for verbatim writes: mem0's infer:false branch skips
+// its Phase-7 entity linking, so remember(verbatim) calls the same private
+// per-memory linker mem0's update() uses — feature-detected, best-effort.
+// ---------------------------------------------------------------------------
+describe('Mem0Backend.remember — entity-linking parity on verbatim writes', () => {
+  it('links entities for each ADD id with the scope as user_id', async () => {
+    const linker = vi.fn(async () => {});
+    const add = vi.fn(async () => ({ results: [{ id: UUID_A, metadata: { event: 'ADD' } }] }));
+    const client = stubClient({ add, _linkEntitiesForMemory: linker } as Record<string, unknown>);
+    const be = new Mem0Backend({ getClient: async () => client });
+    const out = await be.remember('WI-1234 shipped', { scope: 'userA', verbatim: true });
+    expect(out.ids).toEqual([UUID_A]);
+    expect(linker).toHaveBeenCalledTimes(1);
+    expect(linker).toHaveBeenCalledWith(UUID_A, 'WI-1234 shipped', { user_id: 'userA' });
+  });
+
+  it('does NOT invoke the linker on the non-verbatim (infer) path — mem0 links internally there', async () => {
+    const linker = vi.fn(async () => {});
+    const add = vi.fn(async () => ({ results: [{ id: UUID_A, event: 'ADD' }] }));
+    const client = stubClient({ add, _linkEntitiesForMemory: linker } as Record<string, unknown>);
+    const be = new Mem0Backend({ getClient: async () => client });
+    await be.remember('fact', { scope: 'userA' });
+    expect(linker).not.toHaveBeenCalled();
+  });
+
+  it('a linker failure never fails the write', async () => {
+    const linker = vi.fn(async () => {
+      throw new Error('entity store down');
+    });
+    const add = vi.fn(async () => ({ results: [{ id: UUID_A, metadata: { event: 'ADD' } }] }));
+    const client = stubClient({ add, _linkEntitiesForMemory: linker } as Record<string, unknown>);
+    const be = new Mem0Backend({ getClient: async () => client });
+    const out = await be.remember('fact', { scope: 'userA', verbatim: true });
+    expect(out.ids).toEqual([UUID_A]);
+  });
+
+  it('no linker on the client (mem0 upgrade) → silent no-op, write succeeds', async () => {
+    const add = vi.fn(async () => ({ results: [{ id: UUID_A, metadata: { event: 'ADD' } }] }));
+    const client = stubClient({ add });
+    const be = new Mem0Backend({ getClient: async () => client });
+    const out = await be.remember('fact', { scope: 'userA', verbatim: true });
+    expect(out.ids).toEqual([UUID_A]);
   });
 });
