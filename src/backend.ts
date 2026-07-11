@@ -59,6 +59,13 @@ export interface RememberOptions {
    * lands byte-identical (memory-backend-benchmark D-008).
    */
   verbatim?: boolean;
+  /**
+   * OPT-IN federation egress (F0-2): true = this memory may federate to
+   * other hives. Default false — memories are hive-private. Backends that
+   * support federation should store this as a first-class column or in
+   * metadata for capture-trigger filtering.
+   */
+  shareable?: boolean;
 }
 
 export interface SearchOptions {

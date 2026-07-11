@@ -205,6 +205,7 @@ export class Mem0Backend implements MemoryBackend {
     const client = await this.client();
     const metadata: Record<string, unknown> = { ...(opts.metadata ?? {}) };
     if (opts.kind !== undefined) metadata.kind = opts.kind;
+    if (opts.shareable !== undefined) metadata.shareable = opts.shareable;
     // `verbatim` → mem0's `infer: false`: skip the LLM fact-extraction and
     // embed + insert the raw text as exactly one ADD (D-008 — bulk seeding).
     const result = await client.add(text, {
