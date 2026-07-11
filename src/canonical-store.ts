@@ -302,11 +302,16 @@ export class CanonicalVectorStore {
   ): Promise<VectorStoreResult[]> {
     const client = await this.getClient();
     const vecTable = `${this.cfg.schema}.${this.cfg.vecTable}`;
+    // Temporal controls are split out for BOTH kinds (left in the filter map
+    // they'd become payload-equality conds matching nothing); the validity
+    // clause itself applies to memory rows only — entity rows are mem0's
+    // lifecycle, exempt by design.
+    const { temporal, rest } = splitTemporalControls(filters);
     const conds: string[] = [storeKindCond('c.', this.storeKind), `c.state != 'archived'`];
     const params: unknown[] = [toVectorLiteral(query), topK];
     let idx = 3;
-    if (filters) {
-      for (const [key, value] of Object.entries(filters)) {
+    if (rest) {
+      for (const [key, value] of Object.entries(rest)) {
         if (value === undefined || value === null) continue;
         if (typeof value !== 'string' && typeof value !== 'number') continue;
         conds.push(`c.payload->>'${safeKey(key)}' = $${idx}`);
@@ -314,9 +319,14 @@ export class CanonicalVectorStore {
         idx++;
       }
     }
+    if (this.storeKind === 'memory') {
+      const vCond = validityCond('c.', temporal, params, () => idx++);
+      if (vCond) conds.push(vCond);
+    }
     const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
     const sql = `
-      SELECT c.id, c.payload, 1 - (v.vector <=> $1::vector) AS score
+      SELECT c.id, c.payload, c.valid_at, c.invalid_at, c.superseded_by,
+             1 - (v.vector <=> $1::vector) AS score
       FROM ${vecTable} v
       JOIN ${this.cfg.schema}.memory_canonical c ON c.id = v.memory_id
       ${where}
@@ -324,11 +334,20 @@ export class CanonicalVectorStore {
       LIMIT $2
     `;
     const res = await client.query(sql, params);
-    return res.rows.map((r: { id: string; payload: Record<string, unknown>; score: string | number }) => ({
-      id: r.id,
-      payload: r.payload,
-      score: Number(r.score),
-    }));
+    return res.rows.map(
+      (r: {
+        id: string;
+        payload: Record<string, unknown>;
+        valid_at?: unknown;
+        invalid_at?: unknown;
+        superseded_by?: unknown;
+        score: string | number;
+      }) => ({
+        id: r.id,
+        payload: this.storeKind === 'memory' ? foldValidity(r.payload, r, temporal) : r.payload,
+        score: Number(r.score),
+      }),
+    );
   }
 
   // mem0 calls this for BM25 hybrid scoring. Returning null tells mem0
