@@ -281,3 +281,36 @@ describe('HybridBackend (P-020)', () => {
     expect(lexSearch).not.toHaveBeenCalled();
   });
 });
+
+describe('HybridBackend searchLexical (WI-4214 embed-free fallback)', () => {
+  it('prefers the cosine leg\'s lexical capability (canonical store covers ALL memories)', async () => {
+    const cosineLex = vi.fn(async () => [e('canonical-hit', 0.5)]);
+    const cosine = fakeBackend('cosine', [], { searchLexical: cosineLex } as Partial<MemoryBackend>);
+    const lexSearch = vi.fn(async () => [e('projected-hit', 1)]);
+    const lexical = fakeBackend('lexical', [], { search: lexSearch });
+    const hy = new HybridBackend(lexical, cosine);
+    const out = await hy.searchLexical('q', { scope: 's', limit: 3 });
+    expect(out.map((x) => x.id)).toEqual(['canonical-hit']);
+    expect(cosineLex).toHaveBeenCalledWith('q', { scope: 's', limit: 3 });
+    expect(lexSearch).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the native lexical leg when the cosine leg lacks the capability', async () => {
+    const cosine = fakeBackend('cosine', []);
+    const lexical = fakeBackend('lexical', [e('projected-hit', 1)]);
+    const hy = new HybridBackend(lexical, cosine);
+    const out = await hy.searchLexical('q', { scope: 's', limit: 3 });
+    expect(out.map((x) => x.id)).toEqual(['projected-hit']);
+  });
+
+  it('falls back to the native lexical leg when the cosine lexical THROWS (degraded path stays serving)', async () => {
+    const cosine = fakeBackend('cosine', [], {
+      searchLexical: vi.fn(async () => {
+        throw new Error('pg down');
+      }),
+    } as Partial<MemoryBackend>);
+    const lexical = fakeBackend('lexical', [e('projected-hit', 1)]);
+    const hy = new HybridBackend(lexical, cosine);
+    expect((await hy.searchLexical('q', { scope: 's' })).map((x) => x.id)).toEqual(['projected-hit']);
+  });
+});

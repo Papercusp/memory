@@ -546,3 +546,49 @@ describe('Mem0Backend.remember — entity-linking parity on verbatim writes', ()
     expect(out.ids).toEqual([UUID_A]);
   });
 });
+
+describe('Mem0Backend.searchLexical (WI-4214 embed-free fallback)', () => {
+  it('fans out per scope with a user_id filter, maps canonical payloads, merges + sorts by score', async () => {
+    const calls: Array<{ query: string; topK: number; filters: Record<string, string> }> = [];
+    const be = new Mem0Backend({
+      // getClient is deliberately NEVER touched on this path (no embed, no mem0
+      // client): a throwing stub proves it.
+      getClient: async () => {
+        throw new Error('must not build a client on the lexical path');
+      },
+      lexicalSearch: async (query, topK, filters) => {
+        calls.push({ query, topK, filters });
+        if (filters.user_id === 'userA') {
+          return [
+            {
+              id: 'm-1',
+              payload: { data: 'embed sidecar fact', user_id: 'userA', kind: 'project', anchors: ['WI-4214'] },
+              score: 0.5,
+            },
+          ];
+        }
+        return [
+          { id: 'm-2', payload: { data: 'harness fact about embed', user_id: 'harness:x' }, score: 1 },
+        ];
+      },
+    });
+
+    const out = await be.searchLexical('embed sidecar', { scope: ['userA', 'harness:x'], limit: 4 });
+
+    expect(calls.map((c) => c.filters.user_id).sort()).toEqual(['harness:x', 'userA']);
+    expect(calls.every((c) => c.query === 'embed sidecar' && c.topK === 4)).toBe(true);
+    // Sorted by token-overlap score desc; payload.data lands as text; user_id
+    // is dropped from metadata (redundant with scope) while the rest survives.
+    expect(out.map((e) => e.id)).toEqual(['m-2', 'm-1']);
+    expect(out[1]).toMatchObject({
+      id: 'm-1',
+      text: 'embed sidecar fact',
+      kind: 'project',
+      scope: 'userA',
+      score: 0.5,
+    });
+    expect(out[1].metadata).toEqual({ kind: 'project', anchors: ['WI-4214'] });
+    expect(out[1].metadata).not.toHaveProperty('data');
+    expect(out[1].metadata).not.toHaveProperty('user_id');
+  });
+});

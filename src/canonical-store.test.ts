@@ -13,7 +13,7 @@
  * integration proof).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { CanonicalVectorStore, type CanonicalStoreConfig } from './canonical-store';
+import { CanonicalVectorStore, lexicalTokens, type CanonicalStoreConfig } from './canonical-store';
 
 type CapturedQuery = { sql: string; params: unknown[] };
 
