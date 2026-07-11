@@ -170,6 +170,18 @@ export interface MemoryBackend {
   /** Semantic/text search. See `SearchOptions` for limit semantics. */
   search(query: string, opts: SearchOptions): Promise<MemoryEntry[]>;
 
+  /**
+   * OPTIONAL capability: EMBED-FREE lexical search over the same pools —
+   * the degraded-path fallback for when the semantic leg is unusable (an
+   * overloaded/saturated embedder times `search` out while the store
+   * itself is fine — WI-4214). Must never invoke an embedder; a plain
+   * token/keyword match is the contract, and scores are backend-native
+   * (ordering only, NOT on the cosine scale). Backends whose `search` is
+   * already lexical (file stores) alias it; callers feature-test
+   * (`backend.searchLexical?.(…)`).
+   */
+  searchLexical?(query: string, opts: SearchOptions): Promise<MemoryEntry[]>;
+
   /** Enumerate entries in the given pools (insertion order unspecified). */
   list(opts: ListOptions): Promise<MemoryEntry[]>;
 

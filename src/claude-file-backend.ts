@@ -160,6 +160,12 @@ export class ClaudeFileMemoryBackend implements MemoryBackend {
     return [...merged.values()].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
   }
 
+  /** search() is already a pure token match with no embedder — the lexical
+   *  capability (WI-4214) is the same call. */
+  searchLexical(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
+    return this.search(query, opts);
+  }
+
   async list(opts: ListOptions): Promise<MemoryEntry[]> {
     const entries = this.collect();
     const merged = new Map<string, MemoryEntry>();

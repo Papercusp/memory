@@ -131,6 +131,29 @@ export async function updateMemoryPayload(id: string, patch: Record<string, unkn
 }
 
 /**
+ * EMBED-FREE lexical search over the canonical store (the store half of
+ * `Mem0Backend.searchLexical` — WI-4214's degraded-path fallback). Same
+ * live-store access pattern as `updateMemoryPayload`: any live
+ * `CanonicalVectorStore` works (they all point at the one shared
+ * `memory_canonical` table; which vec table it owns is irrelevant — this
+ * path never joins one). NOTE the availability asymmetry this fallback
+ * relies on: in the saturated-embedder case the mem0 client is already
+ * built and cached, so `getMemoryClient()` returns instantly and NO embed
+ * happens anywhere on this path; only a cold client build can fail here,
+ * and the caller surfaces that as fallback-unavailable.
+ */
+export async function lexicalSearchCanonical(
+  query: string,
+  topK: number,
+  filters: Record<string, string>,
+): Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>> {
+  await getMemoryClient(); // reuse the cached client so a canonical store exists
+  const store = [..._liveCanonicalStores][0];
+  if (!store) throw new Error('mem0_unavailable');
+  return store.lexicalSearch(query, topK, filters);
+}
+
+/**
  * mem0ai 3.x has NO `custom` embedder provider — its EmbedderFactory
  * switch only knows openai/ollama/lmstudio/google/azure_openai/langchain
  * and throws "Unsupported embedder provider: custom" otherwise. It

@@ -79,6 +79,25 @@ function safeKey(k: string): string {
   return k.replace(/[^a-zA-Z0-9_]/g, '');
 }
 
+/** Cap on query tokens for the lexical fallback — bounds the OR-chain. */
+const LEXICAL_MAX_TOKENS = 8;
+
+/**
+ * Tokenize a query for the lexical fallback: lowercase, split on anything
+ * outside [a-z0-9_-], drop tokens under 3 chars (stopword-ish noise), dedupe,
+ * cap. Exported for `lexicalSearch` scoring parity and its tests.
+ */
+export function lexicalTokens(query: string): string[] {
+  return [
+    ...new Set(
+      query
+        .toLowerCase()
+        .split(/[^a-z0-9_-]+/)
+        .filter((t) => t.length >= 3),
+    ),
+  ].slice(0, LEXICAL_MAX_TOKENS);
+}
+
 function toVectorLiteral(v: number[]): string {
   return `[${v.join(',')}]`;
 }
@@ -231,6 +250,65 @@ export class CanonicalVectorStore {
     _filters?: SearchFilters,
   ): Promise<VectorStoreResult[] | null> {
     return null;
+  }
+
+  /**
+   * EMBED-FREE lexical search — the degraded-path fallback behind
+   * `MemoryBackend.searchLexical` (WI-4214): when the embedder is saturated
+   * or down, semantic search is unusable but PG itself is healthy, so a
+   * plain token match over the canonical text still serves recall. Pulls
+   * candidates matching ANY query token (ILIKE), then scores by
+   * token-overlap fraction (matched/total, 0..1) in JS — NOT on the cosine
+   * scale; ordering only. Reuses the store-kind + archived guards and the
+   * post-filter semantics of search()/list(). Bounded: ≤ LEXICAL_MAX_TOKENS
+   * tokens, candidates capped, no vec-table join.
+   */
+  async lexicalSearch(
+    query: string,
+    topK = 5,
+    filters?: SearchFilters,
+  ): Promise<VectorStoreResult[]> {
+    const tokens = lexicalTokens(query);
+    if (tokens.length === 0) return [];
+    const client = await this.getClient();
+    const conds: string[] = [storeKindCond('', this.storeKind), `state != 'archived'`];
+    const params: unknown[] = [];
+    let idx = 1;
+    if (filters) {
+      for (const [key, value] of Object.entries(filters)) {
+        if (value === undefined || value === null) continue;
+        if (typeof value !== 'string' && typeof value !== 'number') continue;
+        conds.push(`payload->>'${safeKey(key)}' = $${idx}`);
+        params.push(String(value));
+        idx++;
+      }
+    }
+    // `_` is a LIKE single-char wildcard and survives the tokenizer —
+    // escape it so a token like `user_id` matches literally.
+    const tokenConds = tokens.map((t) => {
+      params.push(`%${t.replace(/[\\%_]/g, (m) => `\\${m}`)}%`);
+      return `payload->>'data' ILIKE $${idx++}`;
+    });
+    conds.push(`(${tokenConds.join(' OR ')})`);
+    // Over-fetch candidates newest-first: token-overlap scoring happens in
+    // JS, and the created_at order makes score ties resolve to fresh rows.
+    const candidateCap = Math.max(topK * 3, 30);
+    params.push(candidateCap);
+    const res = await client.query(
+      `SELECT id, payload
+       FROM ${this.cfg.schema}.memory_canonical
+       WHERE ${conds.join(' AND ')}
+       ORDER BY created_at DESC
+       LIMIT $${idx}`,
+      params,
+    );
+    const scored = res.rows.map((r: { id: string; payload: Record<string, unknown> }) => {
+      const data = String(r.payload?.data ?? '').toLowerCase();
+      const matched = tokens.filter((t) => data.includes(t)).length;
+      return { id: r.id, payload: r.payload, score: matched / tokens.length };
+    });
+    // Stable sort: score desc, ties keep the newest-first candidate order.
+    return scored.sort((a: VectorStoreResult, b: VectorStoreResult) => (b.score ?? 0) - (a.score ?? 0)).slice(0, topK);
   }
 
   async get(id: string): Promise<VectorStoreResult | null> {

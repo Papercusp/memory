@@ -38,6 +38,7 @@ import {
 import {
   getMemoryClient,
   invalidateMemoryClient,
+  lexicalSearchCanonical,
   updateMemoryPayload,
   type Mem0Row,
   type MemoryClient,
@@ -162,6 +163,32 @@ function toEntry(row: Mem0Row, scope: string): MemoryEntry {
   };
 }
 
+/**
+ * Map a raw canonical-store row (id + jsonb payload) onto the neutral entry
+ * shape — the lexical-fallback sibling of `toEntry` (which maps mem0's
+ * search-row shape). The memory text lives at `payload.data`; `user_id` is
+ * the scope key (redundant with the fan-out scope, dropped); everything else
+ * in the payload is caller-visible metadata (kind, anchors, provenance, …).
+ */
+function canonicalRowToEntry(
+  row: { id: string; payload: Record<string, unknown>; score?: number },
+  scope: string,
+): MemoryEntry {
+  const { data, user_id: _userId, ...rest } = (row.payload ?? {}) as {
+    data?: unknown;
+    user_id?: unknown;
+  } & Record<string, unknown>;
+  const kind = typeof rest.kind === 'string' ? rest.kind : undefined;
+  return {
+    id: row.id,
+    text: typeof data === 'string' ? data : String(data ?? ''),
+    ...(kind !== undefined ? { kind } : {}),
+    scope,
+    ...(typeof row.score === 'number' ? { score: row.score } : {}),
+    ...(Object.keys(rest).length > 0 ? { metadata: rest } : {}),
+  };
+}
+
 /** Merge fan-out results, de-duping by id (keep the higher-scored hit). */
 function mergeById(entries: MemoryEntry[]): MemoryEntry[] {
   const byId = new Map<string, MemoryEntry>();
@@ -177,16 +204,28 @@ export interface Mem0BackendDeps {
   getClient?: () => Promise<MemoryClient | null>;
   /** Test seam — the metadata merge-patch (defaults to the real canonical-store path). */
   updatePayload?: (id: string, patch: Record<string, unknown>) => Promise<boolean>;
+  /** Test seam — the embed-free canonical lexical query (defaults to the real store path). */
+  lexicalSearch?: (
+    query: string,
+    topK: number,
+    filters: Record<string, string>,
+  ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
 }
 
 export class Mem0Backend implements MemoryBackend {
   readonly name = 'mem0';
   private readonly getClient: () => Promise<MemoryClient | null>;
   private readonly updatePayload: (id: string, patch: Record<string, unknown>) => Promise<boolean>;
+  private readonly lexicalSearch: (
+    query: string,
+    topK: number,
+    filters: Record<string, string>,
+  ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
 
   constructor(deps: Mem0BackendDeps = {}) {
     this.getClient = deps.getClient ?? getMemoryClient;
     this.updatePayload = deps.updatePayload ?? updateMemoryPayload;
+    this.lexicalSearch = deps.lexicalSearch ?? lexicalSearchCanonical;
   }
 
   async available(): Promise<MemoryAvailability> {
@@ -276,6 +315,26 @@ export class Mem0Backend implements MemoryBackend {
       (a, b) =>
         (b.score ?? 0) * recencyFactor(tsById.get(b.id) ?? null, now) -
         (a.score ?? 0) * recencyFactor(tsById.get(a.id) ?? null, now),
+    );
+  }
+
+  /**
+   * EMBED-FREE lexical fallback (WI-4214, the `MemoryBackend.searchLexical`
+   * capability): same per-scope fan-out + merge semantics as search(), but
+   * served by a plain token-ILIKE query over `memory_canonical` — no
+   * embedder anywhere on the path, so it works while the semantic leg is
+   * saturated or down. Scores are token-overlap fractions (0..1, ordering
+   * only — NOT cosine), so the relevance floor and decay deliberately do
+   * not apply.
+   */
+  async searchLexical(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
+    const limit = opts.limit ?? DEFAULT_SEARCH_LIMIT;
+    const pulls = scopesOf(opts.scope).map(async (scope) => {
+      const rows = await this.lexicalSearch(query, limit, { user_id: scope });
+      return rows.map((row) => canonicalRowToEntry(row, scope));
+    });
+    return mergeById((await Promise.all(pulls)).flat()).sort(
+      (a, b) => (b.score ?? 0) - (a.score ?? 0),
     );
   }
 

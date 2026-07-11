@@ -141,4 +141,24 @@ export class HybridBackend implements MemoryBackend {
     });
     return opts.limit !== undefined ? fused.slice(0, opts.limit) : fused;
   }
+
+  /**
+   * EMBED-FREE degraded-path fallback (WI-4214). Prefer the COSINE leg's
+   * lexical capability — the canonical PG store covers ALL memories, while
+   * the native lexical leg only sees projected writes (header §"in
+   * production…"). If the cosine leg lacks/fails it, the native lexical
+   * leg's search is itself embed-free, so it serves as the last resort. No
+   * fusion here: this is an emergency recall path, not the ranked product.
+   */
+  async searchLexical(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
+    const cosineLex = this.cosine.searchLexical?.bind(this.cosine);
+    if (cosineLex) {
+      try {
+        return await cosineLex(query, opts);
+      } catch {
+        /* fall through to the native lexical leg */
+      }
+    }
+    return this.lexical.search(query, { scope: opts.scope, ...(opts.limit !== undefined ? { limit: opts.limit } : {}) });
+  }
 }
