@@ -66,6 +66,19 @@ export interface RememberOptions {
    * metadata for capture-trigger filtering.
    */
   shareable?: boolean;
+  /**
+   * WRITE-TIME EMBED AUGMENTATION (EI-10048). When set (and different from
+   * `text`), the backend (re)computes the entry's VECTOR from `embedText`
+   * while the STORED text stays exactly `text` — the embedding is enriched
+   * but the canonical body is untouched. Callers pass `text` plus resolved
+   * reference titles (e.g. "WI-4028: <title>") so a ref-only memory ALSO
+   * matches queries about the referenced item's TOPIC — the multi-hop recall
+   * a flat store can't bridge (query-time graph fusion was rejected, D-001).
+   * Doing the hop once at write time costs nothing at query time and never
+   * perturbs ranking. Best-effort: a backend that can't separate stored-text
+   * from embed-text (file stores, noop) ignores this and stores `text` as-is.
+   */
+  embedText?: string;
 }
 
 export interface SearchOptions {

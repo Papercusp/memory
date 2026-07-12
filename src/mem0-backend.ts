@@ -24,6 +24,7 @@
  */
 
 import { applyScoreFloor } from './score-floor';
+import { embedAndUpsertVector } from './vec-write';
 import {
   MemoryUnavailableError,
   scopesOf,
