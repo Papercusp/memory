@@ -227,6 +227,13 @@ export interface Mem0BackendDeps {
   ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
   /** Test seam — the validity-window close (defaults to the real canonical-store path). */
   invalidateEntry?: (id: string, opts: { supersededBy?: string }) => Promise<boolean>;
+  /**
+   * Test seam — write-time embed augmentation (EI-10048): overwrite a new
+   * row's vector with `embed(embedText)` under the current mode, stored text
+   * untouched. Defaults to the real resolve-embedder + memory_vec_<mode>
+   * upsert. Best-effort (returns false, never throws).
+   */
+  reembedVector?: (id: string, scope: string, embedText: string) => Promise<boolean>;
 }
 
 export class Mem0Backend implements MemoryBackend {
@@ -239,12 +246,17 @@ export class Mem0Backend implements MemoryBackend {
     filters: Record<string, string>,
   ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
   private readonly invalidateEntryStore: (id: string, opts: { supersededBy?: string }) => Promise<boolean>;
+  private readonly reembedVector: (id: string, scope: string, embedText: string) => Promise<boolean>;
 
   constructor(deps: Mem0BackendDeps = {}) {
     this.getClient = deps.getClient ?? getMemoryClient;
     this.updatePayload = deps.updatePayload ?? updateMemoryPayload;
     this.lexicalSearch = deps.lexicalSearch ?? lexicalSearchCanonical;
     this.invalidateEntryStore = deps.invalidateEntry ?? invalidateEntryCanonical;
+    // scope is unused by the default (memory_id is globally unique + the vec
+    // table is per-mode, not per-scope) but kept in the seam for symmetry.
+    this.reembedVector =
+      deps.reembedVector ?? ((id, _scope, embedText) => embedAndUpsertVector(id, embedText));
   }
 
   async available(): Promise<MemoryAvailability> {
@@ -290,6 +302,19 @@ export class Mem0Backend implements MemoryBackend {
         for (const id of ids) {
           await linker.call(client, id, text, { user_id: opts.scope }).catch(() => {});
         }
+      }
+    }
+    // Write-time embed augmentation (EI-10048): when the caller supplies an
+    // enriched embed-text (clean body + resolved reference titles), overwrite
+    // each new row's VECTOR with embed(embedText) while the stored
+    // payload.data stays = text. A ref-only memory then also matches queries
+    // about the referenced item's TOPIC (multi-hop recall the flat store
+    // can't bridge; query-time graph fusion rejected, D-001). Best-effort +
+    // non-fatal — mirrors the entity-linker posture above: a failure leaves
+    // the baseline clean-text vector.
+    if (opts.embedText && opts.embedText !== text && ids.length > 0) {
+      for (const id of ids) {
+        await this.reembedVector(id, opts.scope, opts.embedText).catch(() => {});
       }
     }
     return { ids, storedEvents: extractStoredEventCount(result) };
