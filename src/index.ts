@@ -112,6 +112,11 @@ export {
 } from './reembed';
 
 export {
+  relinkEntities,
+  type RelinkResult,
+} from './relink-entities';
+
+export {
   embedViaWorker,
   buildLocalEmbedder,
   getWorkerState,
