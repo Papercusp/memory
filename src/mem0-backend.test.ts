@@ -184,6 +184,60 @@ describe('Mem0Backend.remember — verbatim/infer mapping, metadata+kind, {ids,s
 });
 
 // ---------------------------------------------------------------------------
+// EI-10048 — write-time embed augmentation: opts.embedText re-embeds each new
+// row's vector (via the reembedVector seam) while the STORED text is unchanged.
+// ---------------------------------------------------------------------------
+describe('Mem0Backend.remember — write-time embed augmentation (EI-10048)', () => {
+  const addOne = () => vi.fn(async () => ({ results: [{ id: UUID_A, event: 'ADD' }] }));
+
+  it('re-embeds each new row from embedText, leaving the stored text unchanged', async () => {
+    const add = addOne();
+    const reembedVector = vi.fn(async () => true);
+    const be = new Mem0Backend({ getClient: async () => stubClient({ add }), reembedVector });
+
+    await be.remember('clean body', { scope: 'userA', embedText: 'clean body\n\n[refs] WI-1: title' });
+
+    // stored text is UNCHANGED — add() still receives the clean body verbatim
+    expect(add.mock.calls[0][0]).toBe('clean body');
+    // the vector is (re)computed from the enriched embedText, once per added id
+    expect(reembedVector).toHaveBeenCalledTimes(1);
+    expect(reembedVector).toHaveBeenCalledWith(UUID_A, 'userA', 'clean body\n\n[refs] WI-1: title');
+  });
+
+  it('does not re-embed when embedText is absent', async () => {
+    const reembedVector = vi.fn(async () => true);
+    const be = new Mem0Backend({ getClient: async () => stubClient({ add: addOne() }), reembedVector });
+    await be.remember('a fact', { scope: 'userA' });
+    expect(reembedVector).not.toHaveBeenCalled();
+  });
+
+  it('does not re-embed when embedText equals the stored text (no enrichment)', async () => {
+    const reembedVector = vi.fn(async () => true);
+    const be = new Mem0Backend({ getClient: async () => stubClient({ add: addOne() }), reembedVector });
+    await be.remember('same', { scope: 'userA', embedText: 'same' });
+    expect(reembedVector).not.toHaveBeenCalled();
+  });
+
+  it('does not re-embed when the write produced no new rows (nothing to augment)', async () => {
+    const add = vi.fn(async () => ({ results: [{ id: UUID_A, event: 'NONE' }] }));
+    const reembedVector = vi.fn(async () => true);
+    const be = new Mem0Backend({ getClient: async () => stubClient({ add }), reembedVector });
+    await be.remember('x', { scope: 'userA', embedText: 'x augmented' });
+    expect(reembedVector).not.toHaveBeenCalled();
+  });
+
+  it('is best-effort: a re-embed failure never fails the write', async () => {
+    const add = addOne();
+    const reembedVector = vi.fn(async () => {
+      throw new Error('pg down');
+    });
+    const be = new Mem0Backend({ getClient: async () => stubClient({ add }), reembedVector });
+    const out = await be.remember('body', { scope: 'userA', embedText: 'body + refs' });
+    expect(out.ids).toEqual([UUID_A]); // write still succeeded
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GAP 2 (helpers) — extractAddedIds / extractStoredEventCount, incl. the
 // infer:false nested-metadata.event wire shape and the UUID guard.
 // ---------------------------------------------------------------------------
