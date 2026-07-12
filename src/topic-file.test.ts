@@ -8,9 +8,10 @@
  * hand-curated / partial file without throwing or losing the body.
  *
  * The load-bearing invariants pinned here:
- *  1. ROUND-TRIP: parse(serialize(tf)) === tf (body compared trimmed — serialize
- *     leaves a single trailing newline, harmless on re-read). Special chars in the
- *     description (quote, backslash) and a nested `extra` object survive intact.
+ *  1. ROUND-TRIP: parse(serialize(tf)) === tf EXACTLY for a trimmed body — parse
+ *     strips the file's trailing newline(s) that serialize appends, so consumers
+ *     never need a defensive .trim(). Special chars in the description (quote,
+ *     backslash) and a nested `extra` object survive intact.
  *  2. HOOK-SHAPE: serialize emits frontmatter as the FIRST `---`-block with
  *     top-level `name:`/`description:` and a metadata-nested `type:` — exactly the
  *     precedence parse (and the projector) reads.
@@ -62,8 +63,8 @@ describe('parseTopicFile — well-formed file yields every field', () => {
     expect(tf.scope).toBe('owner-42');
     expect(tf.kind).toBe('reference');
     expect(tf.extra).toEqual({ orig_file: 'notes.md', n: 3 });
-    // parse strips only LEADING newlines; the file's trailing newline survives on the body.
-    expect(tf.body.trim()).toBe('The experimental build server accepts deploys 2–4am UTC only.');
+    // parse strips the separator blank line AND the file's trailing newline(s).
+    expect(tf.body).toBe('The experimental build server accepts deploys 2–4am UTC only.');
   });
 
   it('normalizes CRLF line endings before parsing', () => {
@@ -71,7 +72,7 @@ describe('parseTopicFile — well-formed file yields every field', () => {
     const tf = parseTopicFile(text);
     expect(tf.name).toBe('crlf_fact');
     expect(tf.type).toBe('user');
-    expect(tf.body.trim()).toBe('Body line.');
+    expect(tf.body).toBe('Body line.');
   });
 
   it("strips a single layer of surrounding quotes on description (double AND single)", () => {
@@ -195,7 +196,7 @@ describe('serializeTopicFile — canonical hook-compatible shape', () => {
 });
 
 describe('serialize ∘ parse round-trip — the write→re-read data-integrity invariant', () => {
-  it('a full record round-trips identically (body compared trimmed)', () => {
+  it('a full record round-trips identically (body exact — no trailing-newline growth)', () => {
     const tf: TopicFile = {
       name: 'deploy_window',
       description: 'build server deploys 2 to 4am utc only',
@@ -206,7 +207,7 @@ describe('serialize ∘ parse round-trip — the write→re-read data-integrity 
       body: 'The experimental build server accepts deploys between 2am and 4am UTC.',
     };
     const rt = parseTopicFile(serializeTopicFile(tf));
-    expect({ ...rt, body: rt.body.trim() }).toEqual(tf);
+    expect(rt).toEqual(tf);
   });
 
   it('special characters in the description survive (quote + backslash escaping is symmetric)', () => {
@@ -224,7 +225,15 @@ describe('serialize ∘ parse round-trip — the write→re-read data-integrity 
   it('a minimal record (no scope/kind/extra) round-trips with those fields still undefined', () => {
     const tf: TopicFile = { name: 'minimal', description: 'tiny', type: 'user', body: 'x' };
     const rt = parseTopicFile(serializeTopicFile(tf));
-    expect({ ...rt, body: rt.body.trim() }).toEqual(tf);
+    expect(rt).toEqual(tf);
+  });
+
+  it('the parsed body never carries the file trailing newline(s); internal blank lines survive', () => {
+    const body = 'Para one.\n\nPara two.';
+    const rt = parseTopicFile(serializeTopicFile({ name: 'n', description: 'd', type: 'project', body }));
+    expect(rt.body).toBe(body); // internal \n\n preserved, EOF newline stripped
+    // Even a sloppy hand-edited file with extra blank lines at EOF parses clean.
+    expect(parseTopicFile('---\nname: n\n---\n\nBody.\n\n\n').body).toBe('Body.');
   });
 
   it('parse→serialize→parse is stable (idempotent on an already-canonical file)', () => {
