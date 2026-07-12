@@ -15,6 +15,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   CanonicalVectorStore,
+  isLowQualityCompoundEntity,
   lexicalTokens,
   splitTemporalControls,
   foldValidity,
@@ -93,12 +94,88 @@ describe('CanonicalVectorStore store-kind segregation', () => {
     expect(queries[0].sql).toContain("WHERE NOT (c.payload ? 'entityType')");
   });
 
-  it('insert is kind-agnostic — payloads pass through untouched', async () => {
+  it('insert stores a well-formed entity payload untouched', async () => {
     const { store, queries } = makeStore('operator_memory_local_entities');
-    await store.insert([VEC], ['id-1'], [{ data: 'x', entityType: 'COMPOUND', linkedMemoryIds: ['m1'] }]);
+    await store.insert(
+      [VEC],
+      ['id-1'],
+      [{ data: 'harrier embedder sidecar', entityType: 'COMPOUND', linkedMemoryIds: ['m1'] }],
+    );
     const canonical = queries.find((q) => q.sql.includes('memory_canonical'));
     expect(canonical).toBeDefined();
     expect(JSON.parse(canonical!.params[1] as string)).toMatchObject({ entityType: 'COMPOUND' });
+  });
+});
+
+describe('EI-10183 entity-quality gate — isLowQualityCompoundEntity', () => {
+  // Real fragments observed in the live store (regex fallback + nlp residue).
+  it.each([
+    'so the re',
+    'just before end of',
+    'flaked mid',
+    'left the one',
+    'embed job stalled and',
+    'nothing else pending',
+    'nothing else drained',
+    'the folder', // single generic head after stripping the article
+    'of the', // pure function words
+    'x', // too short
+    '', // empty
+  ])('rejects junk fragment %j', (frag) => {
+    expect(isLowQualityCompoundEntity(frag)).toBe(true);
+  });
+
+  // Genuine noun phrases (incl. a leading article and hyphenated heads) survive.
+  it.each([
+    'the one-liner in the folder',
+    'The harrier embedder sidecar heartbeat',
+    'harrier embedder sidecar',
+    'in-memory cache',
+    'release trigger routine',
+  ])('keeps real phrase %j', (phrase) => {
+    expect(isLowQualityCompoundEntity(phrase)).toBe(false);
+  });
+});
+
+describe('EI-10183 entity-quality gate — insert filtering', () => {
+  const junk = { data: 'just before end of', entityType: 'COMPOUND', linkedMemoryIds: ['m1'] };
+  const good = { data: 'harrier embedder sidecar', entityType: 'COMPOUND', linkedMemoryIds: ['m1'] };
+
+  it('drops a junk COMPOUND entity — no canonical or vec write', async () => {
+    const { store, queries } = makeStore('operator_memory_local_entities');
+    await store.insert([VEC], ['id-junk'], [junk]);
+    expect(queries).toHaveLength(0);
+  });
+
+  it('still writes a good COMPOUND entity', async () => {
+    const { store, queries } = makeStore('operator_memory_local_entities');
+    await store.insert([VEC], ['id-good'], [good]);
+    expect(queries.some((q) => q.sql.includes('memory_canonical'))).toBe(true);
+  });
+
+  it('never filters PROPER/QUOTED entities (gate is COMPOUND-only)', async () => {
+    const { store, queries } = makeStore('operator_memory_local_entities');
+    await store.insert([VEC], ['id-p'], [{ data: 'of the', entityType: 'PROPER', linkedMemoryIds: [] }]);
+    expect(queries.some((q) => q.sql.includes('memory_canonical'))).toBe(true);
+  });
+
+  it('never filters a MEMORY-kind store even if the text looks fragmentary', async () => {
+    const { store, queries } = makeStore('operator_memory_local'); // not *_entities
+    await store.insert([VEC], ['id-m'], [{ data: 'just before end of' }]);
+    expect(queries.some((q) => q.sql.includes('memory_canonical'))).toBe(true);
+  });
+
+  it('kill-switch PAPERCUSP_MEMORY_ENTITY_FILTER=off passes junk through', async () => {
+    const prev = process.env.PAPERCUSP_MEMORY_ENTITY_FILTER;
+    process.env.PAPERCUSP_MEMORY_ENTITY_FILTER = 'off';
+    try {
+      const { store, queries } = makeStore('operator_memory_local_entities');
+      await store.insert([VEC], ['id-junk'], [junk]);
+      expect(queries.some((q) => q.sql.includes('memory_canonical'))).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.PAPERCUSP_MEMORY_ENTITY_FILTER;
+      else process.env.PAPERCUSP_MEMORY_ENTITY_FILTER = prev;
+    }
   });
 });
 
