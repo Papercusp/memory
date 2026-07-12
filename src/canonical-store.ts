@@ -79,6 +79,48 @@ function safeKey(k: string): string {
   return k.replace(/[^a-zA-Z0-9_]/g, '');
 }
 
+/**
+ * EI-10183 entity-quality gate (deterministic backstop). mem0's local entity
+ * extractor emits COMPOUND noun-chunks; on the clean nlp path these are real
+ * noun phrases, but the regex fallback (when `compromise` fails to load) — and
+ * even compromise occasionally — produce sentence fragments bounded by a
+ * function word ("just before end of", "embed job stalled and", "so the re").
+ * This drops the obvious fragments at entity-INSERT time. It ONLY prunes the
+ * entity graph (`storeKind === 'entity'`, COMPOUND only) — memory rows, recall,
+ * and PROPER/QUOTED entities (names + user quotes, intentional and low-junk) are
+ * never touched. NOTE: mem0 has already paid the embed cost by insert time, so
+ * this reclaims STORAGE + graph quality, not embed compute (the nlp fix cuts
+ * volume upstream). Kill-switch: PAPERCUSP_MEMORY_ENTITY_FILTER=off.
+ */
+const ENTITY_STOPWORDS = new Set([
+  'the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'but', 'so',
+  'is', 'was', 'are', 'were', 'be', 'been', 'being', 'it', 'its', 'this', 'that',
+  'these', 'those', 'with', 'as', 'by', 'from', 'just', 'else', 'before', 'after',
+  'nothing', 'something', 'anything', 'one', 'mid', 're', 've', 'll', 'no', 'not',
+  'than', 'then', 'up', 'out', 'off', 'over', 'per', 'via', 'their', 'there', 'here',
+  'when', 'while', 'into', 'onto', 'about', 'above', 'below',
+]);
+
+/** True when a COMPOUND entity span is a low-value sentence fragment. */
+export function isLowQualityCompoundEntity(text: string): boolean {
+  let t = String(text ?? '').trim().toLowerCase();
+  if (!t) return true;
+  // Strip a leading article — a good phrase legitimately starts with "the"
+  // ("the one-liner in the folder"); don't let that alone condemn it.
+  t = t.replace(/^(?:the|a|an)\s+/, '');
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length < 2) return true; // a lone/generic head is not a useful COMPOUND
+  // A real phrase is not bounded by a function word.
+  if (ENTITY_STOPWORDS.has(words[0]) || ENTITY_STOPWORDS.has(words[words.length - 1])) return true;
+  // Must carry at least one content token (guards pure function-word runs).
+  const hasContent = words.some((w) => w.length >= 3 && !ENTITY_STOPWORDS.has(w) && /[a-z]/.test(w));
+  return !hasContent;
+}
+
+function entityFilterEnabled(): boolean {
+  return process.env.PAPERCUSP_MEMORY_ENTITY_FILTER !== 'off';
+}
+
 /** Cap on query tokens for the lexical fallback — bounds the OR-chain. */
 const LEXICAL_MAX_TOKENS = 8;
 
@@ -277,6 +319,15 @@ export class CanonicalVectorStore {
       // stored payload key — a read-modify-write caller would otherwise echo
       // it back in, shadowing the live columns with a stale snapshot.
       const { validity: _validity, ...payload } = payloads[i] ?? {};
+      // EI-10183: drop junk COMPOUND entity fragments before they hit the graph.
+      if (
+        this.storeKind === 'entity' &&
+        entityFilterEnabled() &&
+        (payload as { entityType?: unknown }).entityType === 'COMPOUND' &&
+        isLowQualityCompoundEntity(String((payload as { data?: unknown }).data ?? ''))
+      ) {
+        continue;
+      }
       if (vec.length !== this.cfg.embeddingModelDims) {
         throw new Error(
           `CanonicalVectorStore.insert: vector dim ${vec.length} !== expected ${this.cfg.embeddingModelDims}`,
