@@ -64,7 +64,7 @@ type Linker = (memoryId: string, text: string, filters: Record<string, string>) 
  * linker private API missing after a mem0 upgrade).
  */
 export async function relinkEntities(
-  opts: { dryRun?: boolean; maxMemories?: number; progress?: (p: RelinkProgress) => void } = {},
+  opts: { dryRun?: boolean; maxMemories?: number; userId?: string; progress?: (p: RelinkProgress) => void } = {},
 ): Promise<RelinkResult> {
   if (process.env.PAPERCUSP_MEMORY_ENTITY_RELINK === 'off') {
     throw new Error('relink_disabled');
@@ -99,7 +99,9 @@ export async function relinkEntities(
               payload->>'data' AS data,
               ARRAY(SELECT jsonb_array_elements_text(COALESCE(payload->'linkedMemoryIds','[]'::jsonb))) AS linked
          FROM ${schema}.memory_canonical
-        WHERE payload->>'entityType' = 'COMPOUND'`,
+        WHERE payload->>'entityType' = 'COMPOUND'
+          ${opts.userId ? `AND payload->>'user_id' = $1` : ''}`,
+      opts.userId ? [opts.userId] : [],
     );
     const junk = compoundRows.rows.filter((r) => isLowQualityCompoundEntity(r.data ?? ''));
     const junkRemainingTotal = junk.length;
