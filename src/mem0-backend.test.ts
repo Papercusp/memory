@@ -198,7 +198,8 @@ describe('Mem0Backend.remember — write-time embed augmentation (EI-10048)', ()
     await be.remember('clean body', { scope: 'userA', embedText: 'clean body\n\n[refs] WI-1: title' });
 
     // stored text is UNCHANGED — add() still receives the clean body verbatim
-    expect(add.mock.calls[0][0]).toBe('clean body');
+    // (asserted via toHaveBeenCalledWith to avoid tuple-index typing on mock.calls)
+    expect(add).toHaveBeenCalledWith('clean body', expect.objectContaining({ userId: 'userA' }));
     // the vector is (re)computed from the enriched embedText, once per added id
     expect(reembedVector).toHaveBeenCalledTimes(1);
     expect(reembedVector).toHaveBeenCalledWith(UUID_A, 'userA', 'clean body\n\n[refs] WI-1: title');
