@@ -322,7 +322,9 @@ describe('CanonicalVectorStore temporal-lite validity windows (P-002, migration 
     const { store, queries } = makeStore('operator_memory_local_entities');
     await store.search(VEC, 5, { user_id: 'scope-a', as_of: '2026-07-01T00:00:00Z' });
     const q = queries[0];
-    expect(q.sql).not.toContain('invalid_at');
+    // No validity CLAUSE (the column list still selects the fields — unused).
+    expect(q.sql).not.toContain('invalid_at IS NULL');
+    expect(q.sql).not.toContain('COALESCE(c.valid_at');
     expect(q.sql).not.toContain("payload->>'as_of'");
   });
 
