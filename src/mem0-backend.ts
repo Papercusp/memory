@@ -24,6 +24,7 @@
  */
 
 import { applyScoreFloor } from './score-floor';
+import { diversityRerank, textSimilarity } from './diversity-rerank';
 import { embedAndUpsertVector } from './vec-write';
 import {
   MemoryUnavailableError,
@@ -97,6 +98,17 @@ export function recencyFactor(tsMs: number | null, nowMs: number): number {
   const ageDays = Math.max(0, (nowMs - tsMs) / 86_400_000);
   const floor = decayFloor();
   return floor + (1 - floor) * Math.pow(0.5, ageDays / decayHalfLifeDays());
+}
+
+/**
+ * Diversity re-rank kill switch (EI-10230). The re-rank itself is opt-in per
+ * call via `SearchOptions.diversify` (default undefined ⇒ never applied) —
+ * this env var is a defense-in-depth OFF override for a caller that requests
+ * it anyway, mirroring the decay master-switch pattern above. Unset/anything
+ * but '0' leaves a per-call request honored.
+ */
+function diversifyKillSwitchDisabled(): boolean {
+  return process.env.PAPERCUSP_MEMORY_MMR === '0';
 }
 /** Freshness timestamp of a mem0 search row (updatedAt, else createdAt). */
 function rowTimestampMs(row: Mem0Row): number | null {
@@ -355,15 +367,23 @@ export class Mem0Backend implements MemoryBackend {
     // Relevance floor (P-001 / D-003): drop hits too weak to be real matches, so
     // an out-of-corpus query returns nothing instead of nearest-neighbour noise.
     const floored = applyScoreFloor(ranked, { minScore: opts.minScore, minScoreRatio: opts.minScoreRatio });
-    if (!decayEnabled()) return floored;
     // Memory decay (recency ranking bias) — re-order AFTER the floor so the
     // admitted set is identical with decay on or off; see recencyFactor.
     const now = Date.now();
-    return [...floored].sort(
-      (a, b) =>
-        (b.score ?? 0) * recencyFactor(tsById.get(b.id) ?? null, now) -
-        (a.score ?? 0) * recencyFactor(tsById.get(a.id) ?? null, now),
-    );
+    const decayed = !decayEnabled()
+      ? floored
+      : [...floored].sort(
+          (a, b) =>
+            (b.score ?? 0) * recencyFactor(tsById.get(b.id) ?? null, now) -
+            (a.score ?? 0) * recencyFactor(tsById.get(a.id) ?? null, now),
+        );
+    // Diversity re-rank (EI-10230, MMR) — opt-in per call via `diversify`,
+    // applied LAST so it only reorders the already-admitted, already-decayed
+    // set (never changes which entries qualify). Lexical (trigram-Jaccard)
+    // similarity fallback — see diversity-rerank.ts for the rationale and the
+    // preferred real-vector path this can be upgraded to later.
+    if (!opts.diversify || diversifyKillSwitchDisabled()) return decayed;
+    return diversityRerank(decayed, { lambda: opts.diversify.lambda, similarity: textSimilarity });
   }
 
   /**

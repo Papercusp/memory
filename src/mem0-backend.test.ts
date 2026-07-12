@@ -557,6 +557,69 @@ describe('Mem0Backend.search — memory decay (recency ranking bias)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Diversity re-rank (EI-10230, MMR) — opt-in, order-only re-rank applied
+// LAST (after floor + decay), so the admitted set never changes.
+// ---------------------------------------------------------------------------
+describe('Mem0Backend.search — diversity re-rank (EI-10230)', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  const nearDupRows: Row[] = [
+    { id: 'a', memory: 'the deploy pipeline uses a two port model for staging and release', score: 0.95 },
+    { id: 'b', memory: 'the deploy pipeline uses a two-port model for staging vs release', score: 0.94 },
+    { id: 'c', memory: 'git-sync owns commit and push for the shared tree', score: 0.6 },
+  ];
+
+  it('is a no-op by default (opts.diversify omitted) — identical to pure relevance order', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: nearDupRows }, calls);
+    const be = new Mem0Backend({ getClient: async () => client });
+    const out = await be.search('q', { scope: 'userA', limit: 6 });
+    expect(out.map((e) => e.id)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('opts.diversify demotes a near-duplicate below a distinct lower-scored hit', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: nearDupRows }, calls);
+    const be = new Mem0Backend({ getClient: async () => client });
+    const out = await be.search('q', { scope: 'userA', limit: 6, diversify: { lambda: 0.5 } });
+    expect(out[0].id).toBe('a');
+    expect(out[1].id).toBe('c'); // distinct fact beats b's near-duplicate for slot #2
+    expect(out.map((e) => e.id).sort()).toEqual(['a', 'b', 'c']); // same admitted set
+  });
+
+  it('never changes the admitted set — only order (same ids as no-diversify, just reordered)', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: nearDupRows }, calls);
+    const be = new Mem0Backend({ getClient: async () => client });
+    const plain = await be.search('q', { scope: 'userA', limit: 6 });
+    const reranked = await be.search('q', { scope: 'userA', limit: 6, diversify: { lambda: 0.5 } });
+    expect(reranked.map((e) => e.id).sort()).toEqual(plain.map((e) => e.id).sort());
+  });
+
+  it('PAPERCUSP_MEMORY_MMR=0 kill-switches diversify even when requested per-call', async () => {
+    vi.stubEnv('PAPERCUSP_MEMORY_MMR', '0');
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: nearDupRows }, calls);
+    const be = new Mem0Backend({ getClient: async () => client });
+    const out = await be.search('q', { scope: 'userA', limit: 6, diversify: { lambda: 0.5 } });
+    expect(out.map((e) => e.id)).toEqual(['a', 'b', 'c']); // falls back to plain relevance order
+  });
+
+  it('composes with the relevance floor — floored-out hits never re-enter via diversify', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient(
+      { userA: [{ id: 'strong', memory: 'a real match', score: 0.6 }, { id: 'weak', memory: 'off topic noise', score: 0.2 }] },
+      calls,
+    );
+    const be = new Mem0Backend({ getClient: async () => client });
+    const out = await be.search('q', { scope: 'userA', limit: 6, minScore: 0.45, diversify: { lambda: 0 } });
+    expect(out.map((e) => e.id)).toEqual(['strong']);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Entity-linking parity for verbatim writes: mem0's infer:false branch skips
 // its Phase-7 entity linking, so remember(verbatim) calls the same private
 // per-memory linker mem0's update() uses — feature-detected, best-effort.

@@ -126,6 +126,17 @@ export interface SearchOptions {
    */
   asOf?: string;
   includeSuperseded?: boolean;
+  /**
+   * OPTIONAL read-time diversity re-rank (EI-10230, MMR). Off by default —
+   * omit for today's pure-relevance ordering. When set, the backend applies
+   * a maximal-marginal-relevance pass AFTER any relevance floor + recency
+   * decay, so the ADMITTED set is identical either way; only intra-top-K
+   * ORDER changes (near-duplicate hits stop crowding out distinct facts).
+   * `lambda` (0..1, default 1 = no-op) trades relevance for diversity; see
+   * `diversityRerank` in `./diversity-rerank`. Backends that don't implement
+   * it ignore this.
+   */
+  diversify?: { lambda?: number };
 }
 
 export interface ListOptions {
