@@ -610,48 +610,11 @@ async function tryLoad(): Promise<MemoryClient | null> {
   } catch { /* best-effort */ }
 
   try {
-    // EI-10183: mem0's local entity extractor captures `nlp = __require("compromise")`
-    // at MODULE-EVAL time. We import the ESM build (`mem0ai/oss` → index.mjs), where
-    // esbuild's `__require` shim throws when no global `require` exists — so `nlp` is
-    // undefined and mem0 falls back to a greedy regex noun-chunker that emitted
-    // 100%-junk COMPOUND entities in prod (lowercase sentence fragments like
-    // "so the re", "just before end of", "liner in the folder"; 5906/7071 live
-    // entity rows). Provide a real `require` for the FIRST mem0 import so
-    // `__require("compromise")` resolves and the clean noun-phrase path
-    // (`extractCompoundsWithNlp` / doc.nouns()) runs instead. mem0 binds its
-    // `__require` const to this reference at eval, so we restore the global right
-    // after the import — blast radius stays inside mem0's own CJS interop.
-    // Kill-switch: PAPERCUSP_MEMORY_ENTITY_NLP=off. (compromise ships as a mem0 dep.)
-    type Mem0Loaded = Mem0Module & {
+    const mem0 = await dynamicImport<Mem0Module & {
       VectorStoreFactory: { create: (provider: string, config: Record<string, unknown>) => unknown };
       EmbedderFactory?: { create: (provider: string, config: Record<string, unknown>) => unknown };
       LLMFactory?: { create: (provider: string, config: Record<string, unknown>) => unknown };
-    };
-    const nlpFix = process.env.PAPERCUSP_MEMORY_ENTITY_NLP !== 'off';
-    const gt = globalThis as unknown as { require?: unknown };
-    const hadGlobalRequire = 'require' in globalThis;
-    let installedRequire = false;
-    if (nlpFix && !hadGlobalRequire) {
-      try {
-        const { createRequire } = await import('node:module');
-        gt.require = createRequire(import.meta.url);
-        installedRequire = true;
-      } catch {
-        /* best-effort — mem0 stays on its regex fallback if this fails */
-      }
-    }
-    let mem0: Mem0Loaded;
-    try {
-      mem0 = await dynamicImport<Mem0Loaded>(MEM0_PACKAGE);
-    } finally {
-      if (installedRequire) {
-        try {
-          delete gt.require;
-        } catch {
-          gt.require = undefined;
-        }
-      }
-    }
+    }>(MEM0_PACKAGE);
     patchVectorStoreFactory(mem0);
     _currentEmbedFn = resolved.embed; // feed the patched 'custom' embedder (mem0 strips config.embed)
     patchEmbedderFactory(mem0);
