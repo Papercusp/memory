@@ -117,6 +117,14 @@ export {
 } from './relink-entities';
 
 export {
+  activeVecTable,
+  embedAndUpsertVector,
+  VEC_TABLE,
+  MODE_DIMS,
+  type ResolvedVecMode,
+} from './vec-write';
+
+export {
   embedViaWorker,
   buildLocalEmbedder,
   getWorkerState,

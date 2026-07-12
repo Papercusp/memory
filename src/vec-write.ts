@@ -59,6 +59,32 @@ export function toVectorLiteral(vec: number[]): string {
 }
 
 /**
+ * The vec table recall currently READS — the active embedder mode's table
+ * (`CanonicalVectorStore` is built against the same `resolveEmbedder()` mode, so
+ * a row without a vector HERE is invisible to semantic search). Returns null when
+ * embedding is disabled or the mode has no vec table, so a maintenance pass can
+ * short-circuit instead of guessing a table. Never throws.
+ *
+ * Exposed for the federated-memory vector backfill (EI-10405), which must ask
+ * "which table does recall read?" before looking for rows missing a vector in it.
+ */
+export async function activeVecTable(): Promise<{
+  mode: ResolvedVecMode;
+  schema: string;
+  table: string;
+} | null> {
+  try {
+    const resolved = await memoryHost().resolveEmbedder();
+    if (resolved.mode === 'disabled') return null;
+    const mode = resolved.mode as ResolvedVecMode;
+    if (!VEC_TABLE[mode]) return null;
+    return { mode, schema: memorySchema(), table: VEC_TABLE[mode] };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Embed `text` under the CURRENT-preference embedder and upsert the result as
  * `memoryId`'s vector in that mode's vec table — leaving `payload.data`
  * untouched. This is the default write-time augmentation path (EI-10048):
