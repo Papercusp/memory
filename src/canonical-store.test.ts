@@ -13,7 +13,13 @@
  * integration proof).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { CanonicalVectorStore, lexicalTokens, type CanonicalStoreConfig } from './canonical-store';
+import {
+  CanonicalVectorStore,
+  lexicalTokens,
+  splitTemporalControls,
+  foldValidity,
+  type CanonicalStoreConfig,
+} from './canonical-store';
 
 type CapturedQuery = { sql: string; params: unknown[] };
 
@@ -258,5 +264,220 @@ describe('lexicalTokens', () => {
       'papercusp_memory_tool_timeout_ms',
       'op-deadline',
     ]);
+  });
+});
+
+describe('CanonicalVectorStore temporal-lite validity windows (P-002, migration 578)', () => {
+  /** Fake pool with controllable rows + rowCount (validity columns included). */
+  function makeRowStore(
+    collectionName: string,
+    rows: Array<Record<string, unknown>>,
+    rowCount = rows.length,
+  ) {
+    const queries: CapturedQuery[] = [];
+    const fakePool = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        return { rows: rows.length > 0 ? rows : [{ n: 0 }], rowCount };
+      }),
+      on: () => {},
+    };
+    const { store } = makeStore(collectionName);
+    (store as unknown as { pool: unknown }).pool = fakePool;
+    return { store, queries };
+  }
+
+  it('search EXCLUDES closed-window rows by default and selects the validity columns', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.search(VEC, 5, { user_id: 'scope-a' });
+    const q = queries[0];
+    expect(q.sql).toContain('(c.invalid_at IS NULL OR c.invalid_at > now())');
+    expect(q.sql).toContain('c.valid_at, c.invalid_at, c.superseded_by');
+  });
+
+  it('as_of / include_superseded are TEMPORAL controls, never payload-equality filters', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.search(VEC, 5, {
+      user_id: 'scope-a',
+      as_of: '2026-07-01T00:00:00Z',
+      include_superseded: false,
+    });
+    const q = queries[0];
+    // Left in the filter loop these would silently match nothing.
+    expect(q.sql).not.toContain("payload->>'as_of'");
+    expect(q.sql).not.toContain("payload->>'include_superseded'");
+    // Point-in-time window: valid_at (NULL ⇒ created_at) <= as_of < invalid_at.
+    expect(q.sql).toContain('COALESCE(c.valid_at, c.created_at) <= $4::timestamptz');
+    expect(q.sql).toContain('c.invalid_at > $4::timestamptz');
+    expect(q.params).toContain('2026-07-01T00:00:00.000Z');
+  });
+
+  it('include_superseded drops the validity clause entirely', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.search(VEC, 5, { user_id: 'scope-a', include_superseded: true });
+    expect(queries[0].sql).not.toContain('invalid_at IS NULL OR');
+  });
+
+  it('entity-kind search gets NO validity clause (mem0 lifecycle exempt) but temporal keys are still stripped', async () => {
+    const { store, queries } = makeStore('operator_memory_local_entities');
+    await store.search(VEC, 5, { user_id: 'scope-a', as_of: '2026-07-01T00:00:00Z' });
+    const q = queries[0];
+    expect(q.sql).not.toContain('invalid_at');
+    expect(q.sql).not.toContain("payload->>'as_of'");
+  });
+
+  it('list applies the default exclusion to the page AND the count', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.list({ user_id: 'scope-a' }, 10);
+    expect(queries).toHaveLength(2);
+    for (const q of queries) {
+      expect(q.sql).toContain('(invalid_at IS NULL OR invalid_at > now())');
+    }
+  });
+
+  it('lexicalSearch (the degraded fallback) excludes closed-window rows too', async () => {
+    const { store, queries } = makeRowStore('operator_memory_local', []);
+    await store.lexicalSearch('embed sidecar', 5, { user_id: 'scope-a' });
+    expect(queries[0].sql).toContain('(invalid_at IS NULL OR invalid_at > now())');
+  });
+
+  it('a closed-window row surfaces validity { status: superseded } in its result payload', async () => {
+    const { store } = makeRowStore('operator_memory_local', [
+      {
+        id: 'old-fact',
+        payload: { data: 'embed default is gemma', user_id: 'u' },
+        valid_at: null,
+        invalid_at: '2026-07-01T00:00:00Z',
+        superseded_by: 'new-fact',
+      },
+    ]);
+    const out = await store.lexicalSearch('embed gemma', 5, {
+      user_id: 'u',
+      include_superseded: true,
+    });
+    expect(out[0].payload.validity).toEqual({
+      valid_at: null,
+      invalid_at: '2026-07-01T00:00:00Z',
+      superseded_by: 'new-fact',
+      status: 'superseded',
+    });
+  });
+
+  it('all-NULL validity rows keep their payload byte-identical (no validity key attached)', async () => {
+    const payload = { data: 'embed default is harrier', user_id: 'u' };
+    const { store } = makeRowStore('operator_memory_local', [
+      { id: 'current-fact', payload, valid_at: null, invalid_at: null, superseded_by: null },
+    ]);
+    const out = await store.lexicalSearch('embed harrier', 5, { user_id: 'u' });
+    expect(out[0].payload).toBe(payload);
+  });
+
+  it('invalidate emits a VEC-SAFE column UPDATE guarded to OPEN memory rows (first-wins)', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    const closed = await store.invalidate('old-fact', {
+      supersededBy: 'new-fact',
+      at: '2026-07-12T00:00:00Z',
+    });
+    const q = queries[0];
+    expect(q.sql).toContain('SET invalid_at = COALESCE($2::timestamptz, now())');
+    expect(q.sql).toContain('superseded_by = $3::uuid');
+    expect(q.sql).toContain("NOT (payload ? 'entityType')");
+    expect(q.sql).toContain('AND invalid_at IS NULL');
+    expect(q.sql).not.toContain('memory_vec'); // never touches an embedding table
+    expect(q.params).toEqual(['old-fact', '2026-07-12T00:00:00Z', 'new-fact']);
+    // makeStore's fake reports rowCount 0 — already-closed (or unknown) id → false.
+    expect(closed).toBe(false);
+  });
+
+  it('invalidate returns true when an open row was closed', async () => {
+    const { store } = makeRowStore('operator_memory_local', [], 1);
+    expect(await store.invalidate('open-fact')).toBe(true);
+  });
+
+  it('insert strips the read-side validity key from stored payloads (echo defense)', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.insert(
+      [VEC],
+      ['id-1'],
+      [{ data: 'x', validity: { status: 'current' } }],
+    );
+    const stored = String(queries[0].params[1]);
+    expect(stored).toContain('"data":"x"');
+    expect(stored).not.toContain('validity');
+  });
+
+  it('updatePayload strips validity from the patch (echo defense)', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.updatePayload('id-1', { kind: 'note', validity: { status: 'superseded' } });
+    const patch = JSON.parse(String(queries[0].params[1]));
+    expect(patch).toEqual({ kind: 'note' });
+  });
+});
+
+describe('splitTemporalControls', () => {
+  it('defaults: no filters → no asOf, includeSuperseded false, rest undefined', () => {
+    expect(splitTemporalControls(undefined)).toEqual({
+      temporal: { includeSuperseded: false },
+      rest: undefined,
+    });
+  });
+
+  it('extracts as_of (ISO-normalized) and include_superseded, leaving the rest intact', () => {
+    const { temporal, rest } = splitTemporalControls({
+      user_id: 'u',
+      as_of: '2026-07-01T00:00:00Z',
+      include_superseded: 'true',
+    });
+    expect(temporal).toEqual({ asOf: '2026-07-01T00:00:00.000Z', includeSuperseded: true });
+    expect(rest).toEqual({ user_id: 'u' });
+  });
+
+  it('accepts the truthy forms true/1/"1"/"true" and nothing else', () => {
+    for (const v of [true, 1, '1', 'true']) {
+      expect(splitTemporalControls({ include_superseded: v }).temporal.includeSuperseded).toBe(true);
+    }
+    for (const v of [false, 0, '0', 'false', 'yes', undefined]) {
+      expect(splitTemporalControls({ include_superseded: v }).temporal.includeSuperseded).toBe(false);
+    }
+  });
+
+  it('an unparseable as_of is dropped (never a NaN timestamp in SQL)', () => {
+    expect(splitTemporalControls({ as_of: 'not-a-date' }).temporal.asOf).toBeUndefined();
+  });
+});
+
+describe('foldValidity', () => {
+  const OPEN = { valid_at: null, invalid_at: null, superseded_by: null };
+
+  it('returns the payload UNCHANGED (same reference) for a trivial row with no as_of', () => {
+    const payload = { data: 'x' };
+    expect(foldValidity(payload, OPEN, { includeSuperseded: false })).toBe(payload);
+  });
+
+  it('a closed window folds status superseded against now()', () => {
+    const out = foldValidity(
+      { data: 'x' },
+      { valid_at: null, invalid_at: '2020-01-01T00:00:00Z', superseded_by: 'y' },
+      { includeSuperseded: true },
+    );
+    expect((out.validity as { status: string }).status).toBe('superseded');
+  });
+
+  it('status is computed against as_of when given: current before the close, superseded after', () => {
+    const row = { valid_at: null, invalid_at: '2026-08-01T00:00:00Z', superseded_by: null };
+    const before = foldValidity({}, row, { asOf: '2026-07-01T00:00:00.000Z', includeSuperseded: true });
+    const after = foldValidity({}, row, { asOf: '2026-09-01T00:00:00.000Z', includeSuperseded: true });
+    expect((before.validity as { status: string }).status).toBe('current');
+    expect((after.validity as { status: string }).status).toBe('superseded');
+  });
+
+  it('an as_of read attaches validity even to all-NULL rows (the caller asked for time context)', () => {
+    const out = foldValidity({ data: 'x' }, OPEN, { asOf: '2026-07-01T00:00:00.000Z', includeSuperseded: false });
+    expect(out.validity).toEqual({
+      valid_at: null,
+      invalid_at: null,
+      superseded_by: null,
+      status: 'current',
+    });
   });
 });

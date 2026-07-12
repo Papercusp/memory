@@ -127,7 +127,7 @@ interface TemporalControls {
   includeSuperseded: boolean;
 }
 
-function splitTemporalControls(filters?: SearchFilters): {
+export function splitTemporalControls(filters?: SearchFilters): {
   temporal: TemporalControls;
   rest: SearchFilters | undefined;
 } {
@@ -179,7 +179,7 @@ function validityCond(
  * rows are all-NULL ⇒ trivially 'current', and attaching nothing keeps their
  * result shape byte-identical.
  */
-function foldValidity(
+export function foldValidity(
   payload: Record<string, unknown>,
   row: { valid_at?: unknown; invalid_at?: unknown; superseded_by?: unknown },
   temporal: TemporalControls,
@@ -273,7 +273,10 @@ export class CanonicalVectorStore {
     for (let i = 0; i < ids.length; i++) {
       const id = ids[i];
       const vec = vectors[i];
-      const payload = payloads[i] ?? {};
+      // Echo defense: `validity` is a READ-side fold (foldValidity), never a
+      // stored payload key — a read-modify-write caller would otherwise echo
+      // it back in, shadowing the live columns with a stale snapshot.
+      const { validity: _validity, ...payload } = payloads[i] ?? {};
       if (vec.length !== this.cfg.embeddingModelDims) {
         throw new Error(
           `CanonicalVectorStore.insert: vector dim ${vec.length} !== expected ${this.cfg.embeddingModelDims}`,
@@ -380,17 +383,22 @@ export class CanonicalVectorStore {
     const tokens = lexicalTokens(query);
     if (tokens.length === 0) return [];
     const client = await this.getClient();
+    const { temporal, rest } = splitTemporalControls(filters);
     const conds: string[] = [storeKindCond('', this.storeKind), `state != 'archived'`];
     const params: unknown[] = [];
     let idx = 1;
-    if (filters) {
-      for (const [key, value] of Object.entries(filters)) {
+    if (rest) {
+      for (const [key, value] of Object.entries(rest)) {
         if (value === undefined || value === null) continue;
         if (typeof value !== 'string' && typeof value !== 'number') continue;
         conds.push(`payload->>'${safeKey(key)}' = $${idx}`);
         params.push(String(value));
         idx++;
       }
+    }
+    if (this.storeKind === 'memory') {
+      const vCond = validityCond('', temporal, params, () => idx++);
+      if (vCond) conds.push(vCond);
     }
     // `_` is a LIKE single-char wildcard and survives the tokenizer —
     // escape it so a token like `user_id` matches literally.
@@ -404,18 +412,30 @@ export class CanonicalVectorStore {
     const candidateCap = Math.max(topK * 3, 30);
     params.push(candidateCap);
     const res = await client.query(
-      `SELECT id, payload
+      `SELECT id, payload, valid_at, invalid_at, superseded_by
        FROM ${this.cfg.schema}.memory_canonical
        WHERE ${conds.join(' AND ')}
        ORDER BY created_at DESC
        LIMIT $${idx}`,
       params,
     );
-    const scored = res.rows.map((r: { id: string; payload: Record<string, unknown> }) => {
-      const data = String(r.payload?.data ?? '').toLowerCase();
-      const matched = tokens.filter((t) => data.includes(t)).length;
-      return { id: r.id, payload: r.payload, score: matched / tokens.length };
-    });
+    const scored = res.rows.map(
+      (r: {
+        id: string;
+        payload: Record<string, unknown>;
+        valid_at?: unknown;
+        invalid_at?: unknown;
+        superseded_by?: unknown;
+      }) => {
+        const data = String(r.payload?.data ?? '').toLowerCase();
+        const matched = tokens.filter((t) => data.includes(t)).length;
+        return {
+          id: r.id,
+          payload: this.storeKind === 'memory' ? foldValidity(r.payload, r, temporal) : r.payload,
+          score: matched / tokens.length,
+        };
+      },
+    );
     // Stable sort: score desc, ties keep the newest-first candidate order.
     return scored.sort((a: VectorStoreResult, b: VectorStoreResult) => (b.score ?? 0) - (a.score ?? 0)).slice(0, topK);
   }
@@ -448,12 +468,42 @@ export class CanonicalVectorStore {
    */
   async updatePayload(id: string, patch: Record<string, unknown>): Promise<boolean> {
     if (!patch || typeof patch !== 'object' || Object.keys(patch).length === 0) return false;
+    // Echo defense (see insert): `validity` never lands in the stored payload.
+    // The merge still runs on a validity-only patch so the return keeps its
+    // row-existence meaning (`payload || '{}'` is a no-op).
+    const { validity: _validity, ...rest } = patch;
     const client = await this.getClient();
     const res = await client.query(
       `UPDATE ${this.cfg.schema}.memory_canonical
           SET payload = payload || $2::jsonb, updated_at = now()
         WHERE id = $1 AND NOT (payload ? 'entityType')`,
-      [id, JSON.stringify(patch)],
+      [id, JSON.stringify(rest)],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  /**
+   * Close a memory row's validity window — the store half of soft-forget and
+   * supersession (temporal P-002/P-004). VEC-SAFE: a column-only UPDATE, the
+   * embedding is never touched (validity is not embedded), so invalidation
+   * costs no re-embed. First-wins idempotence: only an OPEN row
+   * (`invalid_at IS NULL`) matches, so a repeat call or a racing peer is a
+   * no-op returning false — the first closer's window (and superseded_by)
+   * stands. Entity rows are exempt (mem0's lifecycle). Returns whether an
+   * open memory row was closed.
+   */
+  async invalidate(
+    id: string,
+    opts: { supersededBy?: string; at?: string } = {},
+  ): Promise<boolean> {
+    const client = await this.getClient();
+    const res = await client.query(
+      `UPDATE ${this.cfg.schema}.memory_canonical
+          SET invalid_at = COALESCE($2::timestamptz, now()),
+              superseded_by = $3::uuid,
+              updated_at = now()
+        WHERE id = $1 AND NOT (payload ? 'entityType') AND invalid_at IS NULL`,
+      [id, opts.at ?? null, opts.supersededBy ?? null],
     );
     return (res.rowCount ?? 0) > 0;
   }
@@ -501,11 +551,12 @@ export class CanonicalVectorStore {
     topK = 100,
   ): Promise<[VectorStoreResult[], number]> {
     const client = await this.getClient();
+    const { temporal, rest } = splitTemporalControls(filters);
     const conds: string[] = [storeKindCond('', this.storeKind), `state != 'archived'`];
     const params: unknown[] = [];
     let idx = 1;
-    if (filters) {
-      for (const [key, value] of Object.entries(filters)) {
+    if (rest) {
+      for (const [key, value] of Object.entries(rest)) {
         if (value === undefined || value === null) continue;
         if (typeof value !== 'string' && typeof value !== 'number') continue;
         conds.push(`payload->>'${safeKey(key)}' = $${idx}`);
@@ -513,10 +564,14 @@ export class CanonicalVectorStore {
         idx++;
       }
     }
+    if (this.storeKind === 'memory') {
+      const vCond = validityCond('', temporal, params, () => idx++);
+      if (vCond) conds.push(vCond);
+    }
     const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
 
     const listSql = `
-      SELECT id, payload
+      SELECT id, payload, valid_at, invalid_at, superseded_by
       FROM ${this.cfg.schema}.memory_canonical
       ${where}
       ORDER BY created_at DESC
@@ -534,9 +589,15 @@ export class CanonicalVectorStore {
     ]);
 
     const rows: VectorStoreResult[] = listRes.rows.map(
-      (r: { id: string; payload: Record<string, unknown> }) => ({
+      (r: {
+        id: string;
+        payload: Record<string, unknown>;
+        valid_at?: unknown;
+        invalid_at?: unknown;
+        superseded_by?: unknown;
+      }) => ({
         id: r.id,
-        payload: r.payload,
+        payload: this.storeKind === 'memory' ? foldValidity(r.payload, r, temporal) : r.payload,
       }),
     );
     return [rows, Number(countRes.rows[0].n)];
