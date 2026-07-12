@@ -76,7 +76,11 @@ export function parseTopicFile(text: string): TopicFile {
   const normalized = text.replace(/\r\n/g, '\n');
   const m = FRONTMATTER_RE.exec(normalized);
   const fm = m ? m[1] : '';
-  const body = (m ? normalized.slice(m[0].length) : normalized).replace(/^\n+/, '');
+  // Strip the frontmatter/body separator blank line AND the file's trailing
+  // newline(s): serialize always ends the file `<body>\n`, so without the
+  // trailing strip parse∘serialize grows the body by '\n' and every consumer
+  // is forced to .trim() defensively.
+  const body = (m ? normalized.slice(m[0].length) : normalized).replace(/^\n+/, '').replace(/\n+$/, '');
 
   const name = clean(scalar(fm, /^name:[ \t]*(.+)$/m));
   const description = clean(scalar(fm, /^description:[ \t]*(.+)$/m));
