@@ -592,3 +592,64 @@ describe('Mem0Backend.searchLexical (WI-4214 embed-free fallback)', () => {
     expect(out[1].metadata).not.toHaveProperty('user_id');
   });
 });
+
+describe('Mem0Backend temporal-lite (P-004/P-006): filter passthrough + invalidateEntry', () => {
+  it('search forwards asOf/includeSuperseded as mem0 FILTER keys next to user_id', async () => {
+    const search = vi.fn(async () => ({ results: [] }));
+    const be = new Mem0Backend({ getClient: async () => stubClient({ search }) });
+    await be.search('q', {
+      scope: 'userA',
+      limit: 3,
+      asOf: '2026-06-15T00:00:00Z',
+      includeSuperseded: true,
+    });
+    expect((search.mock.calls[0] as unknown[])[1]).toMatchObject({
+      filters: { user_id: 'userA', as_of: '2026-06-15T00:00:00Z', include_superseded: 'true' },
+    });
+  });
+
+  it('search omits the temporal keys entirely when unset (byte-stable default filters)', async () => {
+    const search = vi.fn(async () => ({ results: [] }));
+    const be = new Mem0Backend({ getClient: async () => stubClient({ search }) });
+    await be.search('q', { scope: 'userA', limit: 3 });
+    expect(((search.mock.calls[0] as unknown[])[1] as { filters: object }).filters).toEqual({
+      user_id: 'userA',
+    });
+  });
+
+  it('list forwards them to getAll the same way', async () => {
+    const getAll = vi.fn(async () => ({ results: [] }));
+    const be = new Mem0Backend({ getClient: async () => stubClient({ getAll }) });
+    await be.list({ scope: 'userA', asOf: '2026-06-15T00:00:00Z', includeSuperseded: true });
+    expect((getAll.mock.calls[0] as unknown[])[0]).toMatchObject({
+      filters: { user_id: 'userA', as_of: '2026-06-15T00:00:00Z', include_superseded: 'true' },
+    });
+  });
+
+  it('searchLexical forwards them into the canonical lexical seam (degraded reads keep time semantics)', async () => {
+    const calls: Array<Record<string, string>> = [];
+    const be = new Mem0Backend({
+      getClient: async () => {
+        throw new Error('must not build a client on the lexical path');
+      },
+      lexicalSearch: async (_q, _k, filters) => {
+        calls.push(filters);
+        return [];
+      },
+    });
+    await be.searchLexical('q', { scope: 'userA', includeSuperseded: true });
+    expect(calls[0]).toEqual({ user_id: 'userA', include_superseded: 'true' });
+  });
+
+  it('invalidateEntry delegates to the canonical store seam and returns its first-wins verdict', async () => {
+    const inv = vi.fn(async () => true);
+    const be = new Mem0Backend({
+      getClient: async () => {
+        throw new Error('must not build a client here');
+      },
+      invalidateEntry: inv,
+    });
+    await expect(be.invalidateEntry('old-id', { supersededBy: 'new-id' })).resolves.toBe(true);
+    expect(inv).toHaveBeenCalledWith('old-id', { supersededBy: 'new-id' });
+  });
+});

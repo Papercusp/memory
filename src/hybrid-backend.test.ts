@@ -314,3 +314,18 @@ describe('HybridBackend searchLexical (WI-4214 embed-free fallback)', () => {
     expect((await hy.searchLexical('q', { scope: 's' })).map((x) => x.id)).toEqual(['projected-hit']);
   });
 });
+
+describe('HybridBackend.invalidateEntry (temporal-lite lifecycle delegation)', () => {
+  it('delegates to the COSINE leg (the canonical store owns lifecycle) with the supersededBy option', async () => {
+    const inv = vi.fn(async () => true);
+    const cosine = fakeBackend('cosine', [], { invalidateEntry: inv });
+    const hybrid = new HybridBackend(fakeBackend('lex', []), cosine);
+    await expect(hybrid.invalidateEntry('old', { supersededBy: 'new' })).resolves.toBe(true);
+    expect(inv).toHaveBeenCalledWith('old', { supersededBy: 'new' });
+  });
+
+  it('a cosine leg WITHOUT the capability throws — a false would read as "not found" upstream', () => {
+    const hybrid = new HybridBackend(fakeBackend('lex', []), fakeBackend('cosine', []));
+    expect(() => hybrid.invalidateEntry('old')).toThrow(/validity-window/);
+  });
+});
