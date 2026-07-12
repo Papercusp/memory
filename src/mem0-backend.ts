@@ -37,12 +37,26 @@ import {
 } from './backend';
 import {
   getMemoryClient,
+  invalidateEntryCanonical,
   invalidateMemoryClient,
   lexicalSearchCanonical,
   updateMemoryPayload,
   type Mem0Row,
   type MemoryClient,
 } from './mem0-client';
+
+/**
+ * Temporal-lite read controls as mem0 FILTER keys. mem0 forwards filters to
+ * the CanonicalVectorStore verbatim, whose splitTemporalControls picks these
+ * two out before the payload post-filter loop (P-002). String values so the
+ * `Record<string, string>` lexical seam accepts them unchanged.
+ */
+function temporalFilters(opts: { asOf?: string; includeSuperseded?: boolean }): Record<string, string> {
+  return {
+    ...(opts.asOf !== undefined ? { as_of: opts.asOf } : {}),
+    ...(opts.includeSuperseded ? { include_superseded: 'true' } : {}),
+  };
+}
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -210,6 +224,8 @@ export interface Mem0BackendDeps {
     topK: number,
     filters: Record<string, string>,
   ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
+  /** Test seam — the validity-window close (defaults to the real canonical-store path). */
+  invalidateEntry?: (id: string, opts: { supersededBy?: string }) => Promise<boolean>;
 }
 
 export class Mem0Backend implements MemoryBackend {
@@ -221,11 +237,13 @@ export class Mem0Backend implements MemoryBackend {
     topK: number,
     filters: Record<string, string>,
   ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
+  private readonly invalidateEntryStore: (id: string, opts: { supersededBy?: string }) => Promise<boolean>;
 
   constructor(deps: Mem0BackendDeps = {}) {
     this.getClient = deps.getClient ?? getMemoryClient;
     this.updatePayload = deps.updatePayload ?? updateMemoryPayload;
     this.lexicalSearch = deps.lexicalSearch ?? lexicalSearchCanonical;
+    this.invalidateEntryStore = deps.invalidateEntry ?? invalidateEntryCanonical;
   }
 
   async available(): Promise<MemoryAvailability> {
@@ -295,7 +313,11 @@ export class Mem0Backend implements MemoryBackend {
       // broke the seam's per-scope limit contract (caught by the
       // memory-backend-benchmark P-007 run). Keep `limit` for any
       // non-mem0 MemoryClient test doubles.
-      const r = await client.search(query, { filters: { user_id: scope }, topK: limit, limit });
+      const r = await client.search(query, {
+        filters: { user_id: scope, ...temporalFilters(opts) },
+        topK: limit,
+        limit,
+      });
       return (r.results ?? []).map((row) => {
         tsById.set(row.id, rowTimestampMs(row));
         return toEntry(row, scope);
@@ -330,7 +352,7 @@ export class Mem0Backend implements MemoryBackend {
   async searchLexical(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
     const limit = opts.limit ?? DEFAULT_SEARCH_LIMIT;
     const pulls = scopesOf(opts.scope).map(async (scope) => {
-      const rows = await this.lexicalSearch(query, limit, { user_id: scope });
+      const rows = await this.lexicalSearch(query, limit, { user_id: scope, ...temporalFilters(opts) });
       return rows.map((row) => canonicalRowToEntry(row, scope));
     });
     return mergeById((await Promise.all(pulls)).flat()).sort(
@@ -341,7 +363,10 @@ export class Mem0Backend implements MemoryBackend {
   async list(opts: ListOptions): Promise<MemoryEntry[]> {
     const client = await this.client();
     const pulls = scopesOf(opts.scope).map(async (scope) => {
-      const r = await client.getAll({ filters: { user_id: scope }, topK: LIST_TOP_K });
+      const r = await client.getAll({
+        filters: { user_id: scope, ...temporalFilters(opts) },
+        topK: LIST_TOP_K,
+      });
       return (r.results ?? []).map((row) => toEntry(row, scope));
     });
     let merged = mergeById((await Promise.all(pulls)).flat());
@@ -394,5 +419,15 @@ export class Mem0Backend implements MemoryBackend {
 
   invalidate(): void {
     invalidateMemoryClient();
+  }
+
+  /**
+   * Temporal-lite validity close (the `MemoryBackend.invalidateEntry`
+   * capability): soft-forget / supersession as a vec-safe column update on
+   * the canonical store — never a delete, never a re-embed. Returns false
+   * when no OPEN memory row matched (unknown id or already closed).
+   */
+  async invalidateEntry(id: string, opts: { supersededBy?: string } = {}): Promise<boolean> {
+    return this.invalidateEntryStore(id, opts);
   }
 }

@@ -154,6 +154,24 @@ export async function lexicalSearchCanonical(
 }
 
 /**
+ * Close a memory row's validity window in the canonical store (the store half
+ * of `Mem0Backend.invalidateEntry` — temporal-lite soft-forget/supersession).
+ * Same live-store access pattern as `updateMemoryPayload`: any live
+ * `CanonicalVectorStore` works (one shared `memory_canonical` table), and
+ * `invalidate` self-guards to open memory (non-entity) rows. Returns whether
+ * an OPEN row was closed (false ⇒ unknown id or already closed — first-wins).
+ */
+export async function invalidateEntryCanonical(
+  id: string,
+  opts: { supersededBy?: string } = {},
+): Promise<boolean> {
+  await getMemoryClient(); // reuse the cached client so a canonical store exists
+  const store = [..._liveCanonicalStores][0];
+  if (!store) throw new Error('mem0_unavailable');
+  return store.invalidate(id, opts);
+}
+
+/**
  * mem0ai 3.x has NO `custom` embedder provider — its EmbedderFactory
  * switch only knows openai/ollama/lmstudio/google/azure_openai/langchain
  * and throws "Unsupported embedder provider: custom" otherwise. It

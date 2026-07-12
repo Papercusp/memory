@@ -99,6 +99,21 @@ export class HybridBackend implements MemoryBackend {
     return this.cosine.forget(id);
   }
 
+  /**
+   * Temporal-lite validity close — delegates to the COSINE (canonical PG)
+   * leg like every lifecycle write; exposed only when that leg has the
+   * capability. The lexical projection is reconciled by re-projection, not
+   * per-id mirroring (same posture as forget/update above).
+   */
+  invalidateEntry(id: string, opts?: { supersededBy?: string }): Promise<boolean> {
+    const impl = this.cosine.invalidateEntry?.bind(this.cosine);
+    // A false here would read as "not found" upstream — a missing capability
+    // must surface as an error, not a clean negative. (The live cosine leg is
+    // the Mem0Backend, which always has it.)
+    if (!impl) throw new Error('invalidateEntry: the cosine leg has no validity-window support');
+    return impl(id, opts);
+  }
+
   update(id: string, patch: UpdatePatch): Promise<void> {
     return this.cosine.update(id, patch);
   }

@@ -101,6 +101,18 @@ export interface SearchOptions {
    */
   fusionMode?: 'floored-union' | 'cosine-gated';
   minLexScore?: number;
+  /**
+   * TEMPORAL-LITE (memory-temporal-lite-validity-windows-2026-07-11).
+   * `asOf` = point-in-time read: only entries whose validity window covers
+   * this ISO timestamp (valid_at ⇒ created_at when unset; < invalid_at).
+   * `includeSuperseded` = opt-in to entries whose window has CLOSED
+   * (superseded / soft-forgotten) — excluded from recall by default.
+   * Entries touched by either control carry `metadata.validity:
+   * { valid_at, invalid_at, superseded_by, status: 'current'|'superseded' }`.
+   * Backends without validity semantics ignore both.
+   */
+  asOf?: string;
+  includeSuperseded?: boolean;
 }
 
 export interface ListOptions {
@@ -108,6 +120,10 @@ export interface ListOptions {
   scope: string | readonly string[];
   /** Filter to entries whose kind matches. */
   kind?: string;
+  /** TEMPORAL-LITE point-in-time read — see `SearchOptions.asOf`. */
+  asOf?: string;
+  /** Include entries whose validity window has closed — see `SearchOptions`. */
+  includeSuperseded?: boolean;
 }
 
 export interface UpdatePatch {
@@ -206,6 +222,18 @@ export interface MemoryBackend {
 
   /** OPTIONAL capability: drop cached clients/state so the next call rebuilds. */
   invalidate?(): void;
+
+  /**
+   * OPTIONAL capability: close one ENTRY's validity window (temporal-lite
+   * soft-forget / supersession) WITHOUT deleting it — the entry drops out
+   * of default recall but stays retrievable via `includeSuperseded` /
+   * `asOf`. `supersededBy` records the replacing entry's id. First-wins:
+   * returns false when no OPEN entry matched (unknown id, or its window
+   * was already closed — the earlier closure stands). NOT the cache-drop
+   * `invalidate()` above. Backends without validity semantics omit it;
+   * callers feature-test (`backend.invalidateEntry?.(…)`).
+   */
+  invalidateEntry?(id: string, opts?: { supersededBy?: string }): Promise<boolean>;
 }
 
 /** Normalize a `scope: string | readonly string[]` arg to a de-duped array. */
