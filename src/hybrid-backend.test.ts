@@ -280,6 +280,48 @@ describe('HybridBackend (P-020)', () => {
     // The early-return fires BEFORE the lexical search — no wasted lexical probe.
     expect(lexSearch).not.toHaveBeenCalled();
   });
+
+  /**
+   * Recurrence guard: in floored-union mode the two legs MUST run CONCURRENTLY.
+   *
+   * They are independent (two rankings of the same rows — neither's input depends on the
+   * other's output), so awaiting them in sequence puts the lexical leg's whole cost on the
+   * critical path: total = cosine + lexical instead of max(cosine, lexical). That was free
+   * to ignore while the lexical leg was a local file scan, and became the DOMINANT cost the
+   * moment the leg became a PG query — most of why `hybrid-pg` benched at p50 1182ms against
+   * `hybrid`'s 821ms (memory-pg-lexical-own-injection-2026-07-13 P-006 run 8).
+   *
+   * A future refactor that innocently re-writes this back to `await cosine; await lexical;`
+   * would silently restore the regression with every test still green — so pin the overlap
+   * itself: the lexical leg must be STARTED before the cosine leg has resolved.
+   */
+  it('floored-union runs BOTH legs concurrently (the lexical leg is not on the critical path)', async () => {
+    let cosineResolved = false;
+    let lexicalStartedBeforeCosineResolved = false;
+
+    const cosine = fakeBackend('cosine', [], {
+      search: vi.fn(async () => {
+        // Yield to the microtask queue so a concurrently-started lexical leg can run.
+        await new Promise((r) => setTimeout(r, 10));
+        cosineResolved = true;
+        return [e('cosine-hit', 0.9)];
+      }),
+    });
+    const lexical = fakeBackend('lexical', [], {
+      search: vi.fn(async () => {
+        lexicalStartedBeforeCosineResolved = !cosineResolved;
+        return [e('CODEX_HOME', 1.0)];
+      }),
+    });
+
+    const hy = new HybridBackend(lexical, cosine, { fusionMode: 'floored-union' });
+    const hits = await hy.search('CODEX_HOME', { scope: 's' });
+
+    // The overlap itself — the thing a re-serializing refactor would break.
+    expect(lexicalStartedBeforeCosineResolved).toBe(true);
+    // ...and both legs still actually contribute to the fused result.
+    expect(hits.map((h) => h.text)).toEqual(expect.arrayContaining(['CODEX_HOME', 'cosine-hit']));
+  });
 });
 
 describe('HybridBackend searchLexical (WI-4214 embed-free fallback)', () => {
