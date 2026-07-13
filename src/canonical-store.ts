@@ -469,58 +469,59 @@ export class CanonicalVectorStore {
       const vCond = validityCond('', temporal, params, () => idx++);
       if (vCond) conds.push(vCond);
     }
-    // `_` is a LIKE single-char wildcard and survives the tokenizer —
-    // escape it so a token like `user_id` matches literally. ONE param per
-    // token, reused across the three candidate fields.
-    const tokenConds = tokens.map((t) => {
+    // Field-weighted lexical relevance — claude-file-leg parity (scoreEntry in
+    // claude-file-backend.ts): per token, name ×3 > description ×2 > body ×1,
+    // normalized 0..1 by tokens×3.
+    //
+    // ⚠ The score is computed IN SQL, over the WHOLE matching set, and the
+    // ORDER BY is the score itself. It must NOT go back to "pull N candidates
+    // by recency, then score them in JS": that ranked by `created_at` and
+    // truncated the pool BEFORE scoring, so a row could be dropped without
+    // ever being scored — the best lexical match simply lost a recency race to
+    // rows that merely shared a common word. On the 114-row bench corpus that
+    // cost lexical-gap MRR (0.68 vs the file leg's 0.75, because the correct
+    // row is reachable only via a couple of generic words); on a live store it
+    // silently breaks EXACT-IDENTIFIER recall, which is this leg's entire job
+    // (a rare identifier in an old row never enters the candidate pool).
+    //
+    // `_` is a LIKE single-char wildcard and survives the tokenizer — escape it
+    // so a token like `user_id` matches literally. ONE param per token, reused
+    // across the three fields (each ILIKE is evaluated exactly once: the score
+    // expression IS the filter, so there is no separate OR pre-filter).
+    const scoreTerms = tokens.map((t) => {
       params.push(`%${t.replace(/[\\%_]/g, (m) => `\\${m}`)}%`);
       const p = `$${idx++}`;
-      return `(payload->>'data' ILIKE ${p} OR payload->>'name' ILIKE ${p} OR payload->>'description' ILIKE ${p})`;
+      return `CASE WHEN payload->>'name' ILIKE ${p} THEN 3 WHEN payload->>'description' ILIKE ${p} THEN 2 WHEN payload->>'data' ILIKE ${p} THEN 1 ELSE 0 END`;
     });
-    conds.push(`(${tokenConds.join(' OR ')})`);
-    // Over-fetch candidates newest-first: field-weighted scoring happens in
-    // JS, and the created_at order makes score ties resolve to fresh rows.
-    // topK*5 (was *3): weighting can promote a row well past its unweighted
-    // candidate rank, so the pool must be deeper than the slice.
-    const candidateCap = Math.max(topK * 5, 50);
-    params.push(candidateCap);
+    const rawScore = scoreTerms.join(' + ');
+    params.push(topK);
     const res = await client.query(
-      `SELECT id, payload, valid_at, invalid_at, superseded_by
-       FROM ${this.cfg.schema}.memory_canonical
-       WHERE ${conds.join(' AND ')}
-       ORDER BY created_at DESC
+      `SELECT id, payload, valid_at, invalid_at, superseded_by, lex_raw
+       FROM (
+         SELECT id, payload, valid_at, invalid_at, superseded_by, created_at,
+                (${rawScore})::float AS lex_raw
+         FROM ${this.cfg.schema}.memory_canonical
+         WHERE ${conds.join(' AND ')}
+       ) c
+       WHERE lex_raw > 0
+       ORDER BY lex_raw DESC, created_at DESC
        LIMIT $${idx}`,
       params,
     );
-    const scored = res.rows.map(
+    return res.rows.map(
       (r: {
         id: string;
         payload: Record<string, unknown>;
+        lex_raw: number;
         valid_at?: unknown;
         invalid_at?: unknown;
         superseded_by?: unknown;
-      }) => {
-        // Field-weighted lexical relevance — claude-file-leg parity
-        // (scoreEntry in claude-file-backend.ts): name ×3 > description ×2 >
-        // body ×1 per token, normalized 0..1 by tokens×3.
-        const name = String(r.payload?.name ?? '').toLowerCase();
-        const desc = String(r.payload?.description ?? '').toLowerCase();
-        const data = String(r.payload?.data ?? '').toLowerCase();
-        let s = 0;
-        for (const t of tokens) {
-          if (name.includes(t)) s += 3;
-          else if (desc.includes(t)) s += 2;
-          else if (data.includes(t)) s += 1;
-        }
-        return {
-          id: r.id,
-          payload: this.storeKind === 'memory' ? foldValidity(r.payload, r, temporal) : r.payload,
-          score: s / (tokens.length * 3),
-        };
-      },
+      }) => ({
+        id: r.id,
+        payload: this.storeKind === 'memory' ? foldValidity(r.payload, r, temporal) : r.payload,
+        score: Number(r.lex_raw) / (tokens.length * 3),
+      }),
     );
-    // Stable sort: score desc, ties keep the newest-first candidate order.
-    return scored.sort((a: VectorStoreResult, b: VectorStoreResult) => (b.score ?? 0) - (a.score ?? 0)).slice(0, topK);
   }
 
   async get(id: string): Promise<VectorStoreResult | null> {
