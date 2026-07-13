@@ -122,26 +122,37 @@ function entityFilterEnabled(): boolean {
 }
 
 /** Cap on query tokens for the lexical fallback — bounds the OR-chain. */
-const LEXICAL_MAX_TOKENS = 8;
+const LEXICAL_MAX_TOKENS = 12;
 
 /**
  * Tokenize a query for lexical search: lowercase, split on anything outside
- * [a-z0-9_-] (identifiers like `WI-4214` / `user_id` survive intact), drop
- * 1-char tokens, dedupe, cap. Min length is 2 — claude-file-leg parity
- * (P-002, memory-pg-lexical-own-injection-2026-07-13): short identifier
- * tokens (`pg`, `ui`, `su`) carry real signal in this corpus, and the
- * claude-file tokenizer that benched best on exact-identifier recall keeps
- * them. Exported for `lexicalSearch` scoring parity and its tests.
+ * [a-z0-9_-], drop 1-char tokens, dedupe, cap. Two P-002 parity properties
+ * (memory-pg-lexical-own-injection-2026-07-13):
+ *
+ * - Min length 2 — short identifier tokens (`pg`, `ui`, `su`) carry real
+ *   signal in this corpus, and the claude-file tokenizer that benched best
+ *   on exact-identifier recall keeps them.
+ * - COMPOUND identifiers emit both forms: the WHOLE token (`user_id`,
+ *   `wi-4214` — exact-substring precision the claude-file leg lacks) AND its
+ *   `_`/`-` SUBTOKENS (`user`, `id` — the partial matching the claude-file
+ *   leg gets by splitting, without which a variant spelling of one segment
+ *   misses the whole memory; this cost the first hybrid-pg bench 0.10
+ *   lexical-gap MRR vs the file leg). Whole tokens are emitted first so the
+ *   cap never trades a full identifier for a fragment.
+ *
+ * Exported for `lexicalSearch` scoring parity and its tests.
  */
 export function lexicalTokens(query: string): string[] {
-  return [
-    ...new Set(
-      query
-        .toLowerCase()
-        .split(/[^a-z0-9_-]+/)
-        .filter((t) => t.length >= 2),
-    ),
-  ].slice(0, LEXICAL_MAX_TOKENS);
+  const whole = query
+    .toLowerCase()
+    .split(/[^a-z0-9_-]+/)
+    .filter((t) => t.length >= 2);
+  const subs: string[] = [];
+  for (const t of whole) {
+    if (!/[_-]/.test(t)) continue;
+    for (const s of t.split(/[_-]+/)) if (s.length >= 2) subs.push(s);
+  }
+  return [...new Set([...whole, ...subs])].slice(0, LEXICAL_MAX_TOKENS);
 }
 
 function toVectorLiteral(v: number[]): string {

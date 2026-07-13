@@ -359,22 +359,37 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
 });
 
 describe('lexicalTokens', () => {
-  it('lowercases, drops 1-char tokens, dedupes, caps at 8', () => {
+  it('lowercases, drops 1-char tokens, dedupes, caps at 12', () => {
     // min-len 2 (P-002 claude-file parity): 'of' survives, 'a'/'x' drop.
     expect(lexicalTokens('The EMBED embed of a x!')).toEqual(['the', 'embed', 'of']);
-    const many = lexicalTokens('alpha bravo charlie delta echo foxtrot golf hotel india juliet');
-    expect(many).toHaveLength(8);
+    const many = lexicalTokens(
+      'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november',
+    );
+    expect(many).toHaveLength(12);
   });
 
   it('keeps 2-char identifier tokens (pg, ui) — the P-002 min-len change', () => {
     expect(lexicalTokens('pg ui x')).toEqual(['pg', 'ui']);
   });
 
-  it('keeps identifier-ish tokens intact (underscores/hyphens)', () => {
-    expect(lexicalTokens('PAPERCUSP_MEMORY_TOOL_TIMEOUT_MS op-deadline')).toEqual([
-      'papercusp_memory_tool_timeout_ms',
+  it('emits compound identifiers WHOLE plus their subtokens (P-002 lexical-gap parity)', () => {
+    expect(lexicalTokens('PAPERCUSP_MEMORY_TIMEOUT op-deadline')).toEqual([
+      'papercusp_memory_timeout',
       'op-deadline',
+      'papercusp',
+      'memory',
+      'timeout',
+      'op',
+      'deadline',
     ]);
+  });
+
+  it('whole tokens win the cap over subtoken fragments', () => {
+    // 12 whole tokens fill the cap; the compound's subtokens must not evict any.
+    const q = 'a_b c_d e_f g_h i_j k_l m_n o_p q_r s_t u_v w_x';
+    const out = lexicalTokens(q);
+    expect(out).toHaveLength(12);
+    expect(out.every((t) => t.includes('_'))).toBe(true);
   });
 });
 
