@@ -289,11 +289,17 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     expect(q.sql).toContain("state != 'archived'");
     expect(q.sql).toContain("payload->>'user_id' = $1");
     expect(q.sql).toContain("payload->>'data' ILIKE");
+    // P-002: candidates come from all three weighted fields, one shared
+    // param per token.
+    expect(q.sql).toContain("payload->>'name' ILIKE");
+    expect(q.sql).toContain("payload->>'description' ILIKE");
     expect(q.sql).not.toContain('memory_vec'); // never touches an embedding table
     expect(q.params).toContain('scope-a');
     expect(q.params).toContain('%embed%');
     expect(q.params).toContain('%sidecar%');
     expect(q.params).toContain('%concurrency%');
+    // One param per token (not one per field) — the field conds reuse it.
+    expect(q.params.filter((p) => p === '%embed%')).toHaveLength(1);
   });
 
   it('escapes the LIKE single-char wildcard in tokens (user_id matches literally)', async () => {
@@ -308,15 +314,38 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     expect(queries).toHaveLength(0);
   });
 
-  it('scores by token-overlap fraction and orders descending', async () => {
+  it('scores by field-weighted token overlap (normalized by tokens×3) and orders descending', async () => {
     const { store } = makeLexStore([
       { id: 'one-token', payload: { data: 'the embed pipeline', user_id: 'u' } },
       { id: 'both-tokens', payload: { data: 'embed sidecar is warm', user_id: 'u' } },
     ]);
     const out = await store.lexicalSearch('embed sidecar', 5, { user_id: 'u' });
     expect(out.map((r) => r.id)).toEqual(['both-tokens', 'one-token']);
-    expect(out[0].score).toBe(1);
-    expect(out[1].score).toBe(0.5);
+    // Data-only hits weigh ×1 each, normalized by tokens×3 (claude-file parity).
+    expect(out[0].score).toBeCloseTo(2 / 6);
+    expect(out[1].score).toBeCloseTo(1 / 6);
+  });
+
+  it('weights name hits over description hits over data hits (P-002 parity)', async () => {
+    const { store } = makeLexStore([
+      { id: 'data-hit', payload: { data: 'embed embed embed everywhere', user_id: 'u' } },
+      { id: 'name-hit', payload: { name: 'embed pipeline', data: 'unrelated', user_id: 'u' } },
+      { id: 'desc-hit', payload: { description: 'about the embed path', data: 'unrelated', user_id: 'u' } },
+    ]);
+    const out = await store.lexicalSearch('embed', 5, { user_id: 'u' });
+    expect(out.map((r) => r.id)).toEqual(['name-hit', 'desc-hit', 'data-hit']);
+    expect(out[0].score).toBeCloseTo(3 / 3); // name ×3
+    expect(out[1].score).toBeCloseTo(2 / 3); // description ×2
+    expect(out[2].score).toBeCloseTo(1 / 3); // data ×1 — repeats don't stack
+  });
+
+  it('a token counts its BEST field only (name hit shadows data hit for the same token)', async () => {
+    const { store } = makeLexStore([
+      { id: 'both-fields', payload: { name: 'embed', data: 'embed sidecar', user_id: 'u' } },
+    ]);
+    const out = await store.lexicalSearch('embed sidecar', 5, { user_id: 'u' });
+    // 'embed': name ×3 (data hit shadowed); 'sidecar': data ×1 → 4/(2×3).
+    expect(out[0].score).toBeCloseTo(4 / 6);
   });
 
   it('slices to topK after scoring', async () => {
@@ -330,10 +359,15 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
 });
 
 describe('lexicalTokens', () => {
-  it('lowercases, drops short tokens, dedupes, caps at 8', () => {
-    expect(lexicalTokens('The EMBED embed of a x!')).toEqual(['the', 'embed']);
+  it('lowercases, drops 1-char tokens, dedupes, caps at 8', () => {
+    // min-len 2 (P-002 claude-file parity): 'of' survives, 'a'/'x' drop.
+    expect(lexicalTokens('The EMBED embed of a x!')).toEqual(['the', 'embed', 'of']);
     const many = lexicalTokens('alpha bravo charlie delta echo foxtrot golf hotel india juliet');
     expect(many).toHaveLength(8);
+  });
+
+  it('keeps 2-char identifier tokens (pg, ui) — the P-002 min-len change', () => {
+    expect(lexicalTokens('pg ui x')).toEqual(['pg', 'ui']);
   });
 
   it('keeps identifier-ish tokens intact (underscores/hyphens)', () => {

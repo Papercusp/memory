@@ -125,9 +125,13 @@ function entityFilterEnabled(): boolean {
 const LEXICAL_MAX_TOKENS = 8;
 
 /**
- * Tokenize a query for the lexical fallback: lowercase, split on anything
- * outside [a-z0-9_-], drop tokens under 3 chars (stopword-ish noise), dedupe,
- * cap. Exported for `lexicalSearch` scoring parity and its tests.
+ * Tokenize a query for lexical search: lowercase, split on anything outside
+ * [a-z0-9_-] (identifiers like `WI-4214` / `user_id` survive intact), drop
+ * 1-char tokens, dedupe, cap. Min length is 2 — claude-file-leg parity
+ * (P-002, memory-pg-lexical-own-injection-2026-07-13): short identifier
+ * tokens (`pg`, `ui`, `su`) carry real signal in this corpus, and the
+ * claude-file tokenizer that benched best on exact-identifier recall keeps
+ * them. Exported for `lexicalSearch` scoring parity and its tests.
  */
 export function lexicalTokens(query: string): string[] {
   return [
@@ -135,7 +139,7 @@ export function lexicalTokens(query: string): string[] {
       query
         .toLowerCase()
         .split(/[^a-z0-9_-]+/)
-        .filter((t) => t.length >= 3),
+        .filter((t) => t.length >= 2),
     ),
   ].slice(0, LEXICAL_MAX_TOKENS);
 }
@@ -416,15 +420,18 @@ export class CanonicalVectorStore {
   }
 
   /**
-   * EMBED-FREE lexical search — the degraded-path fallback behind
-   * `MemoryBackend.searchLexical` (WI-4214): when the embedder is saturated
-   * or down, semantic search is unusable but PG itself is healthy, so a
-   * plain token match over the canonical text still serves recall. Pulls
-   * candidates matching ANY query token (ILIKE), then scores by
-   * token-overlap fraction (matched/total, 0..1) in JS — NOT on the cosine
-   * scale; ordering only. Reuses the store-kind + archived guards and the
-   * post-filter semantics of search()/list(). Bounded: ≤ LEXICAL_MAX_TOKENS
-   * tokens, candidates capped, no vec-table join.
+   * EMBED-FREE lexical search — originally the degraded-path fallback behind
+   * `MemoryBackend.searchLexical` (WI-4214); since P-002 of
+   * memory-pg-lexical-own-injection-2026-07-13 also the FIRST-CLASS lexical
+   * leg of the `hybrid-pg` backend, brought to scoring parity with the
+   * claude-file leg that benched best on exact-identifier recall. Pulls
+   * candidates matching ANY query token (ILIKE) across the payload's `name`,
+   * `description`, and `data` fields, then field-weight scores in JS — per
+   * token: name hit ×3, else description hit ×2, else data hit ×1,
+   * normalized 0..1 by tokens×3. NOT on the cosine scale; ordering only.
+   * Reuses the store-kind + archived guards and the post-filter semantics of
+   * search()/list(). Bounded: ≤ LEXICAL_MAX_TOKENS tokens, candidates
+   * capped, no vec-table join.
    */
   async lexicalSearch(
     query: string,
@@ -452,15 +459,19 @@ export class CanonicalVectorStore {
       if (vCond) conds.push(vCond);
     }
     // `_` is a LIKE single-char wildcard and survives the tokenizer —
-    // escape it so a token like `user_id` matches literally.
+    // escape it so a token like `user_id` matches literally. ONE param per
+    // token, reused across the three candidate fields.
     const tokenConds = tokens.map((t) => {
       params.push(`%${t.replace(/[\\%_]/g, (m) => `\\${m}`)}%`);
-      return `payload->>'data' ILIKE $${idx++}`;
+      const p = `$${idx++}`;
+      return `(payload->>'data' ILIKE ${p} OR payload->>'name' ILIKE ${p} OR payload->>'description' ILIKE ${p})`;
     });
     conds.push(`(${tokenConds.join(' OR ')})`);
-    // Over-fetch candidates newest-first: token-overlap scoring happens in
+    // Over-fetch candidates newest-first: field-weighted scoring happens in
     // JS, and the created_at order makes score ties resolve to fresh rows.
-    const candidateCap = Math.max(topK * 3, 30);
+    // topK*5 (was *3): weighting can promote a row well past its unweighted
+    // candidate rank, so the pool must be deeper than the slice.
+    const candidateCap = Math.max(topK * 5, 50);
     params.push(candidateCap);
     const res = await client.query(
       `SELECT id, payload, valid_at, invalid_at, superseded_by
@@ -478,12 +489,22 @@ export class CanonicalVectorStore {
         invalid_at?: unknown;
         superseded_by?: unknown;
       }) => {
+        // Field-weighted lexical relevance — claude-file-leg parity
+        // (scoreEntry in claude-file-backend.ts): name ×3 > description ×2 >
+        // body ×1 per token, normalized 0..1 by tokens×3.
+        const name = String(r.payload?.name ?? '').toLowerCase();
+        const desc = String(r.payload?.description ?? '').toLowerCase();
         const data = String(r.payload?.data ?? '').toLowerCase();
-        const matched = tokens.filter((t) => data.includes(t)).length;
+        let s = 0;
+        for (const t of tokens) {
+          if (name.includes(t)) s += 3;
+          else if (desc.includes(t)) s += 2;
+          else if (data.includes(t)) s += 1;
+        }
         return {
           id: r.id,
           payload: this.storeKind === 'memory' ? foldValidity(r.payload, r, temporal) : r.payload,
-          score: matched / tokens.length,
+          score: s / (tokens.length * 3),
         };
       },
     );

@@ -68,6 +68,7 @@ export {
   type DiversityRerankOptions,
 } from './diversity-rerank';
 export { HybridBackend, type HybridBackendOptions } from './hybrid-backend';
+export { LexicalLegBackend } from './lexical-leg';
 export {
   fuse,
   fuseCosineGated,
