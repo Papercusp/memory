@@ -502,13 +502,37 @@ export class CanonicalVectorStore {
     //
     // `_` is a LIKE single-char wildcard and survives the tokenizer — escape it
     // so a token like `user_id` matches literally. ONE param per token, reused
-    // across the three fields (each ILIKE is evaluated exactly once: the score
-    // expression IS the filter, so there is no separate OR pre-filter).
-    const scoreTerms = tokens.map((t) => {
+    // across the three fields AND across the pre-filter below.
+    //
+    // ⚠ EI-10931 — WHY THERE IS AN OR PRE-FILTER (there deliberately wasn't one, and
+    // that was the bug). Scoring in the SELECT list with `lex_raw > 0` applied in the
+    // OUTER query left the inner scan with NO searchable predicate, so Postgres read and
+    // SCORED EVERY ROW on every lexical search — an unavoidable full seq scan that no
+    // index could ever serve, growing linearly with the store:
+    //
+    //     Seq Scan on memory_canonical (actual time=1.368..774.428 rows=1287)
+    //     Execution Time: 775.674 ms        -- 13,594 active rows, 12-token query
+    //
+    // The old comment here defended this as "each ILIKE is evaluated exactly once" —
+    // a micro-optimization that cost a 776ms full scan to save re-evaluating a handful
+    // of ILIKEs on the few rows that actually match. `matchTerms` is LOGICALLY IDENTICAL
+    // to `lex_raw > 0` (a row scores > 0 iff ≥1 token hits ≥1 field, which is exactly
+    // this OR), so it changes NO result — it only gives the planner a predicate it can
+    // serve from the pg_trgm GIN indexes (migration 594). Recall is untouched by
+    // construction; only the plan changes.
+    const scoreTerms: string[] = [];
+    const matchTerms: string[] = [];
+    for (const t of tokens) {
       params.push(`%${t.replace(/[\\%_]/g, (m) => `\\${m}`)}%`);
       const p = `$${idx++}`;
-      return `CASE WHEN payload->>'name' ILIKE ${p} THEN 3 WHEN payload->>'description' ILIKE ${p} THEN 2 WHEN payload->>'data' ILIKE ${p} THEN 1 ELSE 0 END`;
-    });
+      scoreTerms.push(
+        `CASE WHEN payload->>'name' ILIKE ${p} THEN 3 WHEN payload->>'description' ILIKE ${p} THEN 2 WHEN payload->>'data' ILIKE ${p} THEN 1 ELSE 0 END`,
+      );
+      matchTerms.push(
+        `payload->>'name' ILIKE ${p} OR payload->>'description' ILIKE ${p} OR payload->>'data' ILIKE ${p}`,
+      );
+    }
+    if (matchTerms.length > 0) conds.push(`(${matchTerms.join(' OR ')})`);
     const rawScore = scoreTerms.join(' + ');
     params.push(topK);
     const res = await client.query(
