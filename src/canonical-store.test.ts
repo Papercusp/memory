@@ -362,13 +362,28 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
 });
 
 describe('lexicalTokens', () => {
-  it('lowercases, drops 1-char tokens, dedupes, caps at 12', () => {
+  it('lowercases, drops 1-char tokens, dedupes, caps at 32', () => {
     // min-len 2 (P-002 claude-file parity): 'of' survives, 'a'/'x' drop.
     expect(lexicalTokens('The EMBED embed of a x!')).toEqual(['the', 'embed', 'of']);
-    const many = lexicalTokens(
-      'alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november',
-    );
-    expect(many).toHaveLength(12);
+    const many = lexicalTokens(Array.from({ length: 50 }, (_, i) => `word${i}`).join(' '));
+    expect(many).toHaveLength(32);
+  });
+
+  it('does NOT truncate a real natural-language query — the cap is a safety bound, not a relevance knob', () => {
+    // ⚠ THE REGRESSION THIS PINS (plan memory-pg-lexical-own-injection-2026-07-13 P-006):
+    // the cap was 12 while real recall queries run ~20 tokens (gold-set v1: p50 10, p95 24,
+    // max 28). It silently DISCARDED the tail of every long query and then normalized the
+    // score by the truncated token count — costing lexical-gap (paraphrase) MRR 0.432 vs
+    // 0.546 uncapped, the entire hybrid-pg-vs-hybrid regression. Invisible on exact-identifier
+    // queries (short → MRR 1.000 either way), which is what disguised it as a ranking bug.
+    // A 28-token query must survive INTACT; if this fails, someone lowered the cap.
+    const realQuery =
+      'pushing simulated keypresses at a live text-mode console wired into the fleet common ' +
+      'backend could accidentally kick off a real worker the rest of the team relies on';
+    const tokens = lexicalTokens(realQuery);
+    expect(tokens.length).toBeGreaterThanOrEqual(24); // nothing dropped at p95 length
+    expect(tokens).toContain('keypresses'); // …including the discriminative tail
+    expect(tokens).toContain('worker');
   });
 
   it('keeps 2-char identifier tokens (pg, ui) — the P-002 min-len change', () => {
@@ -388,10 +403,10 @@ describe('lexicalTokens', () => {
   });
 
   it('whole tokens win the cap over subtoken fragments', () => {
-    // 12 whole tokens fill the cap; the compound's subtokens must not evict any.
-    const q = 'a_b c_d e_f g_h i_j k_l m_n o_p q_r s_t u_v w_x';
+    // 32 whole compounds fill the cap; their subtokens must not evict any.
+    const q = Array.from({ length: 32 }, (_, i) => `a${i}_b${i}`).join(' ');
     const out = lexicalTokens(q);
-    expect(out).toHaveLength(12);
+    expect(out).toHaveLength(32);
     expect(out.every((t) => t.includes('_'))).toBe(true);
   });
 });

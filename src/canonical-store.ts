@@ -121,8 +121,24 @@ function entityFilterEnabled(): boolean {
   return process.env.PAPERCUSP_MEMORY_ENTITY_FILTER !== 'off';
 }
 
-/** Cap on query tokens for the lexical fallback — bounds the OR-chain. */
-const LEXICAL_MAX_TOKENS = 12;
+/**
+ * Cap on query tokens for the lexical leg — bounds the per-token CASE chain in
+ * `lexicalSearch` (worst case 32 × 3 ILIKEs/row) so a pasted wall of text can't
+ * build an unbounded query.
+ *
+ * ⚠ It must stay WELL ABOVE a real query's length, and 12 did NOT (that is why
+ * it is 32). Natural-language recall queries run ~20 tokens (gold-set v1: p50
+ * 10, p95 24, max 28), so a cap of 12 silently DISCARDED ~40% of every long
+ * query — its discriminative tail — and then normalized the score by the
+ * TRUNCATED token count. Cost: lexical-gap (paraphrase) MRR 0.432 vs 0.546
+ * uncapped, which is the whole of the hybrid-pg-vs-hybrid regression the P-006
+ * bench caught. It is invisible on exact-identifier queries (MRR 1.000 either
+ * way — they are short), so only the paraphrase class regressed, which is what
+ * made it look like a fusion/ranking problem rather than a tokenizer one.
+ * A cap is a SAFETY bound on pathological input, never a relevance knob: set it
+ * so it never fires for real queries.
+ */
+const LEXICAL_MAX_TOKENS = 32;
 
 /**
  * Tokenize a query for lexical search: lowercase, split on anything outside
