@@ -133,8 +133,8 @@ describe('topic-file format', () => {
   });
 
   it('claudeProjectMemoryDir applies the / and . → - slug rule', () => {
-    expect(claudeProjectMemoryDir('/home/marsh-office', '/home/u/.claude')).toBe(
-      '/home/u/.claude/projects/-home-marsh-office/memory',
+    expect(claudeProjectMemoryDir('/home/dev', '/home/u/.claude')).toBe(
+      '/home/u/.claude/projects/-home-dev/memory',
     );
   });
 });
