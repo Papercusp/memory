@@ -126,28 +126,51 @@ export class HybridBackend implements MemoryBackend {
     // Per-call overrides (the P-031 sweep) win over the constructor defaults.
     const mode = opts.fusionMode ?? this.opts.fusionMode ?? 'floored-union';
     const minLexScore = opts.minLexScore ?? this.opts.minLexScore;
-    // The cosine leg carries the FP floor (opts.minScore). In cosine-gated mode an
-    // empty cosine set means "nothing relevant" → return early; in floored-union
-    // mode the lexical leg can still contribute strong identifier hits, so we run it.
-    const cosineHits = await this.cosine.search(query, opts);
-    if (cosineHits.length === 0 && mode === 'cosine-gated') return [];
     const depth = this.opts.lexicalDepth ?? (opts.limit ?? 6) * 3;
-    // Lexical leg: a re-rank (gated mode) or a co-equal recall source (union mode);
-    // if it's unavailable, degrade cleanly to cosine-only (the documented contract,
-    // header §"available()/degrades cleanly"). A try/catch — NOT a trailing `.catch()`
-    // on the call — because `.catch()` only handles an async REJECTION; a SYNCHRONOUS
-    // throw from the method access itself (an undefined/misconfigured lexical leg, or a
-    // leg missing `.search`) escapes it. That asymmetry was EI-2777: remember()'s lexical
-    // projection is in a try/catch (above) so a broken leg was swallowed there, but
-    // search()'s `.catch()` let the same fault surface as the deterministic, search-ONLY
-    // "Cannot read properties of undefined (reading 'search')". The try/catch makes the
-    // two paths symmetric, so a broken lexical leg degrades search to cosine-only too.
-    let lexicalHits: MemoryEntry[];
-    try {
-      lexicalHits = await this.lexical.search(query, { scope: opts.scope, limit: depth });
-    } catch {
-      lexicalHits = [];
-    }
+    // ⚠ The two legs run CONCURRENTLY — they are INDEPENDENT (different rankings of the
+    // same rows; neither's input depends on the other's output), so awaiting them in
+    // sequence put the lexical leg's full cost on the critical path for no reason:
+    // total = cosine + lexical instead of max(cosine, lexical).
+    //
+    // That was invisible while the lexical leg was a local file scan (~free), and it
+    // became the dominant term the moment the leg became a PG query: it is most of why
+    // `hybrid-pg` benched at p50 1182ms vs `hybrid`'s 821ms (memory-pg-lexical-own-
+    // injection-2026-07-13 P-006, run 8). The cosine leg is embed-bound (a network
+    // round-trip to the embedder); the lexical leg is embed-free and DB-bound. Overlapping
+    // them hides the cheaper one entirely behind the one we cannot avoid.
+    //
+    // ⚠ ONLY the union path is overlapped. `cosine-gated` mode carries a DELIBERATE
+    // short-circuit — an empty cosine set means "nothing relevant", so the lexical leg
+    // must never be searched at all (that contract is pinned by hybrid-backend.test.ts
+    // "cosine-gated early-return short-circuits the lexical leg entirely"). Racing the
+    // leg eagerly would silently spend the very work that mode exists to avoid. So in
+    // gated mode we keep the strict sequence; in floored-union mode (the default, and
+    // what hybrid-pg runs) the leg ALWAYS runs anyway, so starting it early costs
+    // nothing and removes it from the critical path.
+    //
+    // The leg is wrapped in an async IIFE with a try/catch — NOT a trailing `.catch()` on
+    // the call — because `.catch()` only handles an async REJECTION, while a SYNCHRONOUS
+    // throw from the method access itself (an undefined/misconfigured leg, or a leg missing
+    // `.search`) escapes it. That asymmetry was EI-2777. Inside an `async` function a sync
+    // throw becomes a rejection, so this catches BOTH and a broken lexical leg still
+    // degrades search cleanly to cosine-only (header §"available()/degrades cleanly").
+    const runLexical = (): Promise<MemoryEntry[]> =>
+      (async () => {
+        try {
+          return await this.lexical.search(query, { scope: opts.scope, limit: depth });
+        } catch {
+          return [];
+        }
+      })();
+
+    const gated = mode === 'cosine-gated';
+    // Union mode: start the lexical leg NOW so it overlaps the embed-bound cosine call.
+    const inFlightLexical = gated ? null : runLexical();
+
+    // The cosine leg carries the FP floor (opts.minScore).
+    const cosineHits = await this.cosine.search(query, opts);
+    if (cosineHits.length === 0 && gated) return []; // lexical leg never started — as contracted
+    const lexicalHits = await (inFlightLexical ?? runLexical());
     const fused = fuse(cosineHits, lexicalHits, {
       k: this.opts.rrfK ?? DEFAULT_RRF_K,
       mode,
