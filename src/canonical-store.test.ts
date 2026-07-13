@@ -265,8 +265,9 @@ describe('CanonicalVectorStore.deleteCol — the shared-table data-loss guard (G
 });
 
 describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () => {
-  /** Fake pool whose query resolves the given rows (payloads included). */
-  function makeLexStore(rows: Array<{ id: string; payload: Record<string, unknown> }>) {
+  /** Fake pool whose query resolves the given rows. `lex_raw` is the score Postgres
+   *  computes (the CASE-sum) — the leg only normalizes it, so tests supply it. */
+  function makeLexStore(rows: Array<{ id: string; payload: Record<string, unknown>; lex_raw?: number }>) {
     const queries: CapturedQuery[] = [];
     const fakePool = {
       query: vi.fn(async (sql: string, params: unknown[] = []) => {
@@ -289,8 +290,7 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     expect(q.sql).toContain("state != 'archived'");
     expect(q.sql).toContain("payload->>'user_id' = $1");
     expect(q.sql).toContain("payload->>'data' ILIKE");
-    // P-002: candidates come from all three weighted fields, one shared
-    // param per token.
+    // P-002: all three weighted fields score, one shared param per token.
     expect(q.sql).toContain("payload->>'name' ILIKE");
     expect(q.sql).toContain("payload->>'description' ILIKE");
     expect(q.sql).not.toContain('memory_vec'); // never touches an embedding table
@@ -298,8 +298,32 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     expect(q.params).toContain('%embed%');
     expect(q.params).toContain('%sidecar%');
     expect(q.params).toContain('%concurrency%');
-    // One param per token (not one per field) — the field conds reuse it.
+    // One param per token (not one per field) — the field CASEs reuse it.
     expect(q.params.filter((p) => p === '%embed%')).toHaveLength(1);
+  });
+
+  it('scores IN SQL with the field weights, and RANKS BY THAT SCORE — never by recency', async () => {
+    // ⚠ The regression this pins (plan memory-pg-lexical-own-injection-2026-07-13):
+    // the leg used to pull `ORDER BY created_at DESC LIMIT max(topK*5, 50)` and score
+    // the survivors in JS — truncating the pool BEFORE scoring, so the best lexical
+    // match was silently dropped whenever it lost a RECENCY race to rows that merely
+    // shared a common word. Ranking must be by score over the WHOLE matching set. The
+    // scoring SEMANTICS are verified against real Postgres in
+    // packages/operator-core/lib/memory/canonical-lexical-search.integration.test.ts.
+    const { store, queries } = makeLexStore([]);
+    await store.lexicalSearch('embed sidecar', 5, { user_id: 'u' });
+    const { sql, params } = queries[0];
+    // The weights live in SQL: name ×3 > description ×2 > data ×1, per token.
+    expect(sql).toContain("CASE WHEN payload->>'name' ILIKE");
+    expect(sql).toContain('THEN 3 WHEN');
+    expect(sql).toContain('THEN 2 WHEN');
+    expect(sql).toContain('THEN 1 ELSE 0 END');
+    // Ordered by that score; only scoring rows come back.
+    expect(sql).toContain('ORDER BY lex_raw DESC');
+    expect(sql).toContain('WHERE lex_raw > 0');
+    // NOT a recency-ranked candidate pull, and no candidate cap above topK.
+    expect(sql).not.toContain('ORDER BY created_at DESC');
+    expect(params.at(-1)).toBe(5); // the only LIMIT is topK itself
   });
 
   it('escapes the LIKE single-char wildcard in tokens (user_id matches literally)', async () => {
@@ -314,47 +338,26 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     expect(queries).toHaveLength(0);
   });
 
-  it('scores by field-weighted token overlap (normalized by tokens×3) and orders descending', async () => {
+  it('normalizes the SQL score by tokens×3 (claude-file parity)', async () => {
+    // Postgres computes lex_raw and returns the rows already ranked; the leg's
+    // remaining job is the 0..1 normalization. (Weights/ordering: see the real-PG
+    // integration test named in the comment above.)
     const { store } = makeLexStore([
-      { id: 'one-token', payload: { data: 'the embed pipeline', user_id: 'u' } },
-      { id: 'both-tokens', payload: { data: 'embed sidecar is warm', user_id: 'u' } },
+      { id: 'name-and-data', payload: { data: 'x', user_id: 'u' }, lex_raw: 4 },
+      { id: 'data-only', payload: { data: 'y', user_id: 'u' }, lex_raw: 1 },
     ]);
     const out = await store.lexicalSearch('embed sidecar', 5, { user_id: 'u' });
-    expect(out.map((r) => r.id)).toEqual(['both-tokens', 'one-token']);
-    // Data-only hits weigh ×1 each, normalized by tokens×3 (claude-file parity).
-    expect(out[0].score).toBeCloseTo(2 / 6);
+    expect(out.map((r) => r.id)).toEqual(['name-and-data', 'data-only']);
+    // 2 tokens → denominator 2×3.
+    expect(out[0].score).toBeCloseTo(4 / 6);
     expect(out[1].score).toBeCloseTo(1 / 6);
   });
 
-  it('weights name hits over description hits over data hits (P-002 parity)', async () => {
-    const { store } = makeLexStore([
-      { id: 'data-hit', payload: { data: 'embed embed embed everywhere', user_id: 'u' } },
-      { id: 'name-hit', payload: { name: 'embed pipeline', data: 'unrelated', user_id: 'u' } },
-      { id: 'desc-hit', payload: { description: 'about the embed path', data: 'unrelated', user_id: 'u' } },
-    ]);
-    const out = await store.lexicalSearch('embed', 5, { user_id: 'u' });
-    expect(out.map((r) => r.id)).toEqual(['name-hit', 'desc-hit', 'data-hit']);
-    expect(out[0].score).toBeCloseTo(3 / 3); // name ×3
-    expect(out[1].score).toBeCloseTo(2 / 3); // description ×2
-    expect(out[2].score).toBeCloseTo(1 / 3); // data ×1 — repeats don't stack
-  });
-
-  it('a token counts its BEST field only (name hit shadows data hit for the same token)', async () => {
-    const { store } = makeLexStore([
-      { id: 'both-fields', payload: { name: 'embed', data: 'embed sidecar', user_id: 'u' } },
-    ]);
-    const out = await store.lexicalSearch('embed sidecar', 5, { user_id: 'u' });
-    // 'embed': name ×3 (data hit shadowed); 'sidecar': data ×1 → 4/(2×3).
-    expect(out[0].score).toBeCloseTo(4 / 6);
-  });
-
-  it('slices to topK after scoring', async () => {
-    const { store } = makeLexStore([
-      { id: 'a', payload: { data: 'embed one' } },
-      { id: 'b', payload: { data: 'embed two' } },
-      { id: 'c', payload: { data: 'embed three' } },
-    ]);
-    expect(await store.lexicalSearch('embed', 2)).toHaveLength(2);
+  it("passes topK to SQL as the LIMIT (the slice is the database's, not ours)", async () => {
+    const { store, queries } = makeLexStore([]);
+    await store.lexicalSearch('embed', 2);
+    expect(queries[0].sql).toMatch(/LIMIT \$\d+/);
+    expect(queries[0].params.at(-1)).toBe(2);
   });
 });
 
