@@ -48,6 +48,7 @@
 
 import { CanonicalVectorStore } from './canonical-store';
 import { memoryHost, memorySchema } from './config';
+import { coalesceEmbedFn } from './embed-coalesce';
 import { FallbackExtractionLlm, type ExtractionLlm } from './extraction-llm';
 
 const LLM_MODEL = 'claude-haiku-4-5';
@@ -490,6 +491,12 @@ async function tryLoad(): Promise<MemoryClient | null> {
   // 'disabled' is a hard stop — don't cache, the user can add a key or
   // flip the preference any time.
   const resolved = await memoryHost().resolveEmbedder();
+  // WI-5094: coalesce + short-TTL-memoize same-text embeds. The pre-turn
+  // memory injection issues three scope pulls with the SAME query text per
+  // turn; on an in-process embedder that was 3 serialized embeds (~2.6-4.5s
+  // of searchMs — the dominant prompt-build phase). Wrapped HERE, once per
+  // (re)build, so a rebuilt/flipped embedder always starts a fresh cache.
+  const coalescedEmbed = coalesceEmbedFn(resolved.embed);
   if (resolved.mode === 'disabled') {
     if (resolved.reason && resolved.reason !== 'user_disabled') {
       warnOnce(`embedder unavailable: ${resolved.reason} (set memoryEmbedderMode in /settings/user)`);
@@ -616,7 +623,7 @@ async function tryLoad(): Promise<MemoryClient | null> {
   // `vectorStore.config.dimension` below) to bypass the probe.
   const embedderConfig: Record<string, unknown> = {
     provider: 'custom',
-    config: { embed: resolved.embed, embeddingDims: resolved.dims },
+    config: { embed: coalescedEmbed, embeddingDims: resolved.dims },
   };
 
   // mem0 tracks add/update/delete event history in SQLite. Default is
@@ -691,7 +698,7 @@ async function tryLoad(): Promise<MemoryClient | null> {
       }
     }
     patchVectorStoreFactory(mem0);
-    _currentEmbedFn = resolved.embed; // feed the patched 'custom' embedder (mem0 strips config.embed)
+    _currentEmbedFn = coalescedEmbed; // feed the patched 'custom' embedder (mem0 strips config.embed)
     patchEmbedderFactory(mem0);
     if (sessionLlm) {
       // Session rung live: route the 'custom' LLM provider to the host's
