@@ -91,6 +91,86 @@ describe('Mem0Backend.search — scope invariant (P-003) + relevance floor (P-00
 // {ids, storedEvents} wiring via extractAddedIds/extractStoredEventCount.
 // ---------------------------------------------------------------------------
 
+describe('Mem0Backend.search — batched multi-scope path (EI-12962)', () => {
+  const rowA = { id: UUID_A, payload: { data: 'fact A', user_id: 'userA', created_at: '2026-07-01T00:00:00Z' }, score: 0.9 };
+  const rowB = { id: UUID_B, payload: { data: 'fact B', user_id: 'harness:x', kind: 'project' }, score: 0.8 };
+
+  it('multi-scope: embeds ONCE + fans out precomputed-vector store queries — the re-embedding client.search never runs', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({}, calls);
+    const embedQuery = vi.fn(async () => [0.1, 0.2, 0.3]);
+    const vectorSearch = vi.fn(async (_v: number[], _topK: number, filters: Record<string, string>) =>
+      filters.user_id === 'userA' ? [rowA] : [rowB],
+    );
+    const be = new Mem0Backend({ getClient: async () => client, embedQuery, vectorSearch });
+
+    const out = await be.search('q', { scope: ['userA', 'harness:x'], limit: 3 });
+
+    expect(embedQuery).toHaveBeenCalledTimes(1); // ONE embed for N scopes — the whole point
+    expect(vectorSearch).toHaveBeenCalledTimes(2);
+    expect(calls).toHaveLength(0); // client.search (embed-per-call) never ran
+    const scopes = vectorSearch.mock.calls.map((c) => (c[2] as { user_id: string }).user_id).sort();
+    expect(scopes).toEqual(['harness:x', 'userA']);
+    // entry mapping parity: text from payload.data, scope from the pull, score carried
+    const a = out.find((e) => e.id === UUID_A);
+    expect(a).toMatchObject({ text: 'fact A', scope: 'userA', score: 0.9 });
+    const b = out.find((e) => e.id === UUID_B);
+    expect(b).toMatchObject({ text: 'fact B', scope: 'harness:x', kind: 'project' });
+  });
+
+  it('a null embed (embedder down / cold client) falls back to the legacy per-scope client.search path', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: [{ id: '1', memory: 'a', score: 0.9 }], 'harness:x': [] }, calls);
+    const embedQuery = vi.fn(async () => null);
+    const vectorSearch = vi.fn(async () => []);
+    const be = new Mem0Backend({ getClient: async () => client, embedQuery, vectorSearch });
+
+    const out = await be.search('q', { scope: ['userA', 'harness:x'], limit: 3 });
+
+    expect(embedQuery).toHaveBeenCalledTimes(1);
+    expect(vectorSearch).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(2); // legacy per-scope fan-out served the query
+    expect(out.map((e) => e.id)).toEqual(['1']);
+  });
+
+  it('a SINGLE scope stays on client.search (mem0 entity boost preserved) — no batched-path calls', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: [{ id: '1', memory: 'a', score: 0.9 }] }, calls);
+    const embedQuery = vi.fn(async () => [0.5]);
+    const vectorSearch = vi.fn(async () => []);
+    const be = new Mem0Backend({ getClient: async () => client, embedQuery, vectorSearch });
+
+    await be.search('q', { scope: 'userA', limit: 3 });
+
+    expect(embedQuery).not.toHaveBeenCalled();
+    expect(vectorSearch).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(1);
+  });
+
+  it('a custom getClient WITHOUT batched seams disables batching — the stub keeps its per-scope contract', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: [{ id: '1', memory: 'a', score: 0.9 }], 'harness:x': [] }, calls);
+    const be = new Mem0Backend({ getClient: async () => client });
+
+    await be.search('q', { scope: ['userA', 'harness:x'] });
+
+    expect(calls).toHaveLength(2); // legacy path, exactly as before EI-12962
+  });
+
+  it('the relevance floor (minScore) applies to batched results identically', async () => {
+    const weak = { id: UUID_C, payload: { data: 'weak', user_id: 'userA' }, score: 0.2 };
+    const embedQuery = vi.fn(async () => [0.1]);
+    const vectorSearch = vi.fn(async (_v: number[], _k: number, f: Record<string, string>) =>
+      f.user_id === 'userA' ? [rowA, weak] : [],
+    );
+    const be = new Mem0Backend({ getClient: async () => stubClient(), embedQuery, vectorSearch });
+
+    const out = await be.search('q', { scope: ['userA', 'harness:x'], minScore: 0.45 });
+
+    expect(out.map((e) => e.id)).toEqual([UUID_A]); // 0.2 floored away
+  });
+});
+
 describe('Mem0Backend.remember — verbatim/infer mapping, metadata+kind, {ids,storedEvents}', () => {
   it('maps verbatim:true → infer:false (EI-178 — skip LLM extraction)', async () => {
     const add = vi.fn(async () => ({ results: [{ id: UUID_A, event: 'ADD' }] }));

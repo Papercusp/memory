@@ -125,6 +125,23 @@ function rowTimestampMs(row: Mem0Row): number | null {
 }
 
 /**
+ * Freshness timestamp of a CANONICAL payload row (the batched multi-scope
+ * path, EI-12962). mem0 stamps `updated_at`/`created_at` into the payload it
+ * stores (snake_case on this wire, unlike the search-row camelCase above);
+ * absent/unparseable ⇒ null, which `recencyFactor` treats as neutral.
+ */
+function canonicalPayloadTimestampMs(payload: Record<string, unknown>): number | null {
+  for (const key of ['updated_at', 'updatedAt', 'created_at', 'createdAt'] as const) {
+    const raw = payload?.[key];
+    if (typeof raw === 'string' || typeof raw === 'number') {
+      const t = new Date(raw).getTime();
+      if (Number.isFinite(t)) return t;
+    }
+  }
+  return null;
+}
+
+/**
  * Read one result row's event. mem0's add() has TWO wire shapes: the
  * infer (LLM-extraction) path reports a top-level `event`, while the
  * `infer: false` path nests it as `metadata.event` (verified against
@@ -276,6 +293,12 @@ export class Mem0Backend implements MemoryBackend {
   ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
   private readonly invalidateEntryStore: (id: string, opts: { supersededBy?: string }) => Promise<boolean>;
   private readonly reembedVector: (id: string, scope: string, embedText: string) => Promise<boolean>;
+  private readonly embedQuery: (text: string) => Promise<number[] | null>;
+  private readonly vectorSearch: (
+    vector: number[],
+    topK: number,
+    filters: Record<string, string>,
+  ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
 
   constructor(deps: Mem0BackendDeps = {}) {
     this.getClient = deps.getClient ?? getMemoryClient;
@@ -286,6 +309,14 @@ export class Mem0Backend implements MemoryBackend {
     // table is per-mode, not per-scope) but kept in the seam for symmetry.
     this.reembedVector =
       deps.reembedVector ?? ((id, _scope, embedText) => embedAndUpsertVector(id, embedText));
+    // Batched-path seams (EI-12962). A custom `getClient` WITHOUT explicit
+    // batched seams DISABLES batching (embedQuery → null ⇒ legacy fallback):
+    // `embedForCurrentClient`/`vectorSearchCanonical` are only coherent with
+    // the REAL module client — a swapped-in client's vec space could silently
+    // mismatch them, and test stubs expect the per-scope `client.search` contract.
+    this.embedQuery =
+      deps.embedQuery ?? (deps.getClient ? async () => null : embedForCurrentClient);
+    this.vectorSearch = deps.vectorSearch ?? vectorSearchCanonical;
   }
 
   async available(): Promise<MemoryAvailability> {
@@ -359,26 +390,59 @@ export class Mem0Backend implements MemoryBackend {
     // scoping structurally avoids. A re-rank pass would only matter if one scope
     // ever neared ~1k entries (not the case today). An empty scope produces zero
     // pulls (scopesOf drops blanks), never an unscoped full-table scan.
+    const scopes = scopesOf(opts.scope);
     // id → freshness ts for the decay re-order below (collected from the raw
     // rows because `toEntry` deliberately drops mem0's createdAt/updatedAt).
     const tsById = new Map<string, number | null>();
-    const pulls = scopesOf(opts.scope).map(async (scope) => {
-      // mem0's Memory.search reads `topK` (default 20) and IGNORES a
-      // `limit` key — passing only `limit` silently over-fetched and
-      // broke the seam's per-scope limit contract (caught by the
-      // memory-backend-benchmark P-007 run). Keep `limit` for any
-      // non-mem0 MemoryClient test doubles.
-      const r = await client.search(query, {
-        filters: { user_id: scope, ...temporalFilters(opts) },
-        topK: limit,
-        limit,
+
+    // EI-12962 — MULTI-scope batched path: embed the query ONCE, then fan out
+    // per-scope pgvector queries with the precomputed vector. `client.search`
+    // re-embeds the query on EVERY call, so an N-scope pull cost N embeds
+    // (~200-450ms each, largely serialized on the embedder) — the operator
+    // chat's 20-harness injection reliably blew its 5s deadline and delivered
+    // ZERO memories. One embed + N ~10ms SQL queries keeps the same per-scope
+    // ranking + floors. Tradeoff, deliberate: this path skips mem0's
+    // entity-graph boost (single-scope pulls keep it); a fast plain-cosine
+    // result beats a timed-out boosted one. A null embed (embedder down /
+    // client cold) falls back to the legacy per-scope path below.
+    let merged: MemoryEntry[] | null = null;
+    if (scopes.length > 1) {
+      const vector = await this.embedQuery(query);
+      if (vector) {
+        const pulls = scopes.map(async (scope) => {
+          const rows = await this.vectorSearch(vector, limit, {
+            user_id: scope,
+            ...temporalFilters(opts),
+          });
+          return rows.map((row) => {
+            tsById.set(row.id, canonicalPayloadTimestampMs(row.payload));
+            return canonicalRowToEntry(row, scope);
+          });
+        });
+        merged = mergeById((await Promise.all(pulls)).flat());
+      }
+    }
+
+    if (merged === null) {
+      const pulls = scopes.map(async (scope) => {
+        // mem0's Memory.search reads `topK` (default 20) and IGNORES a
+        // `limit` key — passing only `limit` silently over-fetched and
+        // broke the seam's per-scope limit contract (caught by the
+        // memory-backend-benchmark P-007 run). Keep `limit` for any
+        // non-mem0 MemoryClient test doubles.
+        const r = await client.search(query, {
+          filters: { user_id: scope, ...temporalFilters(opts) },
+          topK: limit,
+          limit,
+        });
+        return (r.results ?? []).map((row) => {
+          tsById.set(row.id, rowTimestampMs(row));
+          return toEntry(row, scope);
+        });
       });
-      return (r.results ?? []).map((row) => {
-        tsById.set(row.id, rowTimestampMs(row));
-        return toEntry(row, scope);
-      });
-    });
-    const ranked = mergeById((await Promise.all(pulls)).flat()).sort(
+      merged = mergeById((await Promise.all(pulls)).flat());
+    }
+    const ranked = merged.sort(
       (a, b) => (b.score ?? 0) - (a.score ?? 0),
     );
     // Relevance floor (P-001 / D-003): drop hits too weak to be real matches, so
