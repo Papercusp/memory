@@ -38,11 +38,13 @@ import {
   type UpdatePatch,
 } from './backend';
 import {
+  embedForCurrentClient,
   getMemoryClient,
   invalidateEntryCanonical,
   invalidateMemoryClient,
   lexicalSearchCanonical,
   updateMemoryPayload,
+  vectorSearchCanonical,
   type Mem0Row,
   type MemoryClient,
 } from './mem0-client';
@@ -246,6 +248,21 @@ export interface Mem0BackendDeps {
    * upsert. Best-effort (returns false, never throws).
    */
   reembedVector?: (id: string, scope: string, embedText: string) => Promise<boolean>;
+  /**
+   * Test seam — embed a query ONCE with the current client's embed fn for the
+   * batched multi-scope search (EI-12962). null ⇒ the caller falls back to the
+   * legacy per-scope `client.search` path. Defaults to `embedForCurrentClient`.
+   */
+  embedQuery?: (text: string) => Promise<number[] | null>;
+  /**
+   * Test seam — the precomputed-vector canonical search the batched path fans
+   * out per scope (EI-12962). Defaults to `vectorSearchCanonical`.
+   */
+  vectorSearch?: (
+    vector: number[],
+    topK: number,
+    filters: Record<string, string>,
+  ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
 }
 
 export class Mem0Backend implements MemoryBackend {

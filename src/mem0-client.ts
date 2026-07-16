@@ -154,6 +154,44 @@ export async function lexicalSearchCanonical(
 }
 
 /**
+ * Vector search over the canonical store with a PRECOMPUTED query vector —
+ * the store half of `Mem0Backend`'s batched multi-scope search (EI-12962).
+ * Same live-store access pattern as `lexicalSearchCanonical`. The caller
+ * embeds ONCE (`embedForCurrentClient`) and fans this out per scope, so an
+ * N-scope recall costs one embed + N ~10ms pgvector queries instead of N
+ * full embed+search round-trips — the 20-scope operator-chat injection was
+ * reliably blowing its 5s deadline on per-scope embeds (a flat 5s/turn tax
+ * that injected NOTHING).
+ */
+export async function vectorSearchCanonical(
+  vector: number[],
+  topK: number,
+  filters: Record<string, string>,
+): Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>> {
+  await getMemoryClient(); // reuse the cached client so a canonical store exists
+  const store = [..._liveCanonicalStores][0];
+  if (!store) throw new Error('mem0_unavailable');
+  return store.search(vector, topK, filters);
+}
+
+/**
+ * Embed `text` with the EXACT embed fn the current mem0 client was built
+ * against (`_currentEmbedFn`), so a precomputed query vector lives in the
+ * same vec space as the store `vectorSearchCanonical` reads. Returns null
+ * when no client/embedder is up OR the embed fails — callers must fall back
+ * to the legacy per-scope `client.search` path (correctness over speed).
+ */
+export async function embedForCurrentClient(text: string): Promise<number[] | null> {
+  const client = await getMemoryClient().catch(() => null);
+  if (!client || !_currentEmbedFn) return null;
+  try {
+    return await _currentEmbedFn(text);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Close a memory row's validity window in the canonical store (the store half
  * of `Mem0Backend.invalidateEntry` — temporal-lite soft-forget/supersession).
  * Same live-store access pattern as `updateMemoryPayload`: any live
