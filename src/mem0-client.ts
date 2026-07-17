@@ -491,18 +491,20 @@ async function tryLoad(): Promise<MemoryClient | null> {
   // 'disabled' is a hard stop — don't cache, the user can add a key or
   // flip the preference any time.
   const resolved = await memoryHost().resolveEmbedder();
-  // WI-5094: coalesce + short-TTL-memoize same-text embeds. The pre-turn
-  // memory injection issues three scope pulls with the SAME query text per
-  // turn; on an in-process embedder that was 3 serialized embeds (~2.6-4.5s
-  // of searchMs — the dominant prompt-build phase). Wrapped HERE, once per
-  // (re)build, so a rebuilt/flipped embedder always starts a fresh cache.
-  const coalescedEmbed = coalesceEmbedFn(resolved.embed);
   if (resolved.mode === 'disabled') {
     if (resolved.reason && resolved.reason !== 'user_disabled') {
       warnOnce(`embedder unavailable: ${resolved.reason} (set memoryEmbedderMode in /settings/user)`);
     }
     return null;
   }
+  // WI-5094: coalesce + short-TTL-memoize same-text embeds. The pre-turn
+  // memory injection issues three scope pulls with the SAME query text per
+  // turn; on an in-process embedder that was 3 serialized embeds (~2.6-4.5s
+  // of searchMs — the dominant prompt-build phase). Wrapped HERE, once per
+  // (re)build, so a rebuilt/flipped embedder always starts a fresh cache.
+  // (`resolved` is narrowed to the non-disabled variant by the guard above,
+  // so `.embed` is well-typed here — TS2339 fixed 2026-07-17, WI-5217.)
+  const coalescedEmbed = coalesceEmbedFn(resolved.embed);
 
   // Resolve PG connection as discrete fields — mem0's PGVector provider
   // expects user/password/host/port/dbname, NOT a connectionString.
