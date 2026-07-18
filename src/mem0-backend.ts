@@ -293,7 +293,10 @@ export class Mem0Backend implements MemoryBackend {
   ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
   private readonly invalidateEntryStore: (id: string, opts: { supersededBy?: string }) => Promise<boolean>;
   private readonly reembedVector: (id: string, scope: string, embedText: string) => Promise<boolean>;
-  private readonly embedQuery: (text: string) => Promise<number[] | null>;
+  /** PUBLIC (EI-12992): satisfies MemoryBackend.embedQuery? — a caller issuing
+   *  several search() calls against the same query text embeds once here and
+   *  passes the result as SearchOptions.vector on each call. */
+  readonly embedQuery: (text: string) => Promise<number[] | null>;
   private readonly vectorSearch: (
     vector: number[],
     topK: number,
@@ -405,9 +408,19 @@ export class Mem0Backend implements MemoryBackend {
     // entity-graph boost (single-scope pulls keep it); a fast plain-cosine
     // result beats a timed-out boosted one. A null embed (embedder down /
     // client cold) falls back to the legacy per-scope path below.
+    //
+    // EI-12992 — CROSS-CALL shared embed: `opts.vector` (a caller-precomputed
+    // embedding, from a prior `embedQuery()` call — see MemoryBackend.embedQuery)
+    // takes this SAME batched path even for a SINGLE scope, skipping the embed
+    // entirely. This is how a caller issuing several search() calls for the SAME
+    // query text (e.g. the operator's per-turn memory injection, which pulls
+    // user+harness+hive pools) collapses N embeds into 1. The entity-graph-boost
+    // tradeoff above applies identically here — it's the CALLER's call whether to
+    // pass `vector` for a pool that would otherwise keep the boost (see
+    // injection.ts for which pools opt in).
     let merged: MemoryEntry[] | null = null;
-    if (scopes.length > 1) {
-      const vector = await this.embedQuery(query);
+    if (opts.vector || scopes.length > 1) {
+      const vector = opts.vector ?? (await this.embedQuery(query));
       if (vector) {
         const pulls = scopes.map(async (scope) => {
           const rows = await this.vectorSearch(vector, limit, {
