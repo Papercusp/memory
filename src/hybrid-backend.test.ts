@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { HybridBackend } from './hybrid-backend';
+import { Mem0Backend } from './mem0-backend';
+import { LexicalLegBackend } from './lexical-leg';
 import { NoopBackend, NOOP_DISABLED_REASON } from './noop-backend';
 import { MemoryUnavailableError } from './backend';
 import type { MemoryBackend, MemoryEntry, RememberOptions, SearchOptions } from './backend';
@@ -366,6 +368,24 @@ describe('HybridBackend.embedQuery (EI-12992 shared-embed delegation)', () => {
     expect(cosineSearch.mock.calls[0]?.[1]).toMatchObject({ vector: [0.3, 0.4] });
     // The lexical leg is embed-free by construction — it gets scope+limit only.
     expect(lexSearch.mock.calls[0]?.[1]).not.toHaveProperty('vector');
+  });
+
+  it('PRODUCTION COMPOSITION (hybrid-pg) exposes the capability — the seam that actually broke', () => {
+    // Mirrors configure.ts's `hybrid-pg` registration EXACTLY:
+    //   const mem0 = new Mem0Backend();
+    //   new HybridBackend(new LexicalLegBackend(mem0), mem0)
+    // Both constructors are inert (field assignment + a capability check — no PG,
+    // no network), so this stays hermetic.
+    //
+    // Why this test and not just the fake-leg ones above: the ORIGINAL defect was
+    // invisible to every fake-based test AND to the bare-Mem0Backend tests in
+    // mem0-backend.test.ts, because the capability existed on the leg and only
+    // disappeared under COMPOSITION. A capability assertion against the real
+    // production wiring is the only shape that catches "a wrapper silently drops
+    // a leg's optional capability" — for this wrapper and any future one.
+    const mem0 = new Mem0Backend();
+    const hy = new HybridBackend(new LexicalLegBackend(mem0), mem0);
+    expect(typeof hy.embedQuery).toBe('function');
   });
 
   it('REGRESSION (production shape): 3 pulls over one query embed ONCE, not 3×', async () => {
