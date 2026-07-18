@@ -324,6 +324,87 @@ describe('HybridBackend (P-020)', () => {
   });
 });
 
+describe('HybridBackend.embedQuery (EI-12992 shared-embed delegation)', () => {
+  it('exposes the COSINE leg capability and delegates to it — never the lexical leg', async () => {
+    const cosineEmbed = vi.fn(async () => [0.1, 0.2]);
+    const lexEmbed = vi.fn(async () => [9, 9]);
+    const hy = new HybridBackend(
+      fakeBackend('lexical', [], { embedQuery: lexEmbed }),
+      fakeBackend('cosine', [], { embedQuery: cosineEmbed }),
+    );
+    expect(await hy.embedQuery?.('q')).toEqual([0.1, 0.2]);
+    expect(cosineEmbed).toHaveBeenCalledWith('q');
+    // The vector MUST come from the leg that CONSUMES it: search() forwards
+    // opts.vector to the cosine leg, so a lexical-leg vector would be compared
+    // across embedding spaces and return plausible garbage instead of failing.
+    expect(lexEmbed).not.toHaveBeenCalled();
+  });
+
+  it('is UNDEFINED when the cosine leg cannot embed — the capability feature-test stays honest', () => {
+    const hy = new HybridBackend(fakeBackend('lexical', []), fakeBackend('cosine', []));
+    expect(hy.embedQuery).toBeUndefined();
+  });
+
+  it('preserves the cosine leg\'s `this` binding (delegation is bound, not a bare fn ref)', async () => {
+    const cosine = fakeBackend('cosine', []) as MemoryBackend & { model?: string };
+    cosine.model = 'bge-small';
+    cosine.embedQuery = async function (this: { model?: string }) {
+      return this.model === 'bge-small' ? [1] : null;
+    };
+    const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
+    expect(await hy.embedQuery?.('q')).toEqual([1]);
+  });
+
+  it('forwards a precomputed vector to the cosine leg, and never leaks it to the lexical leg', async () => {
+    const cosineSearch = vi.fn(async (_q: string, _o: SearchOptions) => [e('a', 0.6)]);
+    const lexSearch = vi.fn(async (_q: string, _o: SearchOptions) => []);
+    const hy = new HybridBackend(
+      fakeBackend('lexical', [], { search: lexSearch }),
+      fakeBackend('cosine', [], { search: cosineSearch }),
+    );
+    await hy.search('q', { scope: 's', limit: 6, minScore: 0.45, vector: [0.3, 0.4] });
+    expect(cosineSearch.mock.calls[0]?.[1]).toMatchObject({ vector: [0.3, 0.4] });
+    // The lexical leg is embed-free by construction — it gets scope+limit only.
+    expect(lexSearch.mock.calls[0]?.[1]).not.toHaveProperty('vector');
+  });
+
+  it('REGRESSION (production shape): 3 pulls over one query embed ONCE, not 3×', async () => {
+    // Mirrors buildMemoryContextBlock's fan-out (user/harness/hive pools over the
+    // SAME query text) against a cosine leg that embeds per-search unless handed a
+    // vector — exactly Mem0Backend's `opts.vector ?? await this.embedQuery(query)`.
+    // Before this delegation the wrapper hid embedQuery, so `hybrid-pg` — the
+    // PRODUCTION backend — silently paid all 3 embeds and the fix was a no-op.
+    let embeds = 0;
+    const cosine = fakeBackend('cosine', [], {
+      embedQuery: async () => {
+        embeds += 1;
+        return [0.5];
+      },
+      search: async (_q: string, o: SearchOptions) => {
+        if (!o.vector) embeds += 1; // the leg had to embed for itself
+        return [e('a', 0.6)];
+      },
+    });
+    const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
+
+    // Deliberately NO assertion on `shared` here: the embed COUNT below must be
+    // what discriminates, so a regression fails with "expected 3 to be 1" (the
+    // actual defect) rather than tripping an earlier assertion that never
+    // exercises the fan-out. The `?.` + conditional spread mirror injection.ts's
+    // real feature-test/fallback, so this stays a faithful simulation on both sides.
+    const shared = await hy.embedQuery?.('the same query text');
+    for (const scope of ['user', 'harness:papercusp', 'hive:pc']) {
+      await hy.search('the same query text', {
+        scope,
+        limit: 3,
+        minScore: 0.45,
+        ...(shared ? { vector: shared } : {}),
+      });
+    }
+    expect(embeds).toBe(1);
+  });
+});
+
 describe('HybridBackend searchLexical (WI-4214 embed-free fallback)', () => {
   it('prefers the cosine leg\'s lexical capability (canonical store covers ALL memories)', async () => {
     const cosineLex = vi.fn(async () => [e('canonical-hit', 0.5)]);

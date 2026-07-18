@@ -59,11 +59,35 @@ export interface HybridBackendOptions {
 export class HybridBackend implements MemoryBackend {
   readonly name = 'hybrid';
 
+  /**
+   * Shared-embed capability (EI-12992) — delegated to the COSINE leg, which is
+   * the ONLY leg that embeds (the lexical leg is embed-free by construction).
+   *
+   * ⚠ It MUST delegate to the leg that will CONSUME the vector. `search()`
+   * forwards `opts` — and therefore `opts.vector` — verbatim to `this.cosine`,
+   * so the vector is only meaningful in the cosine leg's embedding space.
+   * Sourcing it from anywhere else (a second embedder, the lexical leg) would
+   * silently compare vectors across spaces and return plausible-looking
+   * garbage rather than failing loudly.
+   *
+   * ASSIGNED CONDITIONALLY so the capability feature-test callers perform
+   * (`backend.embedQuery?.(…)`) stays HONEST: a cosine leg that cannot embed
+   * (NoopBackend, a lexical-only store) leaves this undefined, and the caller
+   * falls back to per-call embedding exactly as before. Without this
+   * delegation the wrapper hid the leg's capability entirely, which silently
+   * made the EI-12992 shared-embed a NO-OP under `hybrid-pg` — the production
+   * backend — while it worked in the bare-Mem0Backend tests.
+   */
+  readonly embedQuery?: (text: string) => Promise<number[] | null>;
+
   constructor(
     private readonly lexical: MemoryBackend,
     private readonly cosine: MemoryBackend,
     private readonly opts: HybridBackendOptions = {},
-  ) {}
+  ) {
+    const cosineEmbed = cosine.embedQuery?.bind(cosine);
+    if (cosineEmbed) this.embedQuery = cosineEmbed;
+  }
 
   available(): Promise<MemoryAvailability> {
     return this.cosine.available();
