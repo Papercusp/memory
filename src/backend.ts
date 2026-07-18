@@ -137,6 +137,18 @@ export interface SearchOptions {
    * it ignore this.
    */
   diversify?: { lambda?: number };
+  /**
+   * OPTIONAL: a PRECOMPUTED query embedding (EI-12992). When supplied, a backend
+   * that embeds its query (Mem0Backend's cosine leg) uses this vector INSTEAD OF
+   * re-embedding `query` — the caller already paid for one embed and is sharing
+   * it across several `search()` calls (e.g. the operator's per-turn memory
+   * injection fans out 3 independent pulls — user/harness/hive pools — over the
+   * SAME query text; embedding it 3 times was ~3 serialized embed round-trips,
+   * ~0.5-1s each, riding right up against the injection timeout). Backends that
+   * don't embed (a lexical/file store) ignore this. Get one via
+   * `backend.embedQuery?.(text)`.
+   */
+  vector?: number[];
 }
 
 export interface ListOptions {
@@ -258,6 +270,17 @@ export interface MemoryBackend {
    * callers feature-test (`backend.invalidateEntry?.(…)`).
    */
   invalidateEntry?(id: string, opts?: { supersededBy?: string }): Promise<boolean>;
+
+  /**
+   * OPTIONAL capability (EI-12992): embed `text` ONCE with this backend's own
+   * embedder, for a caller that will issue several `search()` calls against the
+   * SAME query text and wants to pay the embed cost once — pass the result as
+   * `SearchOptions.vector` on each call. Returns null when the embedder is
+   * unavailable/degraded (never throws) — callers fall back to per-call
+   * embedding (today's behavior) on a null. Backends that don't embed (a
+   * lexical/file store) omit it; callers feature-test (`backend.embedQuery?.(…)`).
+   */
+  embedQuery?(text: string): Promise<number[] | null>;
 }
 
 /** Normalize a `scope: string | readonly string[]` arg to a de-duped array. */
