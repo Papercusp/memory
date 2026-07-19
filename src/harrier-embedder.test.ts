@@ -9,7 +9,7 @@
  * The model-loading path (buildHarrierEmbedder) is exercised by the P-006
  * bake-off smoke; here we pin the math + the prompt contract.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   harrierPrompt,
   HARRIER_MODEL,
@@ -60,6 +60,55 @@ describe('width handling (native 1024 / exploratory 384)', () => {
     const a = mrlTruncate(raw, 384);
     const b = mrlTruncate(unit, 384);
     for (let i = 0; i < 384; i++) expect(b[i]).toBeCloseTo(a[i], 10);
+  });
+});
+
+describe('buildHarrierEmbedder — non-sticky worker fallback (EI-16184)', () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  it('retries the worker path on the NEXT call after a transient failure — does not stick to inline forever', async () => {
+    const embedViaWorker = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('transient worker hiccup'))
+      .mockResolvedValueOnce(new Array(HARRIER_NATIVE_DIMS).fill(0.1));
+    const getWorkerState = vi.fn(() => ({ alive: true, disabled: false, pendingCount: 0 }));
+    const warnEmbedFallback = vi.fn();
+    vi.doMock('./local-embedder-worker', () => ({
+      embedViaWorker,
+      getWorkerState,
+      warnEmbedFallback,
+      ORT_SESSION_OPTIONS: {},
+    }));
+
+    const { buildHarrierEmbedder } = await import('./harrier-embedder');
+    const embed = buildHarrierEmbedder({ kind: 'query' });
+
+    await embed('hello').catch(() => {});
+
+    const result = await embed('hello again');
+    expect(embedViaWorker).toHaveBeenCalledTimes(2);
+    expect(result).toHaveLength(HARRIER_NATIVE_DIMS);
+    expect(warnEmbedFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips the worker entirely once the module reports genuine, permanent unavailability', async () => {
+    const embedViaWorker = vi.fn().mockResolvedValue(new Array(HARRIER_NATIVE_DIMS).fill(0.1));
+    const getWorkerState = vi.fn(() => ({ alive: false, disabled: true, pendingCount: 0 }));
+    const warnEmbedFallback = vi.fn();
+    vi.doMock('./local-embedder-worker', () => ({
+      embedViaWorker,
+      getWorkerState,
+      warnEmbedFallback,
+      ORT_SESSION_OPTIONS: {},
+    }));
+
+    const { buildHarrierEmbedder } = await import('./harrier-embedder');
+    const embed = buildHarrierEmbedder({ kind: 'query' });
+    await embed('hello').catch(() => {});
+
+    expect(embedViaWorker).not.toHaveBeenCalled();
   });
 });
 

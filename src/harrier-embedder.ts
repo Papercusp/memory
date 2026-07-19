@@ -92,10 +92,16 @@ type TransformersModule = {
  *
  * Prefers the worker-thread path (0.6B params — inference blocks the main
  * loop far worse than gemma-300m); falls back to an inline main-thread
- * model call when worker_threads is unavailable, with a transition-only
- * warn carrying the worker's real error (a swallowed model/output error
- * otherwise reads as a silent 2.4GB duplicate load). Fallback is sticky per
- * closure. Both paths cap ORT threads (the WI-3792 spin-pool storm).
+ * model call for THIS call when worker_threads is unavailable or the call
+ * fails, warning (rate-limited) with the worker's real error. EI-16184: this
+ * used to be sticky per closure — a single worker failure permanently
+ * disabled the worker path for the rest of that closure's (often hour-long
+ * cached) life, so every subsequent embed blocked the main event loop for a
+ * full 0.6B-param inference. Every call now re-checks the module's own
+ * liveness (`getWorkerState().disabled` — set only for genuine, permanent
+ * unavailability; a crashed worker instead self-heals via `ensureWorker`'s
+ * respawn), so a transient failure costs at most one degraded call. Both
+ * paths cap ORT threads (the WI-3792 spin-pool storm).
  */
 export function buildHarrierEmbedder(opts: {
   kind: HarrierEmbedKind;
@@ -103,12 +109,11 @@ export function buildHarrierEmbedder(opts: {
 }): (text: string) => Promise<number[]> {
   const { kind, dims = HARRIER_NATIVE_DIMS } = opts;
   let pipelinePromise: Promise<RawPipeline> | null = null;
-  let workerDisabled = false;
 
   return async (text: string): Promise<number[]> => {
     const prompted = harrierPrompt(kind, text);
 
-    if (!workerDisabled) {
+    if (!getWorkerState().disabled) {
       try {
         const full = await embedViaWorker(prompted, {
           model: HARRIER_MODEL,
@@ -116,10 +121,7 @@ export function buildHarrierEmbedder(opts: {
         });
         return mrlTruncate(assertNativeDims(full), dims);
       } catch (err) {
-        workerDisabled = true;
-        console.warn(
-          `harrier embed worker path failed, falling back to inline: ${err instanceof Error ? err.message : String(err)}`,
-        );
+        warnEmbedFallback('harrier', err);
       }
     }
 

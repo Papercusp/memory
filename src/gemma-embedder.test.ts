@@ -7,7 +7,7 @@
  * The model-loading path (buildGemmaEmbedder) is exercised by the live memory
  * suite; here we pin the math + the prompt contract.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mrlTruncate, gemmaPrompt, GEMMA_TARGET_DIMS, GEMMA_MODEL } from './gemma-embedder';
 
 describe('mrlTruncate (MRL 768→384 + renormalize)', () => {
@@ -61,6 +61,60 @@ describe('gemmaPrompt (asymmetric task prompts)', () => {
 
   it('query and document prompts differ (dual-encoder)', () => {
     expect(gemmaPrompt('query', 'x')).not.toBe(gemmaPrompt('document', 'x'));
+  });
+});
+
+describe('buildGemmaEmbedder — non-sticky worker fallback (EI-16184)', () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  it('retries the worker path on the NEXT call after a transient failure — does not stick to inline forever', async () => {
+    const embedViaWorker = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('transient worker hiccup'))
+      .mockResolvedValueOnce(new Array(768).fill(0.1));
+    const getWorkerState = vi.fn(() => ({ alive: true, disabled: false, pendingCount: 0 }));
+    const warnEmbedFallback = vi.fn();
+    vi.doMock('./local-embedder-worker', () => ({
+      embedViaWorker,
+      getWorkerState,
+      warnEmbedFallback,
+      ORT_SESSION_OPTIONS: {},
+    }));
+
+    const { buildGemmaEmbedder } = await import('./gemma-embedder');
+    const embed = buildGemmaEmbedder({ kind: 'query' });
+
+    // Call 1: worker rejects, falls through toward inline (no real
+    // @huggingface/transformers wired in this unit test — swallow whatever
+    // that path does; only call 2's behavior is under test here).
+    await embed('hello').catch(() => {});
+
+    // Call 2 MUST re-attempt the worker — the old sticky `workerDisabled`
+    // flag would have skipped straight to inline forever after call 1.
+    const result = await embed('hello again');
+    expect(embedViaWorker).toHaveBeenCalledTimes(2);
+    expect(result).toHaveLength(GEMMA_TARGET_DIMS);
+    expect(warnEmbedFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips the worker entirely once the module reports genuine, permanent unavailability', async () => {
+    const embedViaWorker = vi.fn().mockResolvedValue(new Array(768).fill(0.1));
+    const getWorkerState = vi.fn(() => ({ alive: false, disabled: true, pendingCount: 0 }));
+    const warnEmbedFallback = vi.fn();
+    vi.doMock('./local-embedder-worker', () => ({
+      embedViaWorker,
+      getWorkerState,
+      warnEmbedFallback,
+      ORT_SESSION_OPTIONS: {},
+    }));
+
+    const { buildGemmaEmbedder } = await import('./gemma-embedder');
+    const embed = buildGemmaEmbedder({ kind: 'query' });
+    await embed('hello').catch(() => {});
+
+    expect(embedViaWorker).not.toHaveBeenCalled();
   });
 });
 
