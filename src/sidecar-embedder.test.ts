@@ -21,6 +21,9 @@ import {
   resolveEmbedSidecarUrl,
   sidecarEmbedBatch,
   EMBED_SIDECAR_URL_ENV,
+  SIDECAR_MAX_TEXT_CHARS,
+  SidecarEmbedHttpError,
+  isNonRetryableSidecarError,
 } from './sidecar-embedder';
 
 const PINNED_VECTOR = [0.25, -0.5, 0.75];
@@ -105,6 +108,46 @@ describe('sidecarEmbedBatch', () => {
       sidecarEmbedBatch(badShape.url, { model: 'gemma', kind: 'query', texts: ['x'] }),
     ).rejects.toThrow(/sidecar_embed_bad_shape/);
   });
+
+  it('a non-200 throws a SidecarEmbedHttpError carrying the status (EI-14101)', async () => {
+    const bad400 = await startStubSidecar((_body, res) => {
+      res.statusCode = 400;
+      res.end(JSON.stringify({ error: 'texts[0] exceeds 32000 chars (got 49382) — truncate before embedding' }));
+    });
+    closers.push(bad400.close);
+    let caught: unknown;
+    try {
+      await sidecarEmbedBatch(bad400.url, { model: 'gemma', kind: 'document', texts: ['x'] });
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(SidecarEmbedHttpError);
+    expect((caught as SidecarEmbedHttpError).status).toBe(400);
+    expect(isNonRetryableSidecarError(caught)).toBe(true);
+
+    const bad500 = await startStubSidecar((_body, res) => {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: 'boom' }));
+    });
+    closers.push(bad500.close);
+    let caught500: unknown;
+    try {
+      await sidecarEmbedBatch(bad500.url, { model: 'gemma', kind: 'document', texts: ['x'] });
+    } catch (e) {
+      caught500 = e;
+    }
+    expect(isNonRetryableSidecarError(caught500)).toBe(false); // 5xx IS worth a retry
+  });
+
+  it('truncates an oversized text to SIDECAR_MAX_TEXT_CHARS before sending (EI-14101)', async () => {
+    const stub = await startStubSidecar();
+    closers.push(stub.close);
+    const oversized = 'a'.repeat(SIDECAR_MAX_TEXT_CHARS + 5000);
+    await sidecarEmbedBatch(stub.url, { model: 'gemma', kind: 'document', texts: [oversized, 'short'] });
+    const sent = (stub.requests[0] as { texts: string[] }).texts;
+    expect(sent[0].length).toBe(SIDECAR_MAX_TEXT_CHARS);
+    expect(sent[1]).toBe('short'); // untouched
+  });
 });
 
 describe('buildSidecarFirstEmbedder', () => {
@@ -180,6 +223,36 @@ describe('buildSidecarFirstEmbedder', () => {
 
     expect(await embed('x')).toEqual(PINNED_VECTOR); // attempt 2 serves it
     expect(transitions).toEqual(['down', 'up']);
+  });
+
+  it('a deterministic 400 is NOT retried — one attempt, "rejected" transition, distinct error (EI-14101)', async () => {
+    let fetchAttempts = 0;
+    const stub = await startStubSidecar((_body, res) => {
+      fetchAttempts++;
+      res.statusCode = 400;
+      res.end(JSON.stringify({ error: 'unknown model' }));
+    });
+    closers.push(stub.close);
+    const transitions: string[] = [];
+    let fallbackBuilds = 0;
+    const embed = buildSidecarFirstEmbedder({
+      model: 'gemma',
+      kind: 'document',
+      url: stub.url,
+      fallback: () => {
+        fallbackBuilds++;
+        return async () => [0];
+      },
+      sleepFn: async () => {
+        throw new Error('must not sleep/retry on a deterministic 4xx');
+      },
+      onTransition: (state) => transitions.push(state),
+    });
+
+    await expect(embed('abc')).rejects.toThrow(/sidecar_rejected_request/);
+    expect(fetchAttempts).toBe(1); // no retry budget burned on a request that can never succeed
+    expect(fallbackBuilds).toBe(0);
+    expect(transitions).toEqual(['rejected']); // never 'down' — the sidecar IS up
   });
 
   it('stops retrying once the budget cannot fit another attempt', async () => {

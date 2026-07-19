@@ -66,32 +66,69 @@ export const DEFAULT_SIDECAR_TIMEOUT_MS = 15_000;
  *  shared `timeoutMs` budget caps total wall time regardless). */
 export const DEFAULT_SIDECAR_MAX_ATTEMPTS = 3;
 
+/** The sidecar server's own per-text char cap (embed-sidecar-server.ts
+ *  MAX_TEXT_CHARS — kept in sync here since the client, not the server, is
+ *  the one place every embed caller funnels through). A text over this limit
+ *  is truncated client-side BEFORE it is ever sent (EI-14101): the sidecar's
+ *  own 400 for this condition says "truncate before embedding", so truncating
+ *  at the ONE shared client seam means no individual caller (embed-backfill,
+ *  write-journal, memory writes, …) has to reimplement the cap. */
+export const SIDECAR_MAX_TEXT_CHARS = 32_000;
+
+/** Thrown by sidecarEmbedBatch on a non-2xx sidecar response. Carries the
+ *  HTTP status so a retry policy can tell a DETERMINISTIC client-side
+ *  rejection (4xx — the exact same request can never succeed on retry) apart
+ *  from a transient server/network failure (5xx, connect refused, timeout) —
+ *  see isNonRetryableSidecarError. */
+export class SidecarEmbedHttpError extends Error {
+  readonly status: number;
+  constructor(status: number, detail: string) {
+    super(`sidecar_embed_${status}: ${detail}`);
+    this.name = 'SidecarEmbedHttpError';
+    this.status = status;
+  }
+}
+
+/** True for a sidecar failure that retrying can never fix (a 4xx: the
+ *  sidecar looked at THIS request and rejected it — bad shape, unknown
+ *  model, oversized text pre-truncation, …). False for anything else
+ *  (network/connect/timeout/5xx), which IS worth a bounded retry — the
+ *  sidecar may just be mid-restart. */
+export function isNonRetryableSidecarError(e: unknown): boolean {
+  return e instanceof SidecarEmbedHttpError && e.status >= 400 && e.status < 500;
+}
+
 /**
  * One D-004 wire call. Throws on ANY failure (network, timeout, non-200,
  * malformed/mismatched response) — callers own the fallback decision.
  * Exported for batch consumers (embed-backfill, P-004) that want the
  * texts[] amortization the single-text EmbedFn seam can't express.
+ *
+ * Texts over SIDECAR_MAX_TEXT_CHARS are truncated before submission (the
+ * sidecar rejects them outright otherwise — a deterministic 400 that no
+ * amount of retrying would fix).
  */
 export async function sidecarEmbedBatch(url: string, opts: SidecarEmbedBatchOpts): Promise<SidecarEmbedResponse> {
   const fetchFn = opts.fetchFn ?? fetch;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_SIDECAR_TIMEOUT_MS;
+  const texts = opts.texts.map((t) => (t.length > SIDECAR_MAX_TEXT_CHARS ? t.slice(0, SIDECAR_MAX_TEXT_CHARS) : t));
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     const res = await fetchFn(`${url.replace(/\/$/, '')}/embed`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: opts.model, kind: opts.kind, texts: opts.texts }),
+      body: JSON.stringify({ model: opts.model, kind: opts.kind, texts }),
       signal: ctl.signal,
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
-      throw new Error(`sidecar_embed_${res.status}: ${detail.slice(0, 200)}`);
+      throw new SidecarEmbedHttpError(res.status, detail.slice(0, 200));
     }
     const body = (await res.json()) as SidecarEmbedResponse;
     if (
       !Array.isArray(body.vectors) ||
-      body.vectors.length !== opts.texts.length ||
+      body.vectors.length !== texts.length ||
       body.vectors.some((v) => !Array.isArray(v) || v.length === 0 || typeof v[0] !== 'number')
     ) {
       throw new Error('sidecar_embed_bad_shape: vectors missing/mismatched');
@@ -123,8 +160,11 @@ export interface SidecarFirstEmbedderOpts {
   now?: () => number;
   /** Backoff-sleep seam for tests. */
   sleepFn?: (ms: number) => Promise<void>;
-  /** Down/up transition logging seam (default console.warn, transition-only). */
-  onTransition?: (state: 'down' | 'up', detail: string) => void;
+  /** Down/up/rejected transition logging seam (default console.warn,
+   *  transition-only). 'rejected' = the sidecar is UP and correctly
+   *  refusing a bad request (deterministic 4xx) — distinct from 'down' so
+   *  the log never claims the sidecar is unavailable when it isn't. */
+  onTransition?: (state: 'down' | 'up' | 'rejected', detail: string) => void;
 }
 
 /**
@@ -142,7 +182,7 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
   const maxAttempts = Math.max(1, opts.maxAttempts ?? DEFAULT_SIDECAR_MAX_ATTEMPTS);
   const onTransition =
     opts.onTransition ??
-    ((state: 'down' | 'up', detail: string) =>
+    ((state: 'down' | 'up' | 'rejected', detail: string) =>
       console.warn(`[sidecar-embedder] ${opts.model}:${opts.kind} sidecar ${state}: ${detail}`));
 
   if (!url) {
@@ -187,6 +227,18 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
         return res.vectors[0];
       } catch (e) {
         lastErr = e;
+        if (isNonRetryableSidecarError(e)) {
+          // Deterministic 4xx: the sidecar is UP and correctly rejecting
+          // THIS exact request (bad shape / oversized text / unknown model)
+          // — retrying the same payload can never succeed, so stop right
+          // away instead of burning the retry budget (EI-14101). Logged as
+          // 'rejected', never 'down' — the sidecar isn't unavailable.
+          onTransition(
+            'rejected',
+            `${e instanceof Error ? e.message : String(e)} — sidecar correctly rejected the request (non-retryable, not a downtime issue)`,
+          );
+          break;
+        }
         if (!wasDown) {
           wasDown = true;
           onTransition(
@@ -201,10 +253,16 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
         else break;
       }
     }
-    throw new Error(
-      `sidecar_required_unavailable: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
-        `(${url}, ${opts.model}:${opts.kind}, budget ${timeoutMs}ms) — embedding requires the sidecar; ` +
-        'writes are parked in the memory write journal and auto-recover when it returns',
-    );
+    throw isNonRetryableSidecarError(lastErr)
+      ? new Error(
+          `sidecar_rejected_request: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
+            `(${url}, ${opts.model}:${opts.kind}) — the sidecar rejected this request (non-retryable); ` +
+            'check payload shape/size — this is not a downtime issue',
+        )
+      : new Error(
+          `sidecar_required_unavailable: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
+            `(${url}, ${opts.model}:${opts.kind}, budget ${timeoutMs}ms) — embedding requires the sidecar; ` +
+            'writes are parked in the memory write journal and auto-recover when it returns',
+        );
   };
 }
