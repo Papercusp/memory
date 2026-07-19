@@ -166,6 +166,41 @@ export function getWorkerState(): {
   };
 }
 
+/**
+ * Rate-limited warning for a builder (gemma/harrier/local) falling back to
+ * inline (main-thread-blocking) embedding for ONE call (EI-16184). Every
+ * embedViaWorker() failure used to permanently stick that embedder CLOSURE
+ * to the inline path for the rest of the process's life (see the removed
+ * per-closure `workerDisabled` booleans this replaces) — completely silent
+ * for two of the three builders — so a single transient worker hiccup (a
+ * crash mid-request, a spawn race during a noisy post-restart boot window)
+ * condemned every subsequent embed on that closure to block the event loop
+ * for the full ONNX inference duration, often for the closure's remaining
+ * hour-long cache lifetime. Builders now retry the worker on EVERY call
+ * instead (ensureWorker() already self-heals a crashed worker by respawning;
+ * only genuine unavailability — getWorkerState().disabled — skips straight to
+ * inline), so a SUSTAINED failure could otherwise warn on every single call;
+ * rate-limit it to one line per cooldown window instead.
+ */
+let _lastFallbackWarnAt = 0;
+const FALLBACK_WARN_COOLDOWN_MS = 30_000;
+export function warnEmbedFallback(model: string, err: unknown): void {
+  const now = Date.now();
+  if (now - _lastFallbackWarnAt < FALLBACK_WARN_COOLDOWN_MS) return;
+  _lastFallbackWarnAt = now;
+  if (process.env.NODE_ENV !== 'test') {
+    console.warn(
+      `[embed] ${model} worker path failed — falling back to inline (main-thread, blocks the event loop) for this call: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/** Test-only: reset the fallback-warn cooldown so tests can assert on it independently. */
+export function _resetFallbackWarnForTest(): void {
+  _lastFallbackWarnAt = 0;
+}
+
 export const LOCAL_EMBEDDER_MODEL = 'Xenova/bge-small-en-v1.5';
 const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
 
@@ -193,23 +228,24 @@ const dynamicImport = new Function(
  *
  * Prefers the worker-thread isolated path (`embedViaWorker`) so ONNX
  * inference doesn't block the main event loop; falls back to an inline
- * main-thread pipeline when worker_threads is unavailable or the worker
- * fails to spawn (older Node, some vitest environments). The fallback is
- * sticky per returned closure — once a worker spawn fails we stop
- * retrying it for that embedder instance.
+ * main-thread pipeline for THIS call when the worker is unavailable or the
+ * call fails. EI-16184: this used to be sticky per closure (a single
+ * worker failure permanently disabled the worker path for the rest of the
+ * closure's life, silently — see warnEmbedFallback's doc comment for the
+ * full incident). Every call now re-checks the module's own liveness
+ * (`getWorkerState().disabled` — set only for genuine, permanent
+ * unavailability; a crashed worker instead self-heals via `ensureWorker`'s
+ * respawn), so a transient failure costs at most one degraded call.
  */
 export async function buildLocalEmbedder(): Promise<(text: string) => Promise<number[]>> {
   let pipelinePromise: Promise<Pipeline> | null = null;
-  let workerDisabled = false;
 
   return async (text: string): Promise<number[]> => {
-    if (!workerDisabled) {
+    if (!getWorkerState().disabled) {
       try {
         return await embedViaWorker(text);
-      } catch {
-        // Worker spawn or embedding failed — disable for subsequent
-        // calls on this closure and fall through to inline.
-        workerDisabled = true;
+      } catch (err) {
+        warnEmbedFallback('local', err);
       }
     }
 

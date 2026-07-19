@@ -28,7 +28,7 @@
  * (the embedding-space-vs-dimension scar) — adoption means a full re-embed.
  */
 
-import { embedViaWorker, ORT_SESSION_OPTIONS } from './local-embedder-worker';
+import { embedViaWorker, getWorkerState, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
 import { mrlTruncate } from './gemma-embedder';
 
 /** Transformers.js/ONNX build of microsoft/harrier-oss-v1-0.6b. */

@@ -31,7 +31,7 @@
  * (migration 534), selected by `ResolvedEmbedder.mode === 'gemma'`.
  */
 
-import { embedViaWorker, ORT_SESSION_OPTIONS } from './local-embedder-worker';
+import { embedViaWorker, getWorkerState, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
 
 /** Transformers.js/ONNX build of EmbeddingGemma-300m. */
 export const GEMMA_MODEL = 'onnx-community/embeddinggemma-300m-ONNX';
@@ -91,24 +91,30 @@ type Pipeline = (text: string, opts: unknown) => Promise<{ data: Float32Array }>
  *
  * Prefers the worker-thread path (off the main event loop — EmbeddingGemma-300m
  * is ~10x BGE-small's params, so main-thread inference blocks noticeably);
- * falls back to an inline main-thread pipeline when worker_threads is
- * unavailable (older Node, some vitest envs). Fallback is sticky per closure.
+ * falls back to an inline main-thread pipeline for THIS call when the worker
+ * is unavailable or the call fails. EI-16184: this used to be sticky per
+ * closure (a single worker failure permanently disabled the worker path,
+ * silently, for the rest of that closure's — often hour-long cached — life,
+ * making every subsequent embed block the main event loop). Every call now
+ * re-checks the module's own liveness (`getWorkerState().disabled` — set
+ * only for genuine, permanent unavailability; a crashed worker instead
+ * self-heals via `ensureWorker`'s respawn), so a transient failure costs at
+ * most one degraded call.
  */
 export function buildGemmaEmbedder(opts: { kind: GemmaEmbedKind }): (text: string) => Promise<number[]> {
   const { kind } = opts;
   let pipelinePromise: Promise<Pipeline> | null = null;
-  let workerDisabled = false;
 
   return async (text: string): Promise<number[]> => {
     const prompted = gemmaPrompt(kind, text);
 
-    if (!workerDisabled) {
+    if (!getWorkerState().disabled) {
       try {
         // normalize:false — MRL requires truncate-then-normalize, done below.
         const full = await embedViaWorker(prompted, { model: GEMMA_MODEL, normalize: false });
         return mrlTruncate(full, GEMMA_TARGET_DIMS);
-      } catch {
-        workerDisabled = true;
+      } catch (err) {
+        warnEmbedFallback('gemma', err);
       }
     }
 
