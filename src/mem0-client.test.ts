@@ -111,3 +111,57 @@ describe('resolveExtractionLlmConfig — stale-key cascade (memory-backend-bench
     _resetAnthropicKeyProbeCacheForTest();
   });
 });
+
+/**
+ * EI-15687: getMemoryClient() used to have NO in-flight-build dedup, so
+ * every caller racing a cold cache (e.g. injection.ts's Promise.all of 3
+ * concurrent scope pulls per chat turn, or a fresh :3170 post-restart burst)
+ * independently paid the FULL cold-build cost — a thundering herd that both
+ * wasted work and produced the observed wildly-variable 2.7s-57.7s timings
+ * (N-way contention on the same PG/network legs).
+ *
+ * We can't drive the full mem0ai-import path here (same constraint as above:
+ * no import callback under vitest's module runner) — but `resolveEmbedder`
+ * is the FIRST host call `buildClient()` makes, and a `{mode:'disabled'}`
+ * result short-circuits before ever touching the dynamic import. That's
+ * enough surface to prove the dedup: N concurrent getMemoryClient() calls
+ * against a cold cache must invoke the host's resolveEmbedder exactly ONCE.
+ */
+describe('getMemoryClient — in-flight build de-dup (EI-15687)', async () => {
+  const { configureMemory } = await import('./config');
+  const { getMemoryClient } = await import('./mem0-client');
+
+  it('shares ONE in-flight build across concurrent cold-cache callers', async () => {
+    let resolveEmbedderCalls = 0;
+    let releaseBuild!: () => void;
+    const buildGate = new Promise<void>((r) => {
+      releaseBuild = r;
+    });
+    configureMemory({
+      getAdminUrl: () => 'postgres://unused/unused',
+      getCredentials: async () => ({}),
+      resolveEmbedder: async () => {
+        resolveEmbedderCalls += 1;
+        // Hold every concurrent caller here until they've all queued up
+        // behind the SAME in-flight promise, then let the (single) real
+        // build proceed to its 'disabled' short-circuit.
+        await buildGate;
+        return { mode: 'disabled' as const, reason: 'test' };
+      },
+      buildEmbedderForMode: async () => {
+        throw new Error('must not be reached — resolveEmbedder short-circuits first');
+      },
+    });
+
+    const calls = [getMemoryClient(), getMemoryClient(), getMemoryClient()];
+    // Let the microtask queue settle so all 3 calls have observed the
+    // in-flight promise (or started the build) before releasing it.
+    await Promise.resolve();
+    await Promise.resolve();
+    releaseBuild();
+    const results = await Promise.all(calls);
+
+    expect(resolveEmbedderCalls).toBe(1);
+    expect(results).toEqual([null, null, null]);
+  });
+});

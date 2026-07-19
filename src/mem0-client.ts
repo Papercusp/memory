@@ -472,11 +472,38 @@ export async function resolveExtractionLlmConfig(
 }
 
 /**
+ * In-flight build de-dup (EI-15687 — root cause of the wildly variable
+ * 2.7s-57.7s "cold-build" cost). `getMemoryClient()`/`tryLoad()` used to have
+ * NO guard against concurrent callers racing a cache miss: a single
+ * memory-injected chat turn already fires 3 concurrent scope pulls via
+ * `Promise.all` (injection.ts), and every restart of a request-only host
+ * (:3170's papercup-staging-sync timer FFs + restarts it roughly every 5min
+ * BY DESIGN) wipes `_client` — so the very next turn's 3 concurrent pulls
+ * each independently ran the FULL cold path (a fresh PG probe connect, the
+ * Anthropic key-probe network call, mem0 module init, and its own warm
+ * `search()`), a thundering herd that both wasted work and is the most
+ * likely source of the observed variability (N-way contention on the same
+ * PG/network legs, worst case ~57s). Sharing ONE in-flight build across
+ * concurrent callers fixes both: only one real cold-build runs, and every
+ * concurrent caller resolves off the SAME promise as soon as it settles.
+ */
+let _clientBuildPromise: Promise<MemoryClient | null> | null = null;
+
+/**
  * Try to load the mem0 client. Returns null if dependencies aren't
  * installed, mode is 'disabled', or config can't be assembled.
  */
 async function tryLoad(): Promise<MemoryClient | null> {
   if (_client && Date.now() - _clientBuiltAt < _clientTtlMs) return _client;
+  if (_clientPermanentFailure) return null;
+  if (_clientBuildPromise) return _clientBuildPromise;
+  _clientBuildPromise = buildClient().finally(() => {
+    _clientBuildPromise = null;
+  });
+  return _clientBuildPromise;
+}
+
+async function buildClient(): Promise<MemoryClient | null> {
   if (_client) {
     // TTL expired — drop and rebuild so learning-loop instructions
     // refresh. mem0 doesn't ship a mutator for customInstructions.
