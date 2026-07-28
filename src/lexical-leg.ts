@@ -37,6 +37,10 @@ import type {
 export class LexicalLegBackend implements MemoryBackend {
   readonly name = 'lexical-leg';
 
+  /** Both methods forward to the wrapped backend's `searchLexical`. */
+  readonly scoreScale = 'lexical' as const;
+  readonly lexicalScoreScale = 'lexical' as const;
+
   constructor(private readonly inner: MemoryBackend) {
     if (typeof inner.searchLexical !== 'function') {
       throw new Error('LexicalLegBackend: wrapped backend has no searchLexical capability');

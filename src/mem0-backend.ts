@@ -279,6 +279,13 @@ export interface Mem0BackendDeps {
 
 export class Mem0Backend implements MemoryBackend {
   readonly name = 'mem0';
+
+  /** pgvector similarity — an absolute, cross-call-comparable measure. */
+  readonly scoreScale = 'cosine' as const;
+
+  /** The embed-free fallback scores token-overlap fractions, NOT cosine
+   *  (see `searchLexical` below) — a different scale from the same backend. */
+  readonly lexicalScoreScale = 'lexical' as const;
   private readonly getClient: () => Promise<MemoryClient | null>;
   private readonly updatePayload: (id: string, patch: Record<string, unknown>) => Promise<boolean>;
   private readonly lexicalSearch: (

@@ -28,6 +28,36 @@
  * and silently dropping a write would lie to the caller.
  */
 
+/**
+ * What SCALE a `MemoryEntry.score` is expressed on.
+ *
+ * `score` has always been documented as "backend-native; ordering only", which
+ * is correct and is precisely the problem: ordering-only values from DIFFERENT
+ * backends land in the SAME telemetry column, and nothing downstream could tell
+ * them apart. Making the scale machine-readable is what lets a reader refuse to
+ * compare across scales instead of silently averaging them.
+ *
+ * The scales are not merely differently-calibrated — they answer different
+ * questions, which is why no linear rescaling can reconcile them:
+ *
+ * - `cosine`  — a SIMILARITY. Absolute and comparable across calls: 0.9 means
+ *               "very close to the query" no matter which call produced it. A
+ *               bad query yields low numbers, so the score can reveal it.
+ * - `rrf`     — a RANK, reciprocal-rank-fused: `Σ lexWeight/(k + rank)` over the
+ *               legs an entry appears in. Bounded above by `(1+lexWeight)/(k+1)`
+ *               (0.0328 at the k=60/lexWeight=1 defaults) and comparable ONLY
+ *               within one call. Critically it is NOT a relevance measure at
+ *               all: SOMETHING is always rank 1, so a meaningless query scores
+ *               the same as a perfect one. An rrf score can never reveal a bad
+ *               query — see context-injection-audit-2026-07-28 D-011.
+ * - `lexical` — a backend-native token/keyword overlap from the embed-free
+ *               fallback leg (WI-4214). Ordering only; typically small rational
+ *               fractions.
+ * - `unknown` — the backend declined to say. Treated as its own bucket and
+ *               NEVER pooled with a labelled one.
+ */
+export type ScoreScale = 'cosine' | 'rrf' | 'lexical' | 'unknown';
+
 /** One stored fact, in the neutral shape every surface renders. */
 export interface MemoryEntry {
   id: string;
@@ -233,6 +263,29 @@ export interface MemoryBackend {
    * (`backend.searchLexical?.(…)`).
    */
   searchLexical?(query: string, opts: SearchOptions): Promise<MemoryEntry[]>;
+
+  /**
+   * The scale of `score` on entries returned by THIS backend's `search()`.
+   *
+   * OPTIONAL on purpose: `MemoryBackend` is implemented by test doubles and
+   * out-of-lib backends, and a REQUIRED field on a shared interface invalidates
+   * every construction site at once. An omitted declaration reads as `unknown`,
+   * which downstream keeps in its own bucket rather than pooling it — the
+   * honest degradation.
+   *
+   * Declared PER-METHOD rather than per-backend because one backend can emit
+   * two scales: `HybridBackend.search` returns fused `rrf`, while its
+   * `searchLexical` returns the raw `lexical` leg. A single backend-level
+   * property would therefore be wrong for exactly the degraded path that most
+   * needs to be distinguishable.
+   */
+  readonly scoreScale?: ScoreScale;
+
+  /**
+   * The scale of `score` on entries returned by `searchLexical()`. Only
+   * meaningful when `searchLexical` is implemented.
+   */
+  readonly lexicalScoreScale?: ScoreScale;
 
   /** Enumerate entries in the given pools (insertion order unspecified). */
   list(opts: ListOptions): Promise<MemoryEntry[]>;

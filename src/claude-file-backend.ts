@@ -95,6 +95,11 @@ interface LoadedEntry {
 export class ClaudeFileMemoryBackend implements MemoryBackend {
   readonly name: string = CLAUDE_FILE_BACKEND_NAME;
 
+  /** A pure token match with no embedder anywhere — `search` and
+   *  `searchLexical` are the SAME call, so both are the lexical scale. */
+  readonly scoreScale = 'lexical' as const;
+  readonly lexicalScoreScale = 'lexical' as const;
+
   private readonly dir: string;
   private readonly unscopedScope: string;
   private readonly matchUnscopedToAnyScope: boolean;

@@ -105,6 +105,19 @@ export class HybridBackend implements MemoryBackend {
   readonly name: string;
 
   /**
+   * `search()` ALWAYS returns fused RRF scores — there is no branch that
+   * returns a leg's own scores. `fuse()` recomputes `score` for every surviving
+   * candidate, and the only other exit from `search()` is the `cosine-gated`
+   * early return, which yields an EMPTY array (no scores at all). So this is a
+   * constant, not a mode-dependent value.
+   */
+  readonly scoreScale = 'rrf' as const;
+
+  /** `searchLexical()` delegates to the cosine leg's own lexical capability
+   *  and does NOT fuse — those scores stay on the raw lexical scale. */
+  readonly lexicalScoreScale = 'lexical' as const;
+
+  /**
    * Shared-embed capability (EI-12992) — delegated to the COSINE leg, which is
    * the ONLY leg that embeds (the lexical leg is embed-free by construction).
    *

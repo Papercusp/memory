@@ -29,6 +29,11 @@ export const NOOP_DISABLED_REASON = 'memory_backend_disabled';
 export class NoopBackend implements MemoryBackend {
   readonly name: string = 'noop';
 
+  /** Never returns an entry (every method throws unavailable), so there are
+   *  no scores to place on a scale. Declared rather than omitted to make the
+   *  "nothing to say" explicit instead of looking like an oversight. */
+  readonly scoreScale = 'unknown' as const;
+
   async available(): Promise<MemoryAvailability> {
     return { ok: false, reason: NOOP_DISABLED_REASON };
   }
