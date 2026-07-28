@@ -39,6 +39,17 @@ import type {
   UpdatePatch,
 } from './backend';
 import { DEFAULT_RRF_K, fuse, type FusionMode } from './hybrid-fusion';
+import { createTextSimilarity, diversityDisabledByEnv, diversityRerank } from './diversity-rerank';
+
+/**
+ * How deep into the fused list the optional diversity re-rank looks, as a
+ * multiple of the caller's `limit`. 3 matches `lexicalDepth`'s existing
+ * limit×3 candidate-pool convention in this file — deep enough that a
+ * near-duplicate can be demoted clear of the top-K and a distinct hit promoted
+ * into it, shallow enough that the O(n²) pass stays trivial on the injection
+ * critical path.
+ */
+const RERANK_DEPTH_FACTOR = 3;
 
 export interface HybridBackendOptions {
   /** RRF damping constant (default 60). */

@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest';
-import { diversityRerank, lexicalSimilarity, textSimilarity } from './diversity-rerank';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import {
+  createTextSimilarity,
+  diversityDisabledByEnv,
+  diversityRerank,
+  lexicalSimilarity,
+  textSimilarity,
+} from './diversity-rerank';
 import type { MemoryEntry } from './backend';
 
 const e = (id: string, text: string, score?: number): MemoryEntry => ({
@@ -104,5 +110,71 @@ describe('lexicalSimilarity', () => {
     const a = 'foo bar baz';
     const b = 'bar baz qux';
     expect(lexicalSimilarity(a, b)).toBeCloseTo(lexicalSimilarity(b, a), 10);
+  });
+});
+
+describe('createTextSimilarity (memoized — F-D)', () => {
+  const m = (id: string, text: string): MemoryEntry => ({ id, text, scope: 's' });
+
+  it('agrees with the unmemoized textSimilarity on every pair', () => {
+    const xs = [
+      m('a', 'the deploy pipeline uses a two port model'),
+      m('b', 'the deploy pipeline uses a two-port model'),
+      m('c', 'git-sync owns commit and push'),
+      m('d', ''),
+    ];
+    const sim = createTextSimilarity();
+    for (const x of xs) {
+      for (const y of xs) {
+        expect(sim(x, y)).toBeCloseTo(textSimilarity(x, y), 10);
+      }
+    }
+  });
+
+  it('produces the SAME ordering as the unmemoized proxy — memoization is perf-only', () => {
+    const xs = [
+      { ...m('best', 'the deploy pipeline uses a two port model for staging and release'), score: 0.95 },
+      { ...m('dup', 'the deploy pipeline uses a two-port model for staging vs release'), score: 0.94 },
+      { ...m('distinct', 'git-sync owns commit and push for the shared tree'), score: 0.6 },
+    ];
+    const plain = diversityRerank(xs, { lambda: 0.5, similarity: textSimilarity });
+    const memo = diversityRerank(xs, { lambda: 0.5, similarity: createTextSimilarity() });
+    expect(memo.map((x) => x.id)).toEqual(plain.map((x) => x.id));
+  });
+
+  it('computes each entry trigram set ONCE — the O(n²) pass must not rebuild them', () => {
+    // Guards the reason this exists: on the injection critical path the naive
+    // adapter rebuilds both operands' trigram sets on every pairwise call.
+    const xs = Array.from({ length: 8 }, (_, i) => ({
+      ...m(`e${i}`, `a memory about subsystem ${i} and how it behaves under load`),
+      score: 1 - i / 10,
+    }));
+    let textReads = 0;
+    const counted = xs.map(
+      (x) =>
+        ({
+          ...x,
+          get text() {
+            textReads++;
+            return `a memory about subsystem ${x.id} and how it behaves under load`;
+          },
+        }) as MemoryEntry,
+    );
+    diversityRerank(counted, { lambda: 0.5, similarity: createTextSimilarity() });
+    expect(textReads).toBeLessThanOrEqual(counted.length);
+  });
+});
+
+describe('diversityDisabledByEnv', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('is off unless PAPERCUSP_MEMORY_MMR is exactly "0"', () => {
+    expect(diversityDisabledByEnv()).toBe(false);
+    vi.stubEnv('PAPERCUSP_MEMORY_MMR', '1');
+    expect(diversityDisabledByEnv()).toBe(false);
+    vi.stubEnv('PAPERCUSP_MEMORY_MMR', '0');
+    expect(diversityDisabledByEnv()).toBe(true);
   });
 });

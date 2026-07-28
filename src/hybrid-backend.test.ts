@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { HybridBackend } from './hybrid-backend';
 import { Mem0Backend } from './mem0-backend';
 import { LexicalLegBackend } from './lexical-leg';
@@ -495,5 +495,99 @@ describe('HybridBackend.invalidateEntry (temporal-lite lifecycle delegation)', (
   it('a cosine leg WITHOUT the capability throws — a false would read as "not found" upstream', () => {
     const hybrid = new HybridBackend(fakeBackend('lex', []), fakeBackend('cosine', []));
     expect(() => hybrid.invalidateEntry('old')).toThrow(/validity-window/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Diversity re-rank over the FUSED list (context-injection-audit-2026-07-28
+// P-034 / F-D, D-014). Before this, `diversify` reached HybridBackend and was
+// forwarded verbatim to the cosine leg — where it reordered the very ranking
+// fuse() consumes as RANK, instead of diversifying the output.
+// ---------------------------------------------------------------------------
+describe('HybridBackend.search — diversity re-rank (F-D / D-014)', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** Entry with REAL text — the similarity proxy is trigram-Jaccard over text. */
+  const t = (id: string, text: string, score: number): MemoryEntry => ({ id, text, scope: 's', score });
+
+  // 'dup' is a near-verbatim paraphrase of 'best'; 'distinct' shares almost no
+  // trigrams with either. Pure relevance ranks best > dup > distinct.
+  const nearDup = [
+    t('best', 'the deploy pipeline uses a two port model for staging and release', 0.95),
+    t('dup', 'the deploy pipeline uses a two-port model for staging vs release', 0.94),
+    t('distinct', 'git-sync owns commit and push for the shared tree', 0.6),
+  ];
+
+  it('does NOT forward `diversify` to the cosine leg — that would re-rank the fusion INPUT', async () => {
+    // The bug this pass exists to prevent: Mem0Backend honors `diversify` by
+    // reordering its own results, and fuse() scores each hit by its rank within
+    // that leg. Forwarding it silently rewrites the RRF input.
+    let seen: SearchOptions | undefined;
+    const cosine = fakeBackend('cosine', nearDup, {
+      search: async (_q: string, o: SearchOptions) => {
+        seen = o;
+        return nearDup;
+      },
+    } as Partial<MemoryBackend>);
+    const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
+    await hy.search('q', { scope: 's', limit: 2, minScore: 0.45, diversify: { lambda: 0.5 } });
+    expect(seen?.diversify).toBeUndefined();
+    // …while every OTHER option still passes through untouched.
+    expect(seen?.minScore).toBe(0.45);
+    expect(seen?.limit).toBe(2);
+    expect(seen?.scope).toBe('s');
+  });
+
+  it('is an exact no-op when `diversify` is omitted', async () => {
+    const hy = new HybridBackend(fakeBackend('lexical', []), fakeBackend('cosine', nearDup));
+    const out = await hy.search('q', { scope: 's', limit: 3 });
+    expect(out.map((x) => x.id)).toEqual(['best', 'dup', 'distinct']);
+  });
+
+  it('re-ranks BEFORE the limit slice, so a near-duplicate loses its slot to a distinct fact', async () => {
+    // The load-bearing assertion of F-D. Applied AFTER the slice this test would
+    // fail: the top-2 would already be [best, dup] and reordering two
+    // near-copies reclaims nothing.
+    const hy = new HybridBackend(fakeBackend('lexical', []), fakeBackend('cosine', nearDup));
+    const plain = await hy.search('q', { scope: 's', limit: 2 });
+    expect(plain.map((x) => x.id)).toEqual(['best', 'dup']);
+
+    const diverse = await hy.search('q', { scope: 's', limit: 2, diversify: { lambda: 0.5 } });
+    expect(diverse.map((x) => x.id)).toEqual(['best', 'distinct']);
+  });
+
+  it('never grows the block — the limit is still the one ceiling', async () => {
+    const hy = new HybridBackend(fakeBackend('lexical', []), fakeBackend('cosine', nearDup));
+    const out = await hy.search('q', { scope: 's', limit: 2, diversify: { lambda: 0 } });
+    expect(out).toHaveLength(2);
+  });
+
+  it('drops nothing when the caller sets no limit — the un-reranked tail is preserved', async () => {
+    const many = [...nearDup, t('tail', 'an unrelated fact about pgbouncer pooling', 0.5)];
+    const hy = new HybridBackend(fakeBackend('lexical', []), fakeBackend('cosine', many));
+    const out = await hy.search('q', { scope: 's', diversify: { lambda: 0.5 } });
+    expect(out.map((x) => x.id).sort()).toEqual(['best', 'distinct', 'dup', 'tail']);
+  });
+
+  it('PAPERCUSP_MEMORY_MMR=0 kill-switches it here too, not just in Mem0Backend', async () => {
+    // The reason the switch moved into diversity-rerank.ts: a per-backend copy
+    // would have covered only half the seams that apply the pass.
+    vi.stubEnv('PAPERCUSP_MEMORY_MMR', '0');
+    const hy = new HybridBackend(fakeBackend('lexical', []), fakeBackend('cosine', nearDup));
+    const out = await hy.search('q', { scope: 's', limit: 2, diversify: { lambda: 0.5 } });
+    expect(out.map((x) => x.id)).toEqual(['best', 'dup']);
+  });
+
+  it('re-ranks only the admitted set — a cosine-gated empty result stays empty', async () => {
+    const hy = new HybridBackend(fakeBackend('lexical', [e('lex-only', 9)]), fakeBackend('cosine', []));
+    const out = await hy.search('q', {
+      scope: 's',
+      limit: 4,
+      fusionMode: 'cosine-gated',
+      diversify: { lambda: 0.5 },
+    });
+    expect(out).toEqual([]);
   });
 });
