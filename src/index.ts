@@ -55,6 +55,7 @@ export {
   type MemoryAvailability,
   type MemoryBackend,
   type MemoryEntry,
+  type ScoreScale,
   type RememberOptions,
   type SearchOptions,
   type UpdatePatch,
