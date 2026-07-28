@@ -27,6 +27,31 @@ function fakeBackend(name: string, searchResult: MemoryEntry[], over: Partial<Me
   } as MemoryBackend;
 }
 
+describe('HybridBackend identity (memory-declaude-and-defaults-2026-07-28 P-003)', () => {
+  it('reports the name it was CONSTRUCTED with, so two hybrid wirings are distinguishable', () => {
+    const mem0 = new Mem0Backend();
+    const pg = new HybridBackend(new LexicalLegBackend(mem0), mem0, { name: 'hybrid-pg' });
+    expect(pg.name).toBe('hybrid-pg');
+  });
+
+  it('defaults to "hybrid" when no name is given (the legacy claude-file+mem0 wiring)', () => {
+    const hy = new HybridBackend(fakeBackend('lexical', []), fakeBackend('cosine', []));
+    expect(hy.name).toBe('hybrid');
+  });
+
+  it('two DIFFERENT wirings never collide on one name — the canary reseed guard depends on this', () => {
+    // bench/recall-canary.ts decides whether to reseed its frozen pair set with
+    // `set.backend !== backend.name`. While both wirings answered 'hybrid', a
+    // flip between them skipped the reseed and scored new results against a
+    // baseline seeded on the OTHER backend — a corrupt comparison reported as a
+    // healthy one. Equal names here would restore exactly that bug.
+    const mem0 = new Mem0Backend();
+    const pg = new HybridBackend(new LexicalLegBackend(mem0), mem0, { name: 'hybrid-pg' });
+    const legacy = new HybridBackend(fakeBackend('claude-file', []), mem0);
+    expect(pg.name).not.toBe(legacy.name);
+  });
+});
+
 describe('HybridBackend (P-020)', () => {
   it('fuses: an exact-id hit (in both legs) ranks above a paraphrase (cosine-only)', async () => {
     const cosine = fakeBackend('cosine', [e('para', 0.6), e('exact', 0.5)]);

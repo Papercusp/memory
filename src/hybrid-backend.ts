@@ -54,10 +54,26 @@ export interface HybridBackendOptions {
   minLexScore?: number;
   /** Weight on the lexical leg's RRF contribution (default 1; >1 favors exact-id). */
   lexWeight?: number;
+  /**
+   * Identity this instance reports as `backend.name` (default `'hybrid'`).
+   *
+   * ⚠ MUST be set to the REGISTERED name by every caller that registers a
+   * distinct hybrid wiring — `hybrid-pg` passes `'hybrid-pg'`. This used to be
+   * hardcoded `'hybrid'`, which made two structurally different backends
+   * (claude-file+mem0 vs PG-lexical+mem0) indistinguishable downstream, and that
+   * is not cosmetic: the live recall canary keys its "did the backend change?"
+   * reseed off exactly this string (`set.backend !== backend.name` in
+   * bench/recall-canary.ts). With both wirings answering `'hybrid'`, a flip
+   * between them silently skipped the reseed and kept scoring new results against
+   * a baseline seeded on the OTHER backend — a corrupt comparison that reports as
+   * a healthy one. It also printed two identical "hybrid" columns in the
+   * 2026-07-13 bench scorecard. (memory-declaude-and-defaults-2026-07-28 P-003.)
+   */
+  name?: string;
 }
 
 export class HybridBackend implements MemoryBackend {
-  readonly name = 'hybrid';
+  readonly name: string;
 
   /**
    * Shared-embed capability (EI-12992) — delegated to the COSINE leg, which is
@@ -85,6 +101,7 @@ export class HybridBackend implements MemoryBackend {
     private readonly cosine: MemoryBackend,
     private readonly opts: HybridBackendOptions = {},
   ) {
+    this.name = opts.name ?? 'hybrid';
     const cosineEmbed = cosine.embedQuery?.bind(cosine);
     if (cosineEmbed) this.embedQuery = cosineEmbed;
   }
