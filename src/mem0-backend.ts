@@ -24,7 +24,7 @@
  */
 
 import { applyScoreFloor } from './score-floor';
-import { diversityRerank, textSimilarity } from './diversity-rerank';
+import { createTextSimilarity, diversityDisabledByEnv, diversityRerank } from './diversity-rerank';
 import { embedAndUpsertVector } from './vec-write';
 import {
   MemoryUnavailableError,
@@ -102,16 +102,11 @@ export function recencyFactor(tsMs: number | null, nowMs: number): number {
   return floor + (1 - floor) * Math.pow(0.5, ageDays / decayHalfLifeDays());
 }
 
-/**
- * Diversity re-rank kill switch (EI-10230). The re-rank itself is opt-in per
- * call via `SearchOptions.diversify` (default undefined ⇒ never applied) —
- * this env var is a defense-in-depth OFF override for a caller that requests
- * it anyway, mirroring the decay master-switch pattern above. Unset/anything
- * but '0' leaves a per-call request honored.
- */
-function diversifyKillSwitchDisabled(): boolean {
-  return process.env.PAPERCUSP_MEMORY_MMR === '0';
-}
+// Diversity re-rank kill switch (EI-10230) — now `diversityDisabledByEnv()`,
+// shared from ./diversity-rerank so the SAME switch covers every seam that
+// applies the pass (this backend and HybridBackend's fused list). It was
+// private here while there was one caller; a second seam would otherwise have
+// gained a kill switch that only half-worked.
 /** Freshness timestamp of a mem0 search row (updatedAt, else createdAt). */
 function rowTimestampMs(row: Mem0Row): number | null {
   for (const key of ['updatedAt', 'createdAt'] as const) {
@@ -476,8 +471,11 @@ export class Mem0Backend implements MemoryBackend {
     // set (never changes which entries qualify). Lexical (trigram-Jaccard)
     // similarity fallback — see diversity-rerank.ts for the rationale and the
     // preferred real-vector path this can be upgraded to later.
-    if (!opts.diversify || diversifyKillSwitchDisabled()) return decayed;
-    return diversityRerank(decayed, { lambda: opts.diversify.lambda, similarity: textSimilarity });
+    if (!opts.diversify || diversityDisabledByEnv()) return decayed;
+    return diversityRerank(decayed, {
+      lambda: opts.diversify.lambda,
+      similarity: createTextSimilarity(),
+    });
   }
 
   /**

@@ -98,8 +98,9 @@ export class HybridBackend implements MemoryBackend {
    * the ONLY leg that embeds (the lexical leg is embed-free by construction).
    *
    * ⚠ It MUST delegate to the leg that will CONSUME the vector. `search()`
-   * forwards `opts` — and therefore `opts.vector` — verbatim to `this.cosine`,
-   * so the vector is only meaningful in the cosine leg's embedding space.
+   * forwards `opts` — and therefore `opts.vector` — to `this.cosine` (all of it
+   * except `diversify`, which is a POST-fusion concern; see search()), so the
+   * vector is only meaningful in the cosine leg's embedding space.
    * Sourcing it from anywhere else (a second embedder, the lexical leg) would
    * silently compare vectors across spaces and return plausible-looking
    * garbage rather than failing loudly.
@@ -227,7 +228,18 @@ export class HybridBackend implements MemoryBackend {
     const inFlightLexical = gated ? null : runLexical();
 
     // The cosine leg carries the FP floor (opts.minScore).
-    const cosineHits = await this.cosine.search(query, opts);
+    //
+    // ⚠ `diversify` is STRIPPED from what the cosine leg receives, and it is not
+    // an optimization — forwarding it is a CORRECTNESS bug (context-injection-
+    // audit-2026-07-28 F-D / D-014). `Mem0Backend.search` honors `diversify` by
+    // MMR-reordering its own result, and `fuse()` below scores every hit by its
+    // RANK WITHIN THAT LEG (`1/(k + cosineRank)`). So a forwarded `diversify`
+    // would not diversify this backend's output at all — it would silently
+    // rewrite the fusion's INPUT ranking, moving a demoted near-duplicate's RRF
+    // contribution rather than demoting the entry. The pass belongs on the fused
+    // list, which is the only globally-comparable ranking on this path.
+    const { diversify, ...cosineOpts } = opts;
+    const cosineHits = await this.cosine.search(query, cosineOpts);
     if (cosineHits.length === 0 && gated) return []; // lexical leg never started — as contracted
     const lexicalHits = await (inFlightLexical ?? runLexical());
     const fused = fuse(cosineHits, lexicalHits, {
@@ -236,7 +248,46 @@ export class HybridBackend implements MemoryBackend {
       ...(minLexScore !== undefined ? { minLexScore } : {}),
       ...(this.opts.lexWeight !== undefined ? { lexWeight: this.opts.lexWeight } : {}),
     });
-    return opts.limit !== undefined ? fused.slice(0, opts.limit) : fused;
+    const diversified = this.diversify(fused, diversify, opts.limit);
+    return opts.limit !== undefined ? diversified.slice(0, opts.limit) : diversified;
+  }
+
+  /**
+   * Optional MMR pass over the FUSED list (EI-10230; wired here by
+   * context-injection-audit-2026-07-28 F-D). Off unless the caller asks.
+   *
+   * Applied BEFORE `slice(0, limit)` — deliberately, and this is the whole
+   * point of the pass here. The fused pool is much larger than `limit` (the
+   * cosine leg alone returns up to `limit` per scope and a multi-scope pull
+   * merges them), so re-ranking AFTER the slice could only reorder a top-K that
+   * pure relevance had already filled with near-copies. Selecting K diverse
+   * entries out of the larger post-floor candidate pool is what actually
+   * reclaims the budget. The QUALITY invariant still holds exactly: every
+   * candidate here already cleared its leg's admission bar (the cosine floor /
+   * `minLexScore`), so diversity re-ranks the admitted set and can never
+   * re-admit a floored-out hit.
+   *
+   * Bounded to a `limit`-relative head for cost: MMR is O(n²) in pairwise
+   * similarity and this runs on the per-turn injection critical path inside a
+   * timeout. Anything below `RERANK_DEPTH_FACTOR × limit` cannot reach the
+   * final top-K by diversity alone, so re-ranking the deep tail buys nothing and
+   * costs quadratically. The tail is preserved in relevance order behind the
+   * head, so an unlimited caller still gets every entry back.
+   */
+  private diversify(
+    fused: MemoryEntry[],
+    diversify: SearchOptions['diversify'],
+    limit: number | undefined,
+  ): MemoryEntry[] {
+    if (!diversify || diversityDisabledByEnv() || fused.length <= 1) return fused;
+    const depth =
+      limit === undefined ? fused.length : Math.min(fused.length, limit * RERANK_DEPTH_FACTOR);
+    if (depth <= 1) return fused;
+    const head = diversityRerank(fused.slice(0, depth), {
+      lambda: diversify.lambda,
+      similarity: createTextSimilarity(),
+    });
+    return depth >= fused.length ? head : [...head, ...fused.slice(depth)];
   }
 
   /**
