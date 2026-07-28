@@ -50,7 +50,25 @@ export interface HybridBackendOptions {
    * exact-identifier column is captured, not capped at the cosine leg's recall).
    */
   fusionMode?: FusionMode;
-  /** Lexical admission bar for floored-union (normalized 0..1, default 0.5). */
+  /**
+   * Lexical admission bar for floored-union (normalized 0..1).
+   *
+   * Default **0.3** — `DEFAULT_MIN_LEX_SCORE` in hybrid-fusion.ts, which is
+   * where the value is actually applied (`opts.minLexScore ?? DEFAULT_MIN_LEX_SCORE`).
+   * This doc-comment previously claimed 0.5, which was never the effective
+   * default on any path; corrected under context-injection-audit-2026-07-28
+   * P-029 (I-D), whose whole point is that a stale comment about a tuning
+   * constant is the next agent's false lead — someone reading 0.5 here would
+   * conclude the bar had been LOOSENED to 0.4 by the push path, when it is in
+   * fact TIGHTENED from 0.3.
+   *
+   * Resolution order, both legs of it real in production:
+   *   opts.minLexScore  → the push path (memory/injection.ts) passes 0.40
+   *   this.opts.minLexScore → NOT set by the production wiring
+   *                           (configure.ts constructs HybridBackend with only
+   *                           `{ name: 'hybrid-pg' }`)
+   *   DEFAULT_MIN_LEX_SCORE → 0.3, what the pull path therefore gets
+   */
   minLexScore?: number;
   /** Weight on the lexical leg's RRF contribution (default 1; >1 favors exact-id). */
   lexWeight?: number;
