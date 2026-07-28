@@ -591,3 +591,32 @@ describe('HybridBackend.search — diversity re-rank (F-D / D-014)', () => {
     expect(out).toEqual([]);
   });
 });
+
+describe('score-scale declaration (context-injection-audit-2026-07-28 P-036)', () => {
+  // Not decoration: recall telemetry stamps these onto every stats row so a
+  // reader can refuse to compare a fused RRF score (bounded by 2/61 = 0.0328)
+  // against a cosine one (floored at ~0.45). A WRONG declaration is worse than
+  // none — it would license exactly the cross-scale comparison the label exists
+  // to prevent — so pin both, and pin that they DIFFER.
+  it('declares rrf for search() and lexical for searchLexical()', () => {
+    const hy = new HybridBackend(new NoopBackend(), new NoopBackend());
+    expect(hy.scoreScale).toBe('rrf');
+    expect(hy.lexicalScoreScale).toBe('lexical');
+  });
+
+  it('declares rrf regardless of fusion mode — search() has no non-fused exit', () => {
+    // `fuse()` recomputes `score` for every surviving candidate, and the only
+    // other way out of search() is cosine-gated's empty early-return. So the
+    // scale is a constant here; if a future mode ever returned a leg's own
+    // scores un-fused, this pin is what makes that a visible decision.
+    const gated = new HybridBackend(new NoopBackend(), new NoopBackend(), { fusionMode: 'cosine-gated' });
+    expect(gated.scoreScale).toBe('rrf');
+  });
+
+  it('the cosine and lexical legs declare the scales the hybrid composes from', () => {
+    // The hybrid's 'rrf' is not inherited from either leg — it is produced by
+    // the fusion. Pinning the legs' own scales keeps that distinction honest.
+    expect(new Mem0Backend({ getClient: async () => ({}) as never }).scoreScale).toBe('cosine');
+    expect(new NoopBackend().scoreScale).toBe('unknown');
+  });
+});
