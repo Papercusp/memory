@@ -173,7 +173,9 @@ describe('Mem0Backend.search — batched multi-scope path (EI-12962)', () => {
 
 describe('Mem0Backend.remember — verbatim/infer mapping, metadata+kind, {ids,storedEvents}', () => {
   it('maps verbatim:true → infer:false (EI-178 — skip LLM extraction)', async () => {
-    const add = vi.fn(async () => ({ results: [{ id: UUID_A, event: 'ADD' }] }));
+    const add = vi.fn(async (_content: string | unknown[], _opts: Record<string, unknown>) => ({
+      results: [{ id: UUID_A, event: 'ADD' }],
+    }));
     const be = new Mem0Backend({ getClient: async () => stubClient({ add }) });
 
     await be.remember('raw fact', { scope: 'userA', verbatim: true });
@@ -186,7 +188,9 @@ describe('Mem0Backend.remember — verbatim/infer mapping, metadata+kind, {ids,s
   });
 
   it('OMITS infer entirely when verbatim is falsy (keeps mem0 LLM extraction on)', async () => {
-    const add = vi.fn(async () => ({ results: [{ id: UUID_A, event: 'ADD' }] }));
+    const add = vi.fn(async (_content: string | unknown[], _opts: Record<string, unknown>) => ({
+      results: [{ id: UUID_A, event: 'ADD' }],
+    }));
     const be = new Mem0Backend({ getClient: async () => stubClient({ add }) });
 
     await be.remember('a fact', { scope: 'userA' });
@@ -197,7 +201,7 @@ describe('Mem0Backend.remember — verbatim/infer mapping, metadata+kind, {ids,s
   });
 
   it('merges opts.metadata and sets metadata.kind from opts.kind', async () => {
-    const add = vi.fn(async () => ({ results: [] }));
+    const add = vi.fn(async (_content: string | unknown[], _opts: Record<string, unknown>) => ({ results: [] }));
     const be = new Mem0Backend({ getClient: async () => stubClient({ add }) });
 
     await be.remember('fact', {
@@ -211,7 +215,7 @@ describe('Mem0Backend.remember — verbatim/infer mapping, metadata+kind, {ids,s
   });
 
   it('kind overrides any kind already present in opts.metadata', async () => {
-    const add = vi.fn(async () => ({ results: [] }));
+    const add = vi.fn(async (_content: string | unknown[], _opts: Record<string, unknown>) => ({ results: [] }));
     const be = new Mem0Backend({ getClient: async () => stubClient({ add }) });
 
     await be.remember('fact', { scope: 'userA', kind: 'identity', metadata: { kind: 'STALE' } });
@@ -221,7 +225,7 @@ describe('Mem0Backend.remember — verbatim/infer mapping, metadata+kind, {ids,s
   });
 
   it('omits metadata.kind when opts.kind is undefined', async () => {
-    const add = vi.fn(async () => ({ results: [] }));
+    const add = vi.fn(async (_content: string | unknown[], _opts: Record<string, unknown>) => ({ results: [] }));
     const be = new Mem0Backend({ getClient: async () => stubClient({ add }) });
 
     await be.remember('fact', { scope: 'userA', metadata: { source: 'chat' } });
@@ -511,7 +515,9 @@ describe('Mem0Backend.available', () => {
 
 describe('Mem0Backend.rememberConversation', () => {
   it('passes the message array to client.add and NEVER sets infer:false (keeps extraction)', async () => {
-    const add = vi.fn(async () => ({ results: [{ id: UUID_A, event: 'ADD' }] }));
+    const add = vi.fn(async (_content: string | unknown[], _opts: Record<string, unknown>) => ({
+      results: [{ id: UUID_A, event: 'ADD' }],
+    }));
     const be = new Mem0Backend({ getClient: async () => stubClient({ add }) });
     const messages = [
       { role: 'user', content: 'I prefer dark mode' },
