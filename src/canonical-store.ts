@@ -520,30 +520,68 @@ export class CanonicalVectorStore {
     // this OR), so it changes NO result — it only gives the planner a predicate it can
     // serve from the pg_trgm GIN indexes (migration 594). Recall is untouched by
     // construction; only the plan changes.
+    // ⚠ WI-6966 — the two rules that keep this query from costing 2x what it should.
+    // Measured live (31,055-row store, 24-token query, EXPLAIN ANALYZE BUFFERS):
+    //   production before      761 ms   182,438 buffers
+    //   + rule 1 below         430 ms    97,769 buffers
+    //   + rule 2 below         391 ms     6,495 buffers   (1.95x faster, 28x buffers)
+    //
+    // RULE 1 — score the row ONCE. There used to be a `WHERE lex_raw > 0` on the outer
+    // query. The planner pushes it back down into the SAME scan filter as the match
+    // pre-filter, so BOTH the match OR-chain AND the whole score CASE-chain ran per row:
+    // ~144 ILIKEs/row at 32 tokens instead of ~72. It is also PROVABLY REDUNDANT given
+    // `matchTerms` is in the inner WHERE — which the EI-10931 note below already states
+    // ("LOGICALLY IDENTICAL"); it was simply never removed when that pre-filter landed:
+    //   match ⇒ some token hits some field ⇒ that CASE ≥ 1, all terms ≥ 0 ⇒ score ≥ 1 > 0
+    //   score > 0 ⇒ some CASE > 0 ⇒ that token hit a field ⇒ match
+    // NULL-safe both ways: a CASE whose every branch is NULL falls to ELSE 0, so the sum
+    // is never NULL; a row with all three fields NULL makes the OR-chain NULL (not TRUE)
+    // and is dropped by the inner WHERE, exactly where its score would have been 0.
+    // So do NOT re-add an outer `lex_raw > 0` — it filters nothing and doubles the work.
+    //
+    // RULE 2 — extract each field ONCE per row. `payload->>'name'` etc. appear once per
+    // token, and Postgres does not CSE them, so each was re-evaluated per token — and
+    // `payload` is jsonb, so every evaluation DETOASTS THE WHOLE PAYLOAD. Live sizes:
+    // data averages 811 bytes (max 8,407) and 596 of 3,685 candidate rows exceed the 2 KB
+    // TOAST threshold, so those were detoasted 3x/token = 72x per row at 24 tokens. That
+    // is the same root-cause class as WI-6934 (engineer_issues' `payload - '_ei'`), one
+    // layer down. Projecting the three fields in a subquery makes buffers FLAT in token
+    // count (33,476/91,142/182,438 at 4/12/24 tokens → a constant 6,495).
+    //
+    // `OFFSET 0` is load-bearing: it is the optimisation fence that stops the subquery
+    // being flattened back into the outer one, which would re-inline `payload->>'…'` per
+    // token and silently restore the old cost. A MATERIALIZED CTE also fences it but
+    // measured SLOWER (418 ms vs 391 ms) because it loses the parallel scan.
+    //
+    // ⚠ Buffers are NOT the win here and the two diverge — every buffer above was a
+    // `shared hit`, so rule 2 ALONE (leaving `lex_raw > 0` in place) measured 771 ms:
+    // 28x fewer buffers and NO faster than production. Both rules are required. Judge a
+    // change to this query on EXECUTION TIME, not on the buffer count.
     const scoreTerms: string[] = [];
     const matchTerms: string[] = [];
     for (const t of tokens) {
       params.push(`%${t.replace(/[\\%_]/g, (m) => `\\${m}`)}%`);
       const p = `$${idx++}`;
       scoreTerms.push(
-        `CASE WHEN payload->>'name' ILIKE ${p} THEN 3 WHEN payload->>'description' ILIKE ${p} THEN 2 WHEN payload->>'data' ILIKE ${p} THEN 1 ELSE 0 END`,
+        `CASE WHEN nm ILIKE ${p} THEN 3 WHEN ds ILIKE ${p} THEN 2 WHEN dt ILIKE ${p} THEN 1 ELSE 0 END`,
       );
-      matchTerms.push(
-        `payload->>'name' ILIKE ${p} OR payload->>'description' ILIKE ${p} OR payload->>'data' ILIKE ${p}`,
-      );
+      matchTerms.push(`nm ILIKE ${p} OR ds ILIKE ${p} OR dt ILIKE ${p}`);
     }
-    if (matchTerms.length > 0) conds.push(`(${matchTerms.join(' OR ')})`);
     const rawScore = scoreTerms.join(' + ');
     params.push(topK);
     const res = await client.query(
-      `SELECT id, payload, valid_at, invalid_at, superseded_by, lex_raw
+      `SELECT id, payload, valid_at, invalid_at, superseded_by,
+              (${rawScore})::float AS lex_raw
        FROM (
          SELECT id, payload, valid_at, invalid_at, superseded_by, created_at,
-                (${rawScore})::float AS lex_raw
+                payload->>'name' AS nm,
+                payload->>'description' AS ds,
+                payload->>'data' AS dt
          FROM ${this.cfg.schema}.memory_canonical
          WHERE ${conds.join(' AND ')}
+         OFFSET 0
        ) c
-       WHERE lex_raw > 0
+       WHERE (${matchTerms.join(' OR ')})
        ORDER BY lex_raw DESC, created_at DESC
        LIMIT $${idx}`,
       params,
