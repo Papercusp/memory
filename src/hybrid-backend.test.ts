@@ -623,3 +623,118 @@ describe('score-scale declaration (context-injection-audit-2026-07-28 P-036)', (
     expect(new NoopBackend().scoreScale).toBe('unknown');
   });
 });
+
+describe('per-leg queries — SearchOptions.lexicalQuery (context-injection-audit-2026-07-28 P-044)', () => {
+  /** Records the exact text each leg was asked for. */
+  function spyLegs(): {
+    lexical: MemoryBackend;
+    cosine: MemoryBackend;
+    asked: { lexical: string[]; cosine: string[] };
+    cosineOpts: SearchOptions[];
+  } {
+    const asked = { lexical: [] as string[], cosine: [] as string[] };
+    const cosineOpts: SearchOptions[] = [];
+    const lexical = fakeBackend('lexical', [], {
+      search: async (q: string) => {
+        asked.lexical.push(q);
+        return [e('lex-hit', 0.9)];
+      },
+    });
+    const cosine = fakeBackend('cosine', [], {
+      search: async (q: string, opts: SearchOptions) => {
+        asked.cosine.push(q);
+        cosineOpts.push(opts);
+        return [e('cos-hit', 0.8)];
+      },
+    });
+    return { lexical, cosine, asked, cosineOpts };
+  }
+
+  it('sends lexicalQuery to the LEXICAL leg and query to the COSINE leg', async () => {
+    const { lexical, cosine, asked } = spyLegs();
+    const hy = new HybridBackend(lexical, cosine);
+    await hy.search('dropdown selection broken', {
+      scope: 's',
+      lexicalQuery: 'dropdown selection broken apps/operator-vite/src WI-6512',
+      fusionMode: 'floored-union',
+      minScore: 0.45,
+    });
+    expect(asked.cosine).toEqual(['dropdown selection broken']);
+    expect(asked.lexical).toEqual(['dropdown selection broken apps/operator-vite/src WI-6512']);
+  });
+
+  it('omitted ⇒ BOTH legs get `query` — the pre-P-044 behaviour, unchanged', async () => {
+    const { lexical, cosine, asked } = spyLegs();
+    const hy = new HybridBackend(lexical, cosine);
+    await hy.search('deploy pipeline', { scope: 's', fusionMode: 'floored-union', minScore: 0.45 });
+    expect(asked.cosine).toEqual(['deploy pipeline']);
+    expect(asked.lexical).toEqual(['deploy pipeline']);
+  });
+
+  it('a blank/whitespace override falls back to `query` rather than asking for nothing', async () => {
+    // An empty lexical query returns zero tokens and therefore zero hits, which
+    // would silently delete the whole leg — a caller that composed an empty
+    // string meant "I have nothing to add", not "search for nothing".
+    const { lexical, cosine, asked } = spyLegs();
+    const hy = new HybridBackend(lexical, cosine);
+    await hy.search('deploy pipeline', {
+      scope: 's',
+      lexicalQuery: '   ',
+      fusionMode: 'floored-union',
+      minScore: 0.45,
+    });
+    expect(asked.lexical).toEqual(['deploy pipeline']);
+  });
+
+  it('STRIPS lexicalQuery from what the cosine leg receives', async () => {
+    // Same class as `diversify` (D-014), and the reason is the same: an option
+    // naming a DIFFERENT query text has no honest meaning on a leg that already
+    // took its query as an argument. A leg that later learned to read it would
+    // embed the identifier-bearing string this option exists to keep OUT of the
+    // vector — the exact dilution D-041 measured.
+    const { lexical, cosine, cosineOpts } = spyLegs();
+    const hy = new HybridBackend(lexical, cosine);
+    await hy.search('q', {
+      scope: 's',
+      lexicalQuery: 'q libs/generic/memory/src/hybrid-backend.ts',
+      fusionMode: 'floored-union',
+      minScore: 0.45,
+    });
+    expect(cosineOpts[0]).not.toHaveProperty('lexicalQuery');
+  });
+
+  it('routes in cosine-gated mode too — where the leg RE-RANKS rather than admits', async () => {
+    // The operator's push path runs cosine-gated (injectFusionMode), so this is
+    // the mode that actually ships. The lexical leg still runs and still gets
+    // its own query; what it cannot do here is admit a row the cosine leg
+    // missed. Pinning the routing separately from the admission keeps that
+    // distinction visible instead of implied.
+    const { lexical, cosine, asked } = spyLegs();
+    const hy = new HybridBackend(lexical, cosine);
+    const out = await hy.search('symptom in plain words', {
+      scope: 's',
+      lexicalQuery: 'symptom in plain words WI-6512',
+      fusionMode: 'cosine-gated',
+      minScore: 0.45,
+    });
+    expect(asked.lexical).toEqual(['symptom in plain words WI-6512']);
+    expect(out.map((x) => x.id)).toEqual(['cos-hit']);
+  });
+
+  it('does not start the lexical leg at all when cosine-gated returns nothing', async () => {
+    // The gated short-circuit is a cost contract (see search()'s comment); a
+    // per-leg query must not become a reason to spend that work.
+    const { lexical, asked } = spyLegs();
+    const cosine = fakeBackend('cosine', []);
+    const hy = new HybridBackend(lexical, cosine);
+    expect(
+      await hy.search('q', {
+        scope: 's',
+        lexicalQuery: 'q WI-6512',
+        fusionMode: 'cosine-gated',
+        minScore: 0.45,
+      }),
+    ).toEqual([]);
+    expect(asked.lexical).toEqual([]);
+  });
+});
