@@ -111,7 +111,7 @@ export interface RememberOptions {
   embedText?: string;
 }
 
-export interface SearchOptions {
+export interface SearchOptionsCommon {
   /**
    * One or more pools to search. `limit` applies PER SCOPE; the merged
    * result is sorted by score (desc) but NOT globally truncated —
@@ -123,26 +123,13 @@ export interface SearchOptions {
   /** Max hits per scope pool. Backend default applies when omitted. */
   limit?: number;
   /**
-   * Relevance floor (memory-backend-improve-and-hybrid P-001). Opt-in, applied
-   * on the auto-inject (push) path where no LLM filters the result (D-003): a
-   * hit below the floor is dropped, so an out-of-corpus query returns nothing
-   * instead of nearest-neighbour noise (the bench's hard-negative FP@5 fix).
-   * `minScore` is an ABSOLUTE floor on the backend's score scale (cosine
-   * similarity for the canonical/mem0 store); `minScoreRatio` is a RELATIVE
-   * floor (× the top hit's score). The stricter of the two wins. Backends
-   * whose score scale differs (or that don't score) ignore these.
+   * HYBRID-ONLY (memory-backend-improve-and-hybrid P-031). The lexical
+   * admission bar for a lexical-only hit in floored-union mode. Falls back to
+   * the backend's constructor default; non-hybrid backends ignore it. Plumbed
+   * as a search-time option so the P-031 sweep can tune it per-call without
+   * rebuilding the backend. (Its sibling `fusionMode` lives on
+   * `SearchFloorPolicy` below, because it is load-bearing rather than a knob.)
    */
-  minScore?: number;
-  minScoreRatio?: number;
-  /**
-   * HYBRID-ONLY overrides (memory-backend-improve-and-hybrid P-031). The hybrid
-   * backend fuses a cosine + a lexical leg; `fusionMode` picks the fusion shape
-   * and `minLexScore` is the lexical admission bar for a lexical-only hit in
-   * floored-union mode. Both fall back to the backend's constructor defaults;
-   * non-hybrid backends ignore them. Plumbed as search-time options so the
-   * P-031 sweep can tune them per-call without rebuilding the backend.
-   */
-  fusionMode?: 'floored-union' | 'cosine-gated';
   minLexScore?: number;
   /**
    * TEMPORAL-LITE (memory-temporal-lite-validity-windows-2026-07-11).
@@ -180,6 +167,75 @@ export interface SearchOptions {
    */
   vector?: number[];
 }
+
+/**
+ * THE FLOOR/FUSION PAIRING — a relevance floor may not be requested without
+ * saying WHICH FUSION SHAPE it applies to.
+ *
+ * WHY THIS IS A TYPE AND NOT A DEFAULT (context-injection-audit-2026-07-28
+ * P-001, re-scoped by D-020). The original P-001 read the bug as "the floor is
+ * lost inside the backend". It is not: the floor works, and F-B/D-010 fixed the
+ * push path by selecting `cosine-gated` per call. Fusion semantics are genuinely
+ * CALLER-SPECIFIC — dedup and classification callers want unfloored
+ * nearest-neighbour behaviour on purpose, and the PULL path legitimately admits
+ * a strong identifier match with weak cosine (measured: a healthy 29.2% zero-hit
+ * rate there, versus the push path's 0.0% before the fix). So per-call mode
+ * selection is the correct design, not a bypass to close.
+ *
+ * What was genuinely left is that **the permissive mode is what you get by
+ * omission**: `floored-union` admits lexical-only hits on `minLexScore` ALONE,
+ * independently of the cosine floor, so a push-like caller added tomorrow could
+ * set `minScore` believing it had bought precision and silently get none. That
+ * is the same class as the founding bug — a 0.45 floor running at 0.03 for
+ * months because nothing asserted it — and it is a DEFAULTS problem, not a
+ * fusion-algorithm problem.
+ *
+ * The fix makes the unsafe combination INEXPRESSIBLE rather than merely
+ * discouraged: pass a floor and you must state the fusion mode. Note the shape
+ * deliberately permits `minScore: number | undefined` alongside an explicit
+ * `fusionMode` — an env-tunable floor that resolves to undefined is still a
+ * caller who has thought about fusion, which is the whole property being
+ * enforced.
+ *
+ * Deliberately NOT done here: flipping the default to `cosine-gated` and making
+ * the pull path opt in. That was D-020's other candidate, and it silently
+ * changes retrieval for the eight existing callers that take the default — a
+ * relevance change this plan's method rule (D-041) says must be measured per
+ * caller against the live corpus, not assumed. This change alters no behaviour
+ * at all; it only refuses a query that cannot state what it means.
+ */
+export type SearchFloorPolicy =
+  | {
+      /** No relevance floor requested — fusion mode is a free choice. */
+      minScore?: undefined;
+      minScoreRatio?: undefined;
+      fusionMode?: 'floored-union' | 'cosine-gated';
+    }
+  | {
+      /**
+       * Relevance floor (memory-backend-improve-and-hybrid P-001). Opt-in,
+       * applied on the auto-inject (push) path where no LLM filters the result
+       * (D-003): a hit below the floor is dropped, so an out-of-corpus query
+       * returns nothing instead of nearest-neighbour noise (the bench's
+       * hard-negative FP@5 fix). `minScore` is an ABSOLUTE floor on the
+       * backend's score scale (cosine similarity for the canonical/mem0 store);
+       * `minScoreRatio` is a RELATIVE floor (× the top hit's score). The
+       * stricter of the two wins. Backends whose score scale differs (or that
+       * don't score) ignore these.
+       */
+      minScore?: number;
+      minScoreRatio?: number;
+      /**
+       * REQUIRED once a floor is in play. `cosine-gated` seeds the candidate set
+       * from cosine hits only, so membership is governed by the cosine floor and
+       * the result is a real 0..K ceiling. `floored-union` admits lexical-only
+       * hits independently of that floor — correct for recall-oriented callers,
+       * wrong for a push path, and never what you should get by accident.
+       */
+      fusionMode: 'floored-union' | 'cosine-gated';
+    };
+
+export type SearchOptions = SearchOptionsCommon & SearchFloorPolicy;
 
 export interface ListOptions {
   /** One or more pools to list. */

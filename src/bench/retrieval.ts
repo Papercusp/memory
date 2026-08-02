@@ -5,7 +5,7 @@
  * the `metadata.corpus_key` stamp the seeder wrote.
  */
 
-import type { MemoryBackend, MemoryEntry } from '../backend';
+import type { MemoryBackend, MemoryEntry, SearchFloorPolicy } from '../backend';
 import { aggregateByClass, latencyStats } from './metrics';
 import type { GoldQuery, QueryOutcome, RetrievalRunResult } from './types';
 
@@ -57,6 +57,20 @@ export async function runGoldSet(
 
   let next = 0;
   let done = 0;
+  // The floor/fusion pairing the sweep will run under, resolved ONCE (it is
+  // loop-invariant). A sweep that sets a floor must name the fusion shape it is
+  // measuring — see `SearchFloorPolicy`; 'floored-union' is what this harness
+  // got by omission before that pairing was enforced, so it stays the fallback
+  // and no historical bench number shifts.
+  const floorPolicy: SearchFloorPolicy =
+    opts.minScore !== undefined || opts.minScoreRatio !== undefined
+      ? {
+          ...(opts.minScore !== undefined ? { minScore: opts.minScore } : {}),
+          ...(opts.minScoreRatio !== undefined ? { minScoreRatio: opts.minScoreRatio } : {}),
+          fusionMode: opts.fusionMode ?? 'floored-union',
+        }
+      : { ...(opts.fusionMode !== undefined ? { fusionMode: opts.fusionMode } : {}) };
+
   async function worker(): Promise<void> {
     for (;;) {
       const i = next++;
@@ -68,10 +82,8 @@ export async function runGoldSet(
         hits = await backend.search(q.query, {
           scope: opts.scope,
           limit,
-          ...(opts.minScore !== undefined ? { minScore: opts.minScore } : {}),
-          ...(opts.minScoreRatio !== undefined ? { minScoreRatio: opts.minScoreRatio } : {}),
           ...(opts.minLexScore !== undefined ? { minLexScore: opts.minLexScore } : {}),
-          ...(opts.fusionMode !== undefined ? { fusionMode: opts.fusionMode } : {}),
+          ...floorPolicy,
         });
       } catch {
         hits = []; // an unavailable backend scores zero, it doesn't crash the run
