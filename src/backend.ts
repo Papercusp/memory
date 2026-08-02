@@ -132,6 +132,40 @@ export interface SearchOptionsCommon {
    */
   minLexScore?: number;
   /**
+   * HYBRID-ONLY. An ALTERNATE query text for the LEXICAL leg — the cosine leg
+   * still searches `query`. Omit and both legs get `query` (byte-identical to
+   * the single-query behaviour, which is what every caller but the operator's
+   * injection path wants).
+   *
+   * WHY A SECOND QUERY RATHER THAN ONE CONCATENATED STRING
+   * (context-injection-audit-2026-07-28 P-044 / F-L). The two legs want
+   * DIFFERENT text, and until now one string had to serve both:
+   *
+   *  - the COSINE leg embeds the query as ONE vector, so every non-semantic
+   *    token drags that vector off-topic. Measured live (D-041): the operator's
+   *    mid-turn query carried `apps/operator-vite/src` twice plus a full
+   *    component path against four content words, and the record that answered
+   *    the question was retrieved ONLY by a query naming its literal id. The
+   *    identifiers were not merely wasted there — they were DILUTING.
+   *  - the LEXICAL leg is exactly the opposite: token-matching, embed-free, and
+   *    the one leg that wins on identifiers.
+   *
+   * So the operator sends the prose to `query` and the prose+identifiers to
+   * `lexicalQuery`. That is a QUERY-composition change only — per D-014,
+   * NOTHING here re-ranks or reorders a leg's OUTPUT, because reordering a
+   * fusion leg rewrites the fusion INPUT.
+   *
+   * ⚠ KEEP IT SHORT. `canonical-store.lexicalSearch` normalizes its score by
+   * `tokens × 3`, so every token added to THIS string lowers the normalized
+   * score of every hit it returns — and `minLexScore` is an absolute bar on
+   * exactly that number. Genuine exact-identifier matches already span 0.33–0.96
+   * (see DEFAULT_MIN_LEX_SCORE), so padding this query is not free: it can push
+   * a real identifier match under the admission bar and REMOVE the hit the
+   * identifier was supposed to rescue. Add a bounded handful of identifiers, not
+   * a dump.
+   */
+  lexicalQuery?: string;
+  /**
    * TEMPORAL-LITE (memory-temporal-lite-validity-windows-2026-07-11).
    * `asOf` = point-in-time read: only entries whose validity window covers
    * this ISO timestamp (valid_at ⇒ created_at when unset; < invalid_at).

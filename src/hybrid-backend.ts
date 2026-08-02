@@ -28,6 +28,12 @@
  *   recall, so the hybrid degrades cleanly to cosine-only for un-projected writes.
  * - `available()` tracks the cosine leg (the source of truth + write target); a
  *   missing/cold lexical leg just degrades search to cosine-only.
+ * - The legs may be asked DIFFERENT questions: `SearchOptions.lexicalQuery`
+ *   overrides the text the lexical leg searches while the cosine leg keeps
+ *   `query` (context-injection-audit-2026-07-28 P-044). Omit it and both legs
+ *   get `query`, exactly as before. Read that option's doc before using it —
+ *   the lexical score is normalized by query-token count, so a longer lexical
+ *   query lowers every hit's score against `minLexScore`.
  */
 import type {
   ListOptions,
@@ -238,10 +244,17 @@ export class HybridBackend implements MemoryBackend {
     // `.search`) escapes it. That asymmetry was EI-2777. Inside an `async` function a sync
     // throw becomes a rejection, so this catches BOTH and a broken lexical leg still
     // degrades search cleanly to cosine-only (header §"available()/degrades cleanly").
+    // P-044 (F-L): the legs may be asked DIFFERENT questions. `lexicalQuery`
+    // overrides the text this leg searches; omitted, it is `query` — so a caller
+    // that does not use the seam is byte-identical to before. See
+    // `SearchOptions.lexicalQuery` for why the split exists (the cosine leg
+    // embeds ONE vector, so identifiers dilute it; the lexical leg is the leg
+    // that wins on them) and for the length warning that comes with it.
+    const lexicalText = opts.lexicalQuery?.trim() ? opts.lexicalQuery : query;
     const runLexical = (): Promise<MemoryEntry[]> =>
       (async () => {
         try {
-          return await this.lexical.search(query, { scope: opts.scope, limit: depth });
+          return await this.lexical.search(lexicalText, { scope: opts.scope, limit: depth });
         } catch {
           return [];
         }
@@ -262,7 +275,14 @@ export class HybridBackend implements MemoryBackend {
     // rewrite the fusion's INPUT ranking, moving a demoted near-duplicate's RRF
     // contribution rather than demoting the entry. The pass belongs on the fused
     // list, which is the only globally-comparable ranking on this path.
-    const { diversify, ...cosineOpts } = opts;
+    //
+    // `lexicalQuery` is stripped for the same reason and it is the SAME class of
+    // bug, not tidiness (P-044): the cosine leg's `search` takes `(query, opts)`,
+    // so an option naming a DIFFERENT query text has no honest meaning there —
+    // and a leg that later learned to read it would silently embed the
+    // identifier-bearing string this option exists to keep OUT of the vector.
+    // Strip an option at the boundary of the leg it is not for.
+    const { diversify, lexicalQuery: _lexicalQuery, ...cosineOpts } = opts;
     const cosineHits = await this.cosine.search(query, cosineOpts);
     if (cosineHits.length === 0 && gated) return []; // lexical leg never started — as contracted
     const lexicalHits = await (inFlightLexical ?? runLexical());
