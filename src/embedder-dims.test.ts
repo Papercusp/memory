@@ -231,7 +231,7 @@ describe('the declared dims are the dims the builders actually use', () => {
     // Derived, not restated — a docblock that merely AGREED with the code is
     // what shipped the bug. This asserts they are the same constant.
     expect(GEMMA_TARGET_DIMS).toBe(EMBEDDER_DIM_SPECS.gemma.targetDims);
-    expect(GEMMA_TARGET_DIMS).toBe(384);
+    expect(GEMMA_TARGET_DIMS).toBe(768);
   });
 
   it('harrier stores at its declared native width', () => {

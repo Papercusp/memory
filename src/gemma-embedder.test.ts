@@ -10,13 +10,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mrlTruncate, gemmaPrompt, GEMMA_TARGET_DIMS, GEMMA_MODEL } from './gemma-embedder';
 
-describe('mrlTruncate (MRL 768→384 + renormalize)', () => {
+describe('mrlTruncate (MRL slice + renormalize; the target is now the NATIVE 768)', () => {
   it('truncates a longer vector to the target length', () => {
     const v = Array.from({ length: 768 }, (_, i) => (i % 7) - 3 || 0.5);
-    expect(mrlTruncate(v, GEMMA_TARGET_DIMS)).toHaveLength(384);
+    expect(mrlTruncate(v, GEMMA_TARGET_DIMS)).toHaveLength(768);
   });
 
-  it('defaults to 384 dims', () => {
+  it('defaults to the declared target width', () => {
     const v = Array.from({ length: 768 }, () => 1);
     expect(mrlTruncate(v)).toHaveLength(384);
   });
@@ -154,8 +154,8 @@ describe('buildGemmaEmbedder — non-sticky worker fallback (EI-16184)', () => {
 });
 
 describe('constants', () => {
-  it('targets 384 dims (reuses the existing vector(384) columns)', () => {
-    expect(GEMMA_TARGET_DIMS).toBe(384);
+  it('targets the NATIVE 768 — no truncation, so no untrained cut is possible (D-005)', () => {
+    expect(GEMMA_TARGET_DIMS).toBe(768);
   });
 
   it('points at the Transformers.js/ONNX EmbeddingGemma-300m build', () => {
