@@ -73,7 +73,7 @@ describe('Mem0Backend.search — scope invariant (P-003) + relevance floor (P-00
     const calls: Record<string, unknown>[] = [];
     const client = fakeClient({ userA: [{ id: '1', memory: 'x', score: 0.39 }, { id: '2', memory: 'y', score: 0.3 }] }, calls);
     const be = new Mem0Backend({ getClient: async () => client });
-    const out = await be.search('off-topic', { scope: 'userA', limit: 6, minScore: 0.45 });
+    const out = await be.search('off-topic', { scope: 'userA', limit: 6, fusionMode: 'floored-union', minScore: 0.45 });
     expect(out).toEqual([]);
   });
 
@@ -81,7 +81,7 @@ describe('Mem0Backend.search — scope invariant (P-003) + relevance floor (P-00
     const calls: Record<string, unknown>[] = [];
     const client = fakeClient({ userA: [{ id: '1', memory: 'x', score: 0.55 }, { id: '2', memory: 'y', score: 0.2 }] }, calls);
     const be = new Mem0Backend({ getClient: async () => client });
-    const out = await be.search('on-topic', { scope: 'userA', limit: 6, minScore: 0.45 });
+    const out = await be.search('on-topic', { scope: 'userA', limit: 6, fusionMode: 'floored-union', minScore: 0.45 });
     expect(out.map((e) => e.id)).toEqual(['1']);
   });
 });
@@ -165,7 +165,7 @@ describe('Mem0Backend.search — batched multi-scope path (EI-12962)', () => {
     );
     const be = new Mem0Backend({ getClient: async () => stubClient(), embedQuery, vectorSearch });
 
-    const out = await be.search('q', { scope: ['userA', 'harness:x'], minScore: 0.45 });
+    const out = await be.search('q', { scope: ['userA', 'harness:x'], fusionMode: 'floored-union', minScore: 0.45 });
 
     expect(out.map((e) => e.id)).toEqual([UUID_A]); // 0.2 floored away
   });
@@ -694,7 +694,7 @@ describe('Mem0Backend.search — diversity re-rank (EI-10230)', () => {
       calls,
     );
     const be = new Mem0Backend({ getClient: async () => client });
-    const out = await be.search('q', { scope: 'userA', limit: 6, minScore: 0.45, diversify: { lambda: 0 } });
+    const out = await be.search('q', { scope: 'userA', limit: 6, fusionMode: 'floored-union', minScore: 0.45, diversify: { lambda: 0 } });
     expect(out.map((e) => e.id)).toEqual(['strong']);
   });
 });

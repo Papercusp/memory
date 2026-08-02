@@ -57,7 +57,7 @@ describe('HybridBackend (P-020)', () => {
     const cosine = fakeBackend('cosine', [e('para', 0.6), e('exact', 0.5)]);
     const lexical = fakeBackend('lexical', [e('exact', 9)]);
     const hy = new HybridBackend(lexical, cosine);
-    const out = await hy.search('q', { scope: 's', limit: 6, minScore: 0.45 });
+    const out = await hy.search('q', { scope: 's', limit: 6, fusionMode: 'floored-union', minScore: 0.45 });
     expect(out.map((x) => x.id)).toEqual(['exact', 'para']);
   });
 
@@ -67,7 +67,7 @@ describe('HybridBackend (P-020)', () => {
     // identifier bar (0.5), so the union does not admit it.
     const lexical = fakeBackend('lexical', [e('weak-overlap', 0.2)]);
     const hy = new HybridBackend(lexical, cosine);
-    expect(await hy.search('kubernetes', { scope: 's', minScore: 0.45 })).toEqual([]);
+    expect(await hy.search('kubernetes', { scope: 's', fusionMode: 'floored-union', minScore: 0.45 })).toEqual([]);
   });
 
   it('floored-union: a STRONG lexical-only identifier hit IS admitted (captures exact-id the cosine leg missed)', async () => {
@@ -76,7 +76,7 @@ describe('HybridBackend (P-020)', () => {
     const cosine = fakeBackend('cosine', [e('para', 0.55)]);
     const lexical = fakeBackend('lexical', [e('CODEX_HOME', 1.0)]);
     const hy = new HybridBackend(lexical, cosine);
-    const out = await hy.search('CODEX_HOME rotation', { scope: 's', limit: 6, minScore: 0.45 });
+    const out = await hy.search('CODEX_HOME rotation', { scope: 's', limit: 6, fusionMode: 'floored-union', minScore: 0.45 });
     expect(out.map((x) => x.id).sort()).toEqual(['CODEX_HOME', 'para']);
   });
 
@@ -85,7 +85,7 @@ describe('HybridBackend (P-020)', () => {
     const lexical = fakeBackend('lexical', [e('weak', 0.3)]);
     const hy = new HybridBackend(lexical, cosine);
     // Per-call minLexScore override (0.5) — 0.3 is below it → excluded.
-    const out = await hy.search('q', { scope: 's', minScore: 0.45, minLexScore: 0.5 });
+    const out = await hy.search('q', { scope: 's', fusionMode: 'floored-union', minScore: 0.45, minLexScore: 0.5 });
     expect(out.map((x) => x.id)).toEqual(['para']); // weak lexical-only excluded
   });
 
@@ -102,7 +102,7 @@ describe('HybridBackend (P-020)', () => {
     const cosine = fakeBackend('cosine', []); // floored empty
     const lexical = fakeBackend('lexical', [e('CODEX_HOME', 1.0)]);
     const hy = new HybridBackend(lexical, cosine, { fusionMode: 'cosine-gated' });
-    expect(await hy.search('CODEX_HOME', { scope: 's', minScore: 0.45 })).toEqual([]);
+    expect(await hy.search('CODEX_HOME', { scope: 's', fusionMode: 'floored-union', minScore: 0.45 })).toEqual([]);
   });
 
   it('preserves a paraphrase (cosine finds it, lexical misses)', async () => {
@@ -187,7 +187,7 @@ describe('HybridBackend (P-020)', () => {
     const search = vi.fn(async (_q: string, _opts: SearchOptions) => [e('a', 0.6)]);
     const cosine = fakeBackend('cosine', [], { search });
     const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
-    await hy.search('q', { scope: 's', limit: 6, minScore: 0.42 });
+    await hy.search('q', { scope: 's', limit: 6, fusionMode: 'floored-union', minScore: 0.42 });
     expect(search.mock.calls[0]?.[1]).toMatchObject({ minScore: 0.42 });
   });
 
@@ -214,7 +214,7 @@ describe('HybridBackend (P-020)', () => {
 
     await clientA.remember('the user prefers nuqs', { scope: 's' });
     // Client B (a different client instance) recalls A's write from the one store.
-    const recalled = await clientB.search('nuqs', { scope: 's', minScore: 0.45 });
+    const recalled = await clientB.search('nuqs', { scope: 's', fusionMode: 'floored-union', minScore: 0.45 });
     expect(recalled.map((r) => r.text)).toEqual(['the user prefers nuqs']);
   });
 
@@ -266,7 +266,7 @@ describe('HybridBackend (P-020)', () => {
       const hy = new HybridBackend(fakeBackend('lexical', []), new NoopBackend());
       // floored-union default: cosine is [] but NOT cosine-gated, so the lexical
       // leg still runs; with an empty lexical leg the fused result is [].
-      await expect(hy.search('anything', { scope: 's', minScore: 0.45 })).resolves.toEqual([]);
+      await expect(hy.search('anything', { scope: 's', fusionMode: 'floored-union', minScore: 0.45 })).resolves.toEqual([]);
     });
 
     it('remember THROWS MemoryUnavailableError — the write is NOT silently dropped', async () => {
@@ -294,7 +294,7 @@ describe('HybridBackend (P-020)', () => {
     ).toEqual([]);
     // Control: with NO override the constructor's floored-union DOES admit it.
     expect(
-      (await hy.search('CODEX_HOME', { scope: 's', minScore: 0.45 })).map((x) => x.id),
+      (await hy.search('CODEX_HOME', { scope: 's', fusionMode: 'floored-union', minScore: 0.45 })).map((x) => x.id),
     ).toEqual(['CODEX_HOME']);
   });
 
@@ -303,7 +303,7 @@ describe('HybridBackend (P-020)', () => {
     const lexSearch = vi.fn(async () => [e('CODEX_HOME', 1.0)]);
     const lexical = fakeBackend('lexical', [], { search: lexSearch });
     const hy = new HybridBackend(lexical, cosine, { fusionMode: 'cosine-gated' });
-    expect(await hy.search('CODEX_HOME', { scope: 's', minScore: 0.45 })).toEqual([]);
+    expect(await hy.search('CODEX_HOME', { scope: 's', fusionMode: 'floored-union', minScore: 0.45 })).toEqual([]);
     // The early-return fires BEFORE the lexical search — no wasted lexical probe.
     expect(lexSearch).not.toHaveBeenCalled();
   });
@@ -389,7 +389,7 @@ describe('HybridBackend.embedQuery (EI-12992 shared-embed delegation)', () => {
       fakeBackend('lexical', [], { search: lexSearch }),
       fakeBackend('cosine', [], { search: cosineSearch }),
     );
-    await hy.search('q', { scope: 's', limit: 6, minScore: 0.45, vector: [0.3, 0.4] });
+    await hy.search('q', { scope: 's', limit: 6, fusionMode: 'floored-union', minScore: 0.45, vector: [0.3, 0.4] });
     expect(cosineSearch.mock.calls[0]?.[1]).toMatchObject({ vector: [0.3, 0.4] });
     // The lexical leg is embed-free by construction — it gets scope+limit only.
     expect(lexSearch.mock.calls[0]?.[1]).not.toHaveProperty('vector');
@@ -442,7 +442,7 @@ describe('HybridBackend.embedQuery (EI-12992 shared-embed delegation)', () => {
       await hy.search('the same query text', {
         scope,
         limit: 3,
-        minScore: 0.45,
+        fusionMode: 'floored-union', minScore: 0.45,
         ...(shared ? { vector: shared } : {}),
       });
     }
@@ -532,7 +532,7 @@ describe('HybridBackend.search — diversity re-rank (F-D / D-014)', () => {
       },
     } as Partial<MemoryBackend>);
     const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
-    await hy.search('q', { scope: 's', limit: 2, minScore: 0.45, diversify: { lambda: 0.5 } });
+    await hy.search('q', { scope: 's', limit: 2, fusionMode: 'floored-union', minScore: 0.45, diversify: { lambda: 0.5 } });
     expect(seen?.diversify).toBeUndefined();
     // …while every OTHER option still passes through untouched.
     expect(seen?.minScore).toBe(0.45);
