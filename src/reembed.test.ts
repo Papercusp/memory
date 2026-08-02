@@ -82,9 +82,12 @@ vi.mock('pg', () => ({ Client: FakeClient, default: { Client: FakeClient } }));
 
 // --- host seam: getAdminUrl feeds pgFields(); buildEmbedderForMode feeds the
 //     re-embed pass with the TARGET-mode embedder. ---
-let embedderForMode: (mode: 'openai' | 'local') => Promise<EmbedFn>;
+// Must accept the FULL mode union that `configureMemory`'s buildEmbedderForMode
+// seam declares — narrowing it to 'openai' | 'local' here was a standing tsc
+// error in this workspace, since the seam can be called with 'gemma'/'harrier'.
+let embedderForMode: (mode: ResolvedVecMode) => Promise<EmbedFn>;
 
-function configure(embed: (mode: 'openai' | 'local') => Promise<EmbedFn>): void {
+function configure(embed: (mode: ResolvedVecMode) => Promise<EmbedFn>): void {
   embedderForMode = embed;
   configureMemory({
     getAdminUrl: () => 'postgres://u:p@localhost:5432/db',
@@ -121,7 +124,7 @@ describe('reembedMemories — happy path (GAP 5)', () => {
   it('embeds each source fact under the TARGET embedder and upserts into the target vec table', async () => {
     script.selectRows = [fact('m1', 'alpha'), fact('m2', 'beta'), fact('m3', 'gamma')];
     const embed = vi.fn(async () => goodVec());
-    const buildForMode = vi.fn(async (_mode: 'openai' | 'local') => embed as EmbedFn);
+    const buildForMode = vi.fn(async (_mode: ResolvedVecMode) => embed as EmbedFn);
     configure(buildForMode);
 
     const res = await reembedMemories('openai', 'local');
@@ -156,7 +159,8 @@ describe('reembedMemories — happy path (GAP 5)', () => {
 
   it('reads the body from payload.memory when payload.data is absent', async () => {
     script.selectRows = [{ id: 'm1', payload: { memory: 'from-memory-field' } }];
-    const embed = vi.fn(async () => goodVec());
+    // Target mode is 'openai' (768) — a 384 vector would be silently skipped.
+    const embed = vi.fn(async () => goodVec('openai'));
     configure(async () => embed as EmbedFn);
 
     const res = await reembedMemories('local', 'openai');
