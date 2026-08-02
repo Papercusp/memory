@@ -65,3 +65,53 @@ describe('queryLevelPRF (P-031)', () => {
     expect(md).toContain('F1-max floor: 0.45');
   });
 });
+
+/**
+ * P-050 regression guard: the sweep must ask the backend the question its
+ * CALLER's real path asks.
+ *
+ * `runFloorSweep` used to pass only `minScore`, so every sweep silently
+ * inherited the backend default (`floored-union`) — a mode where the lexical leg
+ * admits INDEPENDENTLY of the floor, so raising the floor frees cosine slots the
+ * lexical leg immediately backfills (D-008). A caller whose real path is
+ * `cosine-gated` would then lock a constant measured against machinery it does
+ * not run — the same defect class as a bench hardcoding a mode production
+ * stopped using.
+ */
+describe('runFloorSweep — forwards the admission shape (P-050)', () => {
+  function recordingBackend(seen: Array<Record<string, unknown>>): MemoryBackend {
+    return {
+      name: 'stub',
+      scoreScale: 'rrf',
+      search: async (_q: string, opts: Record<string, unknown>) => {
+        seen.push(opts);
+        return [];
+      },
+    } as unknown as MemoryBackend;
+  }
+
+  const gold = [{ id: 'g1', class: 'lexical-gap', query: 'q', expected: ['k1'] }] as unknown as GoldQuery[];
+
+  it('forwards fusionMode and minLexScore to every floor point', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    await runFloorSweep(recordingBackend(seen), gold, {
+      scope: 'bench',
+      floors: [0.5, 0.6],
+      fusionMode: 'cosine-gated',
+      minLexScore: 0.4,
+    });
+    expect(seen).toHaveLength(2);
+    for (const opts of seen) {
+      expect(opts.fusionMode).toBe('cosine-gated');
+      expect(opts.minLexScore).toBe(0.4);
+    }
+    expect(seen.map((o) => o.minScore)).toEqual([0.5, 0.6]);
+  });
+
+  it('injects no opinion of its own when unset (an existing caller is unchanged)', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    await runFloorSweep(recordingBackend(seen), gold, { scope: 'bench', floors: [0.5] });
+    expect(seen[0]).not.toHaveProperty('minLexScore');
+    expect(seen[0]?.minScore).toBe(0.5);
+  });
+});
