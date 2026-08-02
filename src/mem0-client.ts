@@ -50,6 +50,7 @@ import { CanonicalVectorStore } from './canonical-store';
 import { memoryHost, memorySchema } from './config';
 import { coalesceEmbedFn } from './embed-coalesce';
 import { FallbackExtractionLlm, type ExtractionLlm } from './extraction-llm';
+import { dynamicImport } from './dynamic-import';
 
 const LLM_MODEL = 'claude-haiku-4-5';
 // The collectionName is passed to mem0 for its internal bookkeeping
@@ -346,10 +347,6 @@ type Mem0Module = {
 // operator's memoryPreflight().
 type ResolvedMode = 'openai' | 'local' | 'gemma' | 'harrier' | 'disabled';
 
-const dynamicImport = new Function(
-  'specifier',
-  'return import(specifier)',
-) as <T>(specifier: string) => Promise<T>;
 
 const MEM0_PACKAGE = 'mem0ai/oss';
 

@@ -21,6 +21,7 @@
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname } from 'node:path';
+import { dynamicImport } from './dynamic-import';
 
 interface PendingRequest {
   resolve: (v: number[]) => void;
@@ -232,10 +233,6 @@ export const ORT_SESSION_OPTIONS = { intraOpNumThreads: 4, interOpNumThreads: 1 
 
 // Dodge the bundler's static analysis so the optional @huggingface
 // dependency is only required when local mode is actually selected.
-const dynamicImport = new Function(
-  'specifier',
-  'return import(specifier)',
-) as <T>(specifier: string) => Promise<T>;
 
 /**
  * Build a local (free, offline) BGE-small embedder.

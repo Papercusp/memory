@@ -53,6 +53,7 @@
 import { embedViaWorker, getWorkerState, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
 import { mrlTruncate } from './gemma-embedder';
 import { CANDIDATE_DIM_SPECS } from './embedder-dims';
+import { dynamicImport } from './dynamic-import';
 
 /** The two R2 multilingual sizes under evaluation. */
 export type GraniteVariant = '97m' | '311m';
@@ -138,9 +139,6 @@ const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
 
 // Dodge bundler static analysis — @huggingface/transformers is an optional,
 // lazily-resolved dependency (only present when a local embedder is selected).
-const dynamicImport = new Function('specifier', 'return import(specifier)') as <T>(
-  specifier: string,
-) => Promise<T>;
 
 type TransformersModule = {
   pipeline: (
