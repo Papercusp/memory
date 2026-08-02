@@ -74,9 +74,15 @@ describe('every declared embedder spec is sound', () => {
 });
 
 describe('every candidate can produce 384 without an untrained cut', () => {
-  // The prose surfaces store vector(384), so a candidate is only CHEAP to
-  // adopt if it emits 384 without a hand-rolled prefix. That is the property
-  // asserted here, and it is a claim about MIGRATION COST, not about quality.
+  // HISTORICAL FRAMING, kept deliberately. When the prose columns were
+  // vector(384), a candidate was CHEAP to adopt only if it emitted 384 without
+  // a hand-rolled prefix, so that is what these assert — a claim about
+  // MIGRATION COST, not quality.
+  //
+  // The columns are 768 now (D-005), so 384-emission is no longer the cheap
+  // path for anything. These stay because they still pin each candidate's real
+  // MRL behaviour, which is what a future bake-off needs; just don't read
+  // "passes here" as "cheap to adopt" any more.
   //
   // ⚠ Do not extend these into a quality ranking. D-003 measured the
   // temptation false: gemma@384 (untrained) scores ABOVE the trained 512/256
@@ -203,12 +209,13 @@ describe('the guard FAILS on the mistakes it exists to catch', () => {
 });
 
 describe('isTrainedDim reflects how each real model actually reduces', () => {
-  it('gemma: the trained MRL points are supported, 384 is not', () => {
+  it('gemma: the trained MRL points are supported, 384 is not, and the target is one of them', () => {
     const gemma = EMBEDDER_DIM_SPECS.gemma;
     for (const trained of [768, 512, 256, 128]) expect(isTrainedDim(gemma, trained)).toBe(true);
-    // The configured target is knowingly untrained — acknowledged, not hidden.
     expect(isTrainedDim(gemma, 384)).toBe(false);
-    expect(gemma.untrainedCut?.trackedBy).toContain('prose-embedding-384-untrained-mrl-fix');
+    // The configured target must itself be a trained width — the property whose
+    // absence was the original bug (EI-19301722864393687).
+    expect(isTrainedDim(gemma, gemma.targetDims)).toBe(true);
   });
 
   it('harrier: publishes no MRL, so its exploratory 384 variant IS an untrained cut', () => {

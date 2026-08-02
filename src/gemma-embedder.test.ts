@@ -18,7 +18,10 @@ describe('mrlTruncate (MRL slice + renormalize; the target is now the NATIVE 768
 
   it('defaults to the declared target width', () => {
     const v = Array.from({ length: 768 }, () => 1);
-    expect(mrlTruncate(v)).toHaveLength(384);
+    // 768 (native) since D-005 — so the default call is a no-op slice that
+    // still renormalizes, which is exactly what the storage path needs given
+    // the pipeline is invoked with normalize:false.
+    expect(mrlTruncate(v)).toHaveLength(768);
   });
 
   it('L2-normalizes the truncated slice to unit length', () => {
