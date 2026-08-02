@@ -51,6 +51,7 @@
  */
 
 import { embedViaWorker, getWorkerState, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
+import { EMBEDDER_DIM_SPECS } from './embedder-dims';
 
 /** Transformers.js/ONNX build of EmbeddingGemma-300m. */
 export const GEMMA_MODEL = 'onnx-community/embeddinggemma-300m-ONNX';
@@ -59,8 +60,14 @@ const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
 /** MRL truncation target — chosen to match the existing vector(384) columns,
  *  NOT because 384 is a trained MRL dim. EmbeddingGemma's supported MRL dims are
  *  768/512/256/128; 384 is an untrained intermediate cut. See the DIMENSION note
- *  in the file docblock before changing this (EI-19301722864393687). */
-export const GEMMA_TARGET_DIMS = 384;
+ *  in the file docblock before changing this (EI-19301722864393687).
+ *
+ *  DERIVED from the declared spec rather than restated, so the dim this file
+ *  truncates to is by construction the dim `embedder-dims.ts` declares — and
+ *  the guard there cannot be satisfied by a declaration that has drifted from
+ *  the code it describes. Change the target THERE, where the trained dims and
+ *  the untrained-cut acknowledgement sit next to it. */
+export const GEMMA_TARGET_DIMS = EMBEDDER_DIM_SPECS.gemma.targetDims;
 
 /** Whether a text is being embedded as a stored document or a search query.
  *  EmbeddingGemma applies a different task prompt to each. */

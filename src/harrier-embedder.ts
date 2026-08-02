@@ -30,11 +30,15 @@
 
 import { embedViaWorker, getWorkerState, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
 import { mrlTruncate } from './gemma-embedder';
+import { EMBEDDER_DIM_SPECS } from './embedder-dims';
 
 /** Transformers.js/ONNX build of microsoft/harrier-oss-v1-0.6b. */
 export const HARRIER_MODEL = 'onnx-community/harrier-oss-v1-0.6b-ONNX';
-/** Native output width — memory-side storage uses this (P-014). */
-export const HARRIER_NATIVE_DIMS = 1024;
+/** Native output width — memory-side storage uses this (P-014). DERIVED from
+ *  the declared spec so it cannot drift from the dims guard; harrier publishes
+ *  NO MRL, so any narrower `dims` (the exploratory 384 variant) is an untrained
+ *  cut — `isTrainedDim` in embedder-dims.ts reports it as such. */
+export const HARRIER_NATIVE_DIMS = EMBEDDER_DIM_SPECS.harrier.nativeDims;
 /** The export's sole graph output: last-token pooled + L2-normalized. */
 export const HARRIER_GRAPH_OUTPUT = 'sentence_embedding';
 /** The model-card web_search_query instruction (prompt_name=web_search_query). */
