@@ -64,6 +64,8 @@ export {
 } from './backend';
 export { Mem0Backend, extractAddedIds, type Mem0BackendDeps } from './mem0-backend';
 export { applyScoreFloor, type ScoreFloorOptions } from './score-floor';
+/** The ONE runtime-opaque optional-dependency import — see ./dynamic-import. */
+export { dynamicImport } from './dynamic-import';
 export {
   createTextSimilarity,
   diversityDisabledByEnv,

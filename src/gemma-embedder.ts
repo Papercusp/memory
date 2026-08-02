@@ -105,9 +105,6 @@ export function mrlTruncate(vec: number[], dims: number = GEMMA_TARGET_DIMS): nu
   return sliced.map((v) => v / norm);
 }
 
-// Dodge bundler static analysis — @huggingface/transformers is an optional,
-// lazily-resolved dependency (only present when a local embedder is selected).
-
 type TransformersModule = {
   pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<Pipeline>;
 };

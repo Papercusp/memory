@@ -14,11 +14,18 @@ afterEach(() => {
  * Memory constructor threw and was swallowed — every memory:* tool silently
  * returned mem0_unavailable.
  *
- * We can't drive getMemoryClient() end-to-end here: the store loads mem0ai via
- * a `new Function('return import(s)')` trick (to dodge bundler static analysis)
- * which has no import callback under vitest's module runner. So we assert the
- * fix at its seam — patchEmbedderFactory must make mem0ai's own EmbedderFactory
- * accept the 'custom' provider.
+ * This asserts the fix at its seam — patchEmbedderFactory must make mem0ai's own
+ * EmbedderFactory accept the 'custom' provider — which is the right level for
+ * THIS regression regardless of reachability.
+ *
+ * ⚠ The reason originally given here is no longer true, and it mattered: the
+ * store used to load mem0ai through a bare `new Function('return import(s)')`
+ * (dodging bundler static analysis) whose realm has no import callback under
+ * vitest's module runner, so `getMemoryClient()` was unreachable from any test.
+ * That is fixed — `./dynamic-import` keeps the bundler blind while working in a
+ * VM realm (context-injection-audit-2026-07-28 P-002), so an end-to-end drive is
+ * now possible if a future regression warrants one. Don't cite the old
+ * limitation as a reason not to write one.
  */
 describe('patchEmbedderFactory — mem0ai 3.x custom-embedder compatibility', () => {
   it('teaches mem0ai EmbedderFactory the custom provider (was unsupported)', async () => {

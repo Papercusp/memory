@@ -231,9 +231,6 @@ type Pipeline = (text: string, opts: unknown) => Promise<{ data: Float32Array }>
  *  (plain-JS worker, can't import this) — keep the two in sync. */
 export const ORT_SESSION_OPTIONS = { intraOpNumThreads: 4, interOpNumThreads: 1 } as const;
 
-// Dodge the bundler's static analysis so the optional @huggingface
-// dependency is only required when local mode is actually selected.
-
 /**
  * Build a local (free, offline) BGE-small embedder.
  *

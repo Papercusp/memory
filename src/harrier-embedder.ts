@@ -72,9 +72,6 @@ function assertNativeDims(vec: number[]): number[] {
   return vec;
 }
 
-// Dodge bundler static analysis — @huggingface/transformers is an optional,
-// lazily-resolved dependency (only present when a local embedder is selected).
-
 const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
 
 type Tensor = { data: Float32Array };

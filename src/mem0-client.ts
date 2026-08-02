@@ -225,10 +225,12 @@ export async function invalidateEntryCanonical(
  * mem0's mergeConfig drops function-valued config fields during Zod
  * validation, so by the time create() runs the fn is already gone.
  */
-// Exported for the regression test (mem0-client.test.ts) — it can't drive
-// getMemoryClient() under vitest because the `new Function('return import')`
-// dynamicImport trick has no import callback in vitest's module runner, so it
-// patches + asserts EmbedderFactory directly. Not re-exported from index.ts.
+// Exported for the regression test (mem0-client.test.ts), which patches +
+// asserts EmbedderFactory directly — the right level for that regression.
+// (It used to be the ONLY level available: the bare `new Function('return
+// import(s)')` loader had no import callback under vitest's module runner, so
+// getMemoryClient() was unreachable from any test. ./dynamic-import fixed that
+// — P-002.) Not re-exported from index.ts.
 export function patchEmbedderFactory(mem0Module: {
   EmbedderFactory?: { create: (provider: string, config: Record<string, unknown>) => unknown };
 }): void {
