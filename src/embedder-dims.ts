@@ -178,16 +178,24 @@ export const EMBEDDER_DIM_SPECS: Record<EmbedderMode, EmbedderDimSpec> = {
   /**
    * OpenAI text-embedding-3-small. Reduction is first-class here: the
    * `dimensions` API parameter applies the trained MRL and renormalizes
-   * server-side, so 384 is a SUPPORTED width, not a hand-rolled prefix.
+   * server-side, so any width is SUPPORTED, not a hand-rolled prefix.
    * This is the contrast case that keeps the guard honest — it must not
    * flag every non-native width, only untrained ones.
+   *
+   * 768 (was 384) tracks the prose column width so this mode stays
+   * PROSE-ELIGIBLE alongside gemma — see `PROSE_ELIGIBLE_MODES` in
+   * operator-core's `search/prose-vector-dims.ts`. It costs nothing to move:
+   * OpenAI bills per TOKEN, not per dimension, and `dimensions` is applied
+   * server-side. Keeping a second eligible mode matters — it is the working
+   * prose fallback when gemma is unavailable, and it keeps the storage
+   * contract from silently becoming gemma-specific.
    */
   openai: {
     model: 'text-embedding-3-small',
     nativeDims: 1536,
     mrl: 'continuous',
     trainedDims: [1536],
-    targetDims: 384,
+    targetDims: 768,
   },
 
   /**
