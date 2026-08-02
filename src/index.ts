@@ -193,3 +193,11 @@ export {
 } from './sidecar-embedder';
 
 export { CanonicalVectorStore } from './canonical-store';
+/**
+ * The lexical leg's own tokenizer. Exported because anything ASKING a question
+ * of that leg needs to know what its query will actually be reduced to — the
+ * 32-token cap keeps the HEAD, so a caller composing a query can only tell
+ * whether the part it appended survived by running the real tokenizer.
+ * Re-implementing it would defeat the point.
+ */
+export { lexicalTokens } from './canonical-store';
