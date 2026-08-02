@@ -22,9 +22,23 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { configureMemory, type EmbedFn } from './config';
+import { MODE_DIMS, type ResolvedVecMode } from './vec-write';
 
-const EMBEDDER_DIM = 384;
-const goodVec = () => Array.from({ length: EMBEDDER_DIM }, () => 0.01);
+/**
+ * A correctly-sized fake embedding for the TARGET mode.
+ *
+ * ⚠ Widths are per-mode and NOT uniform — `local` is 384 (bge-small, no MRL),
+ * while `openai` and `gemma` are 768 since migration 727. Derive from MODE_DIMS
+ * rather than hardcoding: reembed's wrong-width guard SKIPS silently instead of
+ * throwing, so a fixture pinned to one width makes a re-embed test report
+ * `reembedded: 0` with no error and no failed assertion message worth the name
+ * — which is exactly how WI-7107 stayed invisible.
+ *
+ * Defaults to 'local' because most cases here re-embed *into* local; the
+ * 'local' -> 'openai' case must pass its target explicitly.
+ */
+const goodVec = (mode: ResolvedVecMode = 'local') =>
+  Array.from({ length: MODE_DIMS[mode] }, () => 0.01);
 
 type CapturedQuery = { sql: string; params: unknown[] };
 
