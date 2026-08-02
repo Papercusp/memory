@@ -83,6 +83,10 @@ export async function runGoldSet(
           scope: opts.scope,
           limit,
           ...(opts.minLexScore !== undefined ? { minLexScore: opts.minLexScore } : {}),
+          // A per-query leg split (GoldQuery.lexicalQuery). Passed through
+          // ONLY when the arm set one, so an ordinary gold set replays with
+          // both legs on `query` exactly as before.
+          ...(q.lexicalQuery ? { lexicalQuery: q.lexicalQuery } : {}),
           ...floorPolicy,
         });
       } catch {

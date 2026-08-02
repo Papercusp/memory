@@ -214,6 +214,43 @@ describe('runGoldSet', () => {
     expect(r.perQuery.every((q) => q.rawHits === 0)).toBe(true);
   });
 
+  it('forwards a per-query lexicalQuery to backend.search, and omits it otherwise', async () => {
+    // The COMPOSE seam being right is not the same as the ISSUE seam being
+    // wired: an arm builder can keep producing a perfect split while the
+    // replay quietly drops it and every rank metric stays plausible. So pin
+    // what actually reaches search().
+    const seen: SearchOptions[] = [];
+    const be = new LexicalDouble();
+    const spy: MemoryBackend = {
+      ...be,
+      name: 'spy',
+      available: () => be.available(),
+      remember: (t, o) => be.remember(t, o),
+      list: (o) => be.list(o),
+      get: (id) => be.get(id),
+      forget: (id) => be.forget(id),
+      update: (id, p) => be.update(id, p),
+      search: (q, o) => {
+        seen.push(o);
+        return be.search(q, o);
+      },
+    };
+    await seedCorpus(be, CORPUS, { scope: 'bench' });
+    await runGoldSet(
+      spy,
+      [
+        { ...GOLD[0], lexicalQuery: 'port 3170 staging operator deploy-cli' },
+        GOLD[1],
+      ],
+      { scope: 'bench', limit: 10, concurrency: 1 },
+    );
+
+    expect(seen).toHaveLength(2);
+    expect(seen[0].lexicalQuery).toBe('port 3170 staging operator deploy-cli');
+    // Absent — not undefined-valued — so an arm-free replay is byte-identical.
+    expect('lexicalQuery' in seen[1]).toBe(false);
+  });
+
   it('rankedCorpusKeys dedupes and drops unstamped hits', () => {
     const hits: MemoryEntry[] = [
       { id: '1', text: 'x', scope: 's', metadata: { corpus_key: 'a' } },

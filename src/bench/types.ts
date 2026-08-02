@@ -50,6 +50,20 @@ export interface GoldQuery {
    * those queries must surface nothing.
    */
   expected: string[];
+  /**
+   * HYBRID ONLY — an alternate query for the LEXICAL fusion leg, forwarded as
+   * `SearchOptions.lexicalQuery`. Omitted (the frozen fixtures never set it)
+   * both legs get `query` and a replay is byte-identical to before.
+   *
+   * This exists so an ARM can be a per-leg query split rather than only a
+   * config change: the caller that motivated it asks the two legs DIFFERENT
+   * questions (identifiers to the token-matching leg, prose to the embedding
+   * leg), and a bench that can only vary `query` cannot measure that at all.
+   * A derived arm carries the SAME `id` as the query it transforms, which is
+   * what lets a paired comparison align the two runs by query rather than by
+   * position.
+   */
+  lexicalQuery?: string;
   /** Optional authoring note (why this query / what it probes). */
   note?: string;
 }
