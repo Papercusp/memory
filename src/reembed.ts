@@ -1,11 +1,14 @@
 /**
  * Re-embed memories when the user switches `memoryEmbedderMode`.
  *
- * Background: switching between `openai` and `local` modes uses different
- * embedding models (text-embedding-3-small @ 384 dims via the `dimensions`
- * param, vs BGE-small @ 384). The vector spaces aren't comparable — the same
- * query embedded by different models lands in different parts of the space —
- * so each mode gets its OWN per-fact vector row.
+ * Background: each mode uses a different embedding model, and the vector spaces
+ * aren't comparable — the same query embedded by different models lands in
+ * different parts of the space — so each mode gets its OWN per-fact vector row.
+ *
+ * The per-mode WIDTHS are not stated here on purpose: they are one fact, owned by
+ * `MODE_DIMS` in vec-write.ts (a restatement here is what went stale in WI-7107).
+ * They are not uniform — `local` is bge-small @ native 384 and cannot emit more,
+ * while `openai` and `gemma` moved to 768 with migration 727.
  *
  * Under the canonical schema the fact text lives once in
  * `<schema>.memory_canonical` and each mode's vector lives in
@@ -33,28 +36,13 @@
  */
 
 import { memoryHost, memorySchema } from './config';
-
-type ResolvedMode = 'openai' | 'local' | 'gemma' | 'harrier';
-
-/** Map a mode to its (unqualified) vec table — fixed lookup (no interpolation
- *  of caller input into SQL identifiers); schema is prefixed at use.
- *  'gemma' = EmbeddingGemma-300m @ MRL-384 (migration 534);
- *  'harrier' = harrier-oss-0.6b @ native-1024 (migration 547). */
-const VEC_TABLE: Record<ResolvedMode, string> = {
-  openai: 'memory_vec_openai',
-  local: 'memory_vec_local',
-  gemma: 'memory_vec_gemma',
-  harrier: 'memory_vec_harrier',
-};
-
-/** Per-mode vector width — the wrong-width guard must match the TARGET
- *  mode's space (harrier is 1024; everything else 384). */
-const MODE_DIMS: Record<ResolvedMode, number> = {
-  openai: 384,
-  local: 384,
-  gemma: 384,
-  harrier: 1024,
-};
+// ⚠ SINGLE SOURCE — do NOT re-declare these here. This file used to keep private
+// copies of ResolvedVecMode / VEC_TABLE / MODE_DIMS, and the 384 -> 768 widening
+// (migration 727) updated vec-write.ts's copy while this one silently went stale.
+// Because the width guard below SKIPS rather than throws, that made every
+// re-embed a no-op that still reported success (WI-7107). One declaration means
+// the next width change cannot half-land.
+import { MODE_DIMS, VEC_TABLE, type ResolvedVecMode } from './vec-write';
 
 interface PgFields {
   host: string;
@@ -98,8 +86,8 @@ async function loadPgFields(): Promise<PgFields> {
  * build failure).
  */
 export async function reembedMemories(
-  fromMode: ResolvedMode,
-  toMode: ResolvedMode,
+  fromMode: ResolvedVecMode,
+  toMode: ResolvedVecMode,
   opts: { progress?: (p: ReembedProgress) => void } = {},
 ): Promise<ReembedResult> {
   if (fromMode === toMode) {
