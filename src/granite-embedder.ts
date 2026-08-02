@@ -22,16 +22,28 @@
  *    which are asymmetric dual-encoders and are understated without their
  *    prefixes. Do not "helpfully" add one here.
  *
- * WHY THESE TWO ARE THE INTERESTING CANDIDATES. The prose surfaces store
- * `vector(384)`, and the incumbent gemma@384 reaches that width by an
- * UNTRAINED MRL cut (EI-19301722864393687) — measured on the prose gold set as
- * a real 19-21% MRR loss versus gemma@512/@768 (that plan's D-003). Both
- * granite options reach 384 legitimately, and therefore need NO wide-column
- * migration:
- *   - 97m is natively 384 — there is no cut to be untrained.
- *   - 311m publishes 384 as a TRAINED nesting point — the exact property gemma
- *     lacks. `CANDIDATE_DIM_SPECS.granite311` declares this, so the dims guard
- *     asserts it mechanically rather than leaving it as a claim in prose.
+ * WHY THESE TWO ARE THE INTERESTING CANDIDATES — AND WHY IT IS NOT "THEIR 384
+ * IS TRAINED". The prose surfaces store `vector(384)`, and the incumbent
+ * gemma@384 measured a real 19-21% MRR loss against gemma@512/@768 on the
+ * prose gold set (that plan's D-003).
+ *
+ * ⚠ That loss is ORDINARY WIDTH LOSS, not a penalty for cutting at an
+ * untrained point. D-003 measured it directly and corrected the plan's
+ * original hypothesis: gemma@384 lands ABOVE the trained 512/256
+ * interpolation (.2889 vs .2718), and the TRAINED 256 is dramatically WORSE
+ * than the untrained 384 (-.0889 MRR). **Trainedness did not predict quality
+ * in either direction.** So do not read these candidates as "correct because
+ * their 384 is trained" — that reasoning, applied consistently, selects 256
+ * and measurably degrades retrieval.
+ *
+ * What actually makes them interesting is narrower and purely structural:
+ * they produce 384 at full published quality, so IF the gold set says they
+ * match gemma@512, the fix costs NO wide-column migration.
+ *   - 97m is natively 384 — no truncation happens at all.
+ *   - 311m publishes 384 as a trained nesting point, so its 384 is a
+ *     first-class output rather than a prefix taken on faith.
+ * Both are claims about what the width COSTS to adopt. Whether either is any
+ * GOOD at 384 is decided by the gold set (P-003), never by this docblock.
  *
  * SPACE: granite vectors are a DISTINCT embedding space from gemma/BGE/OpenAI
  * (the embedding-space-vs-dimension scar / EI-8913) — same 384 dims,

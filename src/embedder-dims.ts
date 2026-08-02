@@ -231,11 +231,14 @@ export const EMBEDDER_DIM_SPECS: Record<EmbedderMode, EmbedderDimSpec> = {
  * declaring its dims a TYPE error — while still holding candidates to the same
  * validator, so a candidate cannot be measured under a width nobody checked.
  *
- * These declarations are the POINT of the bake-off, not bookkeeping. The
- * incumbent gemma@384 needs an `untrainedCut` acknowledgement to pass this
- * guard at the width the prose surfaces actually store; both granite entries
- * reach 384 legitimately and therefore carry none. That contrast is the plan's
- * central claim, asserted here mechanically instead of in prose.
+ * ⚠ READ THE ACKNOWLEDGEMENTS AS HYGIENE, NOT AS A QUALITY RANKING. It is
+ * tempting to notice that gemma@384 carries an `untrainedCut` while the
+ * granite entries do not, and conclude the granite widths are therefore
+ * better. That inference is MEASURED FALSE (P-002 / D-003): gemma@384 scores
+ * ABOVE the trained 512/256 interpolation, and the TRAINED 256 is dramatically
+ * WORSE than the untrained 384 (-.0889 MRR). Trainedness predicted quality in
+ * neither direction. What these specs assert is only that a width is declared
+ * and reviewable — the gold set, not this table, says which model to ship.
  */
 export const CANDIDATE_DIM_SPECS: Record<'granite97' | 'granite311' | 'qwen3', EmbedderDimSpec> = {
   /**
@@ -253,12 +256,14 @@ export const CANDIDATE_DIM_SPECS: Record<'granite97' | 'granite311' | 'qwen3', E
   },
 
   /**
-   * Granite-Embedding-311M-Multilingual-R2 — 768 native, and its card
-   * publishes Matryoshka nesting at 768/512/384/256/128. **384 is a TRAINED
-   * point**, which is precisely the property EmbeddingGemma lacks: the same
-   * target width, reached legitimately, so `targetDims: 384` needs no
-   * `untrainedCut` acknowledgement here. If someone later adds one, the
-   * validator's stale-ack rule will reject it.
+   * Granite-Embedding-311M-Multilingual-R2 — 768 native, with card-published
+   * Matryoshka nesting at 768/512/384/256/128. 384 is among them, so
+   * `targetDims: 384` needs no `untrainedCut` acknowledgement (and if someone
+   * later adds one anyway, the validator's stale-ack rule rejects it).
+   *
+   * That is a statement about DECLARABILITY, not quality — see the warning on
+   * this table. Whether 311m@384 actually beats gemma@512 is P-003's
+   * measurement to make.
    */
   granite311: {
     model: 'onnx-community/granite-embedding-311m-multilingual-r2-ONNX',
