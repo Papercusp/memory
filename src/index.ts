@@ -153,6 +153,20 @@ export {
   type GemmaEmbedKind,
 } from './gemma-embedder';
 
+// The declared dim table (D-001). Exported so callers that CHOOSE a width —
+// the MRL bench sweep especially — can ask whether that width is one the model
+// was actually trained at, instead of re-encoding the model card by hand and
+// letting the two drift.
+export {
+  EMBEDDER_DIM_SPECS,
+  isTrainedDim,
+  validateEmbedderDimSpec,
+  type EmbedderMode,
+  type EmbedderDimSpec,
+  type MrlSupport,
+  type UntrainedCutAck,
+} from './embedder-dims';
+
 export {
   buildHarrierEmbedder,
   harrierPrompt,
