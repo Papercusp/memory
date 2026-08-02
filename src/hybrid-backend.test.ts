@@ -102,7 +102,9 @@ describe('HybridBackend (P-020)', () => {
     const cosine = fakeBackend('cosine', []); // floored empty
     const lexical = fakeBackend('lexical', [e('CODEX_HOME', 1.0)]);
     const hy = new HybridBackend(lexical, cosine, { fusionMode: 'cosine-gated' });
-    expect(await hy.search('CODEX_HOME', { scope: 's', fusionMode: 'floored-union', minScore: 0.45 })).toEqual([]);
+    // Mirrors the constructor above: this call inherited 'cosine-gated' from it
+    // before the floor/fusion pairing made the mode explicit at every floored site.
+    expect(await hy.search('CODEX_HOME', { scope: 's', fusionMode: 'cosine-gated', minScore: 0.45 })).toEqual([]);
   });
 
   it('preserves a paraphrase (cosine finds it, lexical misses)', async () => {
@@ -303,7 +305,8 @@ describe('HybridBackend (P-020)', () => {
     const lexSearch = vi.fn(async () => [e('CODEX_HOME', 1.0)]);
     const lexical = fakeBackend('lexical', [], { search: lexSearch });
     const hy = new HybridBackend(lexical, cosine, { fusionMode: 'cosine-gated' });
-    expect(await hy.search('CODEX_HOME', { scope: 's', fusionMode: 'floored-union', minScore: 0.45 })).toEqual([]);
+    // Mirrors the constructor above — the early-return under test is cosine-gated's.
+    expect(await hy.search('CODEX_HOME', { scope: 's', fusionMode: 'cosine-gated', minScore: 0.45 })).toEqual([]);
     // The early-return fires BEFORE the lexical search — no wasted lexical probe.
     expect(lexSearch).not.toHaveBeenCalled();
   });
