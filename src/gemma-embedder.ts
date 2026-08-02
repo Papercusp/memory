@@ -1,6 +1,9 @@
 /**
- * EmbeddingGemma-300m local embedder (the DEFAULT local embedder as of the
- * 2026-07-10 owner ask). A sibling of BGE-small's `buildLocalEmbedder`
+ * EmbeddingGemma-300m local embedder. Adopted as the default local embedder
+ * on the 2026-07-10 owner ask; superseded as the SOLE default by harrier
+ * (WI-4082, 2026-07-11) but kept live as harrier's hybrid companion — both
+ * are warmed by the embed-sidecar at boot and both stay bundled by owner
+ * directive (WI-5638, 2026-07-20). A sibling of BGE-small's `buildLocalEmbedder`
  * (local-embedder-worker.ts); shares the same worker-thread isolation via
  * `embedViaWorker`, differing in three ways EmbeddingGemma requires:
  *

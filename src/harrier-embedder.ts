@@ -1,9 +1,14 @@
 /**
  * Harrier-OSS-v1-0.6b local embedder (shared-embedding-sidecar-and-enrichment
- * P-013) — a BAKE-OFF CANDIDATE, not a default: adoption is gated on a P-001
- * gold-set win outside noise (P-006). A sibling of `buildGemmaEmbedder`
- * sharing the same worker-thread isolation via `embedViaWorker`, differing in
- * three ways harrier requires:
+ * P-013) — ADOPTED: this is the intended DEFAULT local embedder for a fresh
+ * desktop install (offline embeddings out of the box), live since WI-4082
+ * (2026-07-11); the embed-sidecar warms both harrier and gemma at boot and
+ * both stay bundled in a LIVE HYBRID by owner directive (owner,
+ * WI-5638 2026-07-20). The "bake-off candidate, not a default" framing below
+ * predates that adoption — kept only as history for the truncated-384
+ * variant, which is still exploratory (see DIMS below). A sibling of
+ * `buildGemmaEmbedder` sharing the same worker-thread isolation via
+ * `embedViaWorker`, differing in three ways harrier requires:
  *
  * 1. MODEL — `onnx-community/harrier-oss-v1-0.6b-ONNX` (Transformers.js/ONNX
  *    build of microsoft/harrier-oss-v1-0.6b), natively 1024-dim.
