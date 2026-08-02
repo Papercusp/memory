@@ -3,14 +3,23 @@
  * EI-19301722864393687 (the prose surfaces' untrained MRL-384 cut).
  *
  * THE BUG CLASS. Every embedder here emits a vector of some NATIVE width, and
- * several are then truncated to fit the `vector(384)` columns. Truncating a
- * Matryoshka (MRL) model is legitimate *only at the dims it was trained to
- * nest at*; truncating anywhere else is an UNTRAINED cut. It degrades
- * gracefully rather than breaking — the space stays coherent, so nothing
- * throws, no test reds, and quality just quietly sits somewhere unmeasured.
- * That silence is the whole problem: gemma@384 shipped because a docblock
- * asserted any prefix was "a valid lower-dim embedding", and nothing in the
- * code disagreed.
+ * one may be tempted to truncate it to fit a narrower storage column.
+ * Truncating a Matryoshka (MRL) model is legitimate *only at the dims it was
+ * trained to nest at*; truncating anywhere else is an UNTRAINED cut. It
+ * degrades gracefully rather than breaking — the space stays coherent, so
+ * nothing throws, no test reds, and quality just quietly sits somewhere
+ * unmeasured. That silence is the whole problem: gemma@384 shipped because a
+ * docblock asserted any prefix was "a valid lower-dim embedding", and nothing
+ * in the code disagreed. It cost ~19-21% of prose retrieval MRR for months
+ * before anyone measured it (D-003).
+ *
+ * ⚠ THE LESSON IS *MEASURE*, NOT "PREFER A TRAINED DIM" (D-003 correction 1).
+ * Trainedness turned out to predict quality in NEITHER direction: the untrained
+ * 384 scored ABOVE the trained-512/256 interpolation, and the TRAINED 256 was
+ * dramatically WORSE than it (-.0889 MRR). A reflex to "just pick a trained
+ * dim" would have selected 256 and made retrieval worse. What this file
+ * guarantees is that a width is DECLARED and REVIEWABLE — the gold set, never
+ * this table, says which width is actually good.
  *
  * WHAT THIS FILE CHANGES. The target dim is no longer a bare number sitting
  * next to the truncation call — it is DECLARED here alongside the dims the
@@ -182,24 +191,36 @@ export const EMBEDDER_DIM_SPECS: Record<EmbedderMode, EmbedderDimSpec> = {
   },
 
   /**
-   * EmbeddingGemma-300m — the case this guard exists for. Trained MRL points
-   * are 768/512/256/128 per the model card; 384 is an intermediate, UNMEASURED
-   * cut taken to fit the existing vector(384) columns.
+   * EmbeddingGemma-300m at its NATIVE 768 — the case this guard was built for,
+   * resolved by REMOVING the truncation rather than relocating it to a
+   * different trained point (P-005 / D-005).
+   *
+   * The former `targetDims: 384` was an intermediate, untrained MRL cut taken
+   * to fit the pre-existing `vector(384)` columns. Measured (D-003), it cost
+   * ~19-21% of prose retrieval MRR: @384 scores .2889 against @512 .3435 and
+   * @768 .3492, and the paired bootstrap vs @384 excludes zero for both
+   * (@512 +.0546 CI [.0165,.0935]; @768 +.0603 CI [.0210,.1022]).
+   *
+   * WHY NATIVE 768 AND NOT THE TRAINED 512 (D-005). @768 is better on both the
+   * point estimate and the CI lower bound, and — the decisive part — costs the
+   * SAME compute: the model always runs a native-768 forward pass, so an MRL
+   * "truncation" is only a slice afterwards. 512 would buy ~400MB of disk at
+   * the price of keeping the truncation machinery, and therefore keeping this
+   * bug class one config typo away. At the native width `targetDims ===
+   * nativeDims`, so `isTrainedDim` is trivially true and no acknowledgement can
+   * ever be needed here again.
+   *
+   * ⚠ Do NOT "optimize" this back down to a narrower prefix without re-reading
+   * D-005: the re-embed corpus is ~395k vectors, so a width change is a
+   * multi-hour, all-at-once migration (pgvector cannot cast between widths).
+   * That cost is why the width chosen here is the model's terminal one.
    */
   gemma: {
     model: 'onnx-community/embeddinggemma-300m-ONNX',
     nativeDims: 768,
     mrl: 'discrete',
     trainedDims: [768, 512, 256, 128],
-    targetDims: 384,
-    untrainedCut: {
-      reason:
-        'Fits the existing vector(384) columns (incl. the 5 shared-column prose surfaces) with no wide-column migration. ' +
-        'A deliberate infrastructure-fit tradeoff, NOT a claim that 384 is a supported MRL dim: it sits between the ' +
-        'trained 512 and 256 points with no published measurement, and may fall below their interpolation. ' +
-        'If changing this, prefer a TRAINED dim (512/256) or a natively-384 model over another intermediate prefix.',
-      trackedBy: 'prose-embedding-384-untrained-mrl-fix-2026-08-02 (EI-19301722864393687)',
-    },
+    targetDims: 768,
   },
 
   /**
