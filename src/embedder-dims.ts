@@ -217,3 +217,88 @@ export const EMBEDDER_DIM_SPECS: Record<EmbedderMode, EmbedderDimSpec> = {
     targetDims: 1024,
   },
 };
+
+/**
+ * BAKE-OFF CANDIDATES — models being MEASURED as replacements, not yet wired
+ * as production `EmbedderMode`s.
+ *
+ * Deliberately a separate table rather than new `EmbedderMode` entries. A mode
+ * implies a resolver branch, a vector table and a migration; these have earned
+ * none of that until they win the prose gold-set gate
+ * (prose-embedding-384-untrained-mrl-fix-2026-08-02, P-003). Keeping them out
+ * of `EMBEDDER_DIM_SPECS` preserves that table's real guarantee — its
+ * `Record<EmbedderMode, …>` key type is what makes shipping a mode without
+ * declaring its dims a TYPE error — while still holding candidates to the same
+ * validator, so a candidate cannot be measured under a width nobody checked.
+ *
+ * These declarations are the POINT of the bake-off, not bookkeeping. The
+ * incumbent gemma@384 needs an `untrainedCut` acknowledgement to pass this
+ * guard at the width the prose surfaces actually store; both granite entries
+ * reach 384 legitimately and therefore carry none. That contrast is the plan's
+ * central claim, asserted here mechanically instead of in prose.
+ */
+export const CANDIDATE_DIM_SPECS: Record<'granite97' | 'granite311' | 'qwen3', EmbedderDimSpec> = {
+  /**
+   * Granite-Embedding-97M-Multilingual-R2 — natively 384. The cheapest
+   * possible resolution of the untrained-cut bug: at the width the prose
+   * columns already store, there is no truncation happening at all, so the
+   * question "is this cut trained?" does not arise.
+   */
+  granite97: {
+    model: 'onnx-community/granite-embedding-97m-multilingual-r2-ONNX',
+    nativeDims: 384,
+    mrl: 'none',
+    trainedDims: [384],
+    targetDims: 384,
+  },
+
+  /**
+   * Granite-Embedding-311M-Multilingual-R2 — 768 native, and its card
+   * publishes Matryoshka nesting at 768/512/384/256/128. **384 is a TRAINED
+   * point**, which is precisely the property EmbeddingGemma lacks: the same
+   * target width, reached legitimately, so `targetDims: 384` needs no
+   * `untrainedCut` acknowledgement here. If someone later adds one, the
+   * validator's stale-ack rule will reject it.
+   */
+  granite311: {
+    model: 'onnx-community/granite-embedding-311m-multilingual-r2-ONNX',
+    nativeDims: 768,
+    mrl: 'discrete',
+    trainedDims: [768, 512, 384, 256, 128],
+    targetDims: 384,
+  },
+
+  /**
+   * Qwen3-Embedding-0.6B — 1024 native, card-documented MRL across
+   * user-defined widths from 32 to 1024, so reduction is first-class the way
+   * OpenAI's `dimensions` parameter is (hence `continuous`).
+   *
+   * ⚠ `continuous` here means "trained at any width in the published range",
+   * and that range has a FLOOR of 32 which this model shares with no other
+   * entry. `isTrainedDim` cannot express a floor, so it would call dims 1..31
+   * trained. Our target of 384 sits far inside the range; a future caller
+   * asking for a sub-32 width would need that floor checked by hand.
+   */
+  qwen3: {
+    model: 'onnx-community/Qwen3-Embedding-0.6B-ONNX',
+    nativeDims: 1024,
+    mrl: 'continuous',
+    trainedDims: [1024],
+    targetDims: 384,
+  },
+};
+
+/**
+ * The declared spec for a production mode OR a bake-off candidate, by key.
+ *
+ * The eval CLI scores both from one code path (`gemma@512` and `granite311@384`
+ * are the same kind of question), so it needs one lookup spanning both tables.
+ * Returns `undefined` for an unknown key rather than throwing — the CLI turns
+ * that into a per-leg "unknown leg" refusal, which is more useful than
+ * aborting a multi-leg sweep over one typo.
+ */
+export function dimSpecFor(key: string): EmbedderDimSpec | undefined {
+  const production = (EMBEDDER_DIM_SPECS as Record<string, EmbedderDimSpec | undefined>)[key];
+  if (production) return production;
+  return (CANDIDATE_DIM_SPECS as Record<string, EmbedderDimSpec | undefined>)[key];
+}

@@ -54,6 +54,15 @@ parentPort.on('message', async (msg) => {
   const { id, text, model } = msg;
   // BGE-small defaults (mean pooling, normalized) when unspecified; Gemma passes
   // normalize:false and truncate-then-normalizes in the caller (MRL).
+  //
+  // ⚠ 'last_token' (Qwen3) is SAFE HERE ONLY BECAUSE WE EMBED ONE TEXT PER
+  // MESSAGE. transformers.js implements it as `result.slice(null, -1)` — the
+  // final sequence position, with no attention-mask check — and the tokenizer
+  // is called with `padding: true`. Over a single text that pads nothing, so
+  // the final position IS the last real token. If this protocol is ever
+  // widened to a batch, right-padding would silently pool a PAD embedding for
+  // every text shorter than the longest: no error, just quietly wrong vectors.
+  // Batch this only alongside a mask-aware last-token gather.
   const pooling = msg.pooling || 'mean';
   const normalize = msg.normalize === undefined ? true : msg.normalize;
   try {

@@ -159,6 +159,8 @@ export {
 // letting the two drift.
 export {
   EMBEDDER_DIM_SPECS,
+  CANDIDATE_DIM_SPECS,
+  dimSpecFor,
   isTrainedDim,
   validateEmbedderDimSpec,
   type EmbedderMode,
@@ -166,6 +168,29 @@ export {
   type MrlSupport,
   type UntrainedCutAck,
 } from './embedder-dims';
+
+// Bake-off candidates for the prose surfaces' untrained-MRL-384 cut (plan
+// prose-embedding-384-untrained-mrl-fix-2026-08-02, P-003). Exported so the
+// eval CLI measures the SAME builders a winner would ship with — measuring a
+// bench-local reimplementation and then shipping a different one is how an
+// embedding decision goes unexamined in the first place.
+export {
+  buildGraniteEmbedder,
+  graniteNativeDims,
+  GRANITE_MODELS,
+  GRANITE_SPEC_KEYS,
+  type GraniteVariant,
+  type GraniteEmbedKind,
+} from './granite-embedder';
+
+export {
+  buildQwen3Embedder,
+  qwen3Prompt,
+  QWEN3_MODEL,
+  QWEN3_NATIVE_DIMS,
+  QWEN3_QUERY_TASK,
+  type Qwen3EmbedKind,
+} from './qwen3-embedder';
 
 export {
   buildHarrierEmbedder,

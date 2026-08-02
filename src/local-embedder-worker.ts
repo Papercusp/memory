@@ -104,10 +104,24 @@ function ensureWorker(): Promise<void> {
  *  `output` bypasses the pipeline's pooling path entirely and returns the
  *  named graph output from a direct model call — for exports that bake
  *  pooling+normalize into the ONNX graph (harrier's 'sentence_embedding');
- *  `pooling`/`normalize` are ignored when it is set. */
+ *  `pooling`/`normalize` are ignored when it is set.
+ *
+ *  ⚠ POOLING IS A PROPERTY OF THE MODEL, NOT A TUNABLE. Each embedder must
+ *  pass the pooling its own training used — read from that model's
+ *  `1_Pooling/config.json`, never guessed and never carried over from a
+ *  sibling. Scoring a model under the wrong pooling does not error: it returns
+ *  a plausible vector from a subtly wrong space, so a bake-off reads it as a
+ *  fair loss when it is really a measurement bug. The three in use here:
+ *  `mean` (BGE, gemma), `cls` (granite r2), `last_token` (Qwen3 — and harrier,
+ *  which instead bakes it into its graph and so uses `output`). */
 export interface EmbedViaWorkerOpts {
   model?: string;
-  pooling?: 'mean' | 'cls' | 'none';
+  /** `last_token` is transformers.js's `last_token`/`eos` pooling. ⚠ It takes
+   *  the FINAL sequence position, which is the last REAL token only because
+   *  this worker embeds exactly one text per call (`padding: true` over a
+   *  single text pads nothing). If this is ever batched, right-padding would
+   *  make it pool a PAD token — see the note in the worker script. */
+  pooling?: 'mean' | 'cls' | 'none' | 'last_token';
   normalize?: boolean;
   output?: string;
 }
