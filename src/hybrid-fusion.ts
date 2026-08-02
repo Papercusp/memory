@@ -133,9 +133,52 @@ export function fuse(
   };
 
   // Lexical rank (1-based) + the lexical entry, keyed by cross-leg slot (first wins).
+  //
+  // ⚠ `minLexScore` gates conferring a RANK, not merely lexical-ONLY ADMISSION — and
+  // that is a fix, not a tightening for its own sake (WI-7154). The bar used to apply
+  // only in the `floored-union` block below, which meant that under `cosine-gated` —
+  // THE PUSH-PATH DEFAULT, i.e. every per-turn memory injection — it was dead code:
+  // every lexical hit, however weak, still handed its slot a full second RRF term.
+  //
+  // That term decides the ranking. At k=60 over a ~29-candidate cosine list the ENTIRE
+  // cosine ordering spans ~0.005 (1/61 → 1/89) while one cross-leg co-occurrence is
+  // worth up to ~0.013, so membership in the lexical list outweighed relevance: a
+  // candidate at cosine rank 29 (barely above the floor) outranked cosine ranks 2 and 3.
+  //
+  // Whether a pool GOT that bonus was then decided by its SIZE, because the lexical leg
+  // pulls `depth` PER SCOPE. Measured live 2026-08-02 on the initialize query: the
+  // 56-memory hive pool had 36/56 = 64% of its corpus in the lexical list, so its cosine
+  // hits were nearly always also lexical hits and were always boosted; the 1526-memory
+  // harness pool had 36/1526 = 2.4% coverage and its cosine candidates shared ZERO ids
+  // with its lexical rows, so they were never boosted. Harness took 5 of the cosine
+  // top-12 and 0 of the 12 fused slots, on 336 of 337 consecutive real recalls. The
+  // property is scale-INVERTED: the more memories a pool holds, the less likely its best
+  // rows are admitted, so writing more memories made recall strictly worse.
+  //
+  // The decisive measurement is that ALL 108 hits conferring a bonus scored below even
+  // the loosest calibrated bar (0.3) — not one was a real lexical match. The score is
+  // normalized by query-token count, so an 11-token prose query cannot reach 0.4 (that
+  // needs ~5 tokens hitting `name`); this leg exists for EXACT-IDENTIFIER recall, and on
+  // a generic prose query it should contribute nothing rather than decide the outcome.
+  // Applying the bar restores the honest cosine ranking (harness 5 of 12) and leaves
+  // genuine identifier matches — which score 0.33-0.96 — boosting exactly as before.
+  //
+  // Rank DENSELY over the qualifying set (filter first, then enumerate) rather than
+  // keeping each hit's index in the unfiltered list. A disqualified hit must not leave
+  // a rank GAP: the RRF term is 1/(k+rank), so an original-index rank would silently
+  // shrink a genuine identifier match's bonus in proportion to how much weak noise
+  // happened to precede it — making the bar's effect depend on the noise it removed.
+  //
+  // An UNSCORED entry is never dropped — the same contract `applyScoreFloor` states
+  // ("entries without a numeric score are never dropped; we can't judge them"). The
+  // live lexical leg always scores (token overlap), so this only spares hand-built
+  // callers and test doubles from being silently stripped of their boost.
+  const qualifyingLexical = lexicalHits.filter(
+    (e) => typeof e.score !== 'number' || e.score >= minLex,
+  );
   const lexRank = new Map<string, number>();
   const lexEntry = new Map<string, MemoryEntry>();
-  lexicalHits.forEach((e, i) => {
+  qualifyingLexical.forEach((e, i) => {
     const key = lexKeyOf(e);
     if (key && !lexRank.has(key)) {
       lexRank.set(key, i + 1);
@@ -143,11 +186,11 @@ export function fuse(
     }
   });
   if (mode === 'floored-union') {
-    // Admit lexical-ONLY hits that clear the identifier-precision bar.
+    // Admit lexical-ONLY hits. Every entry here already cleared `minLex` above (that
+    // filter is now the single application of the bar), so admission needs no re-check.
     for (const [key, rank] of lexRank) {
       if (candidate.has(key)) continue;
-      const e = lexEntry.get(key)!;
-      if ((e.score ?? 0) >= minLex) candidate.set(key, e);
+      candidate.set(key, lexEntry.get(key)!);
       void rank;
     }
   }

@@ -145,3 +145,48 @@ describe('fuse — cross-leg dedup via metadata.link_id', () => {
     expect(out.map((x) => x.id)).toEqual(['file_a']); // first (best-ranked) projection wins
   });
 });
+
+describe('fuse — minLexScore gates conferring a RANK, not just admission (WI-7154)', () => {
+  it('a weak lexical hit no longer confers an RRF bonus under cosine-gated', () => {
+    // Under cosine-gated the bar used to be dead code, so ANY lexical hit — however
+    // weak — handed its slot a full second RRF term. `weak` scores 0.05, far below the
+    // 0.3 default bar, so it must NOT overtake the better cosine candidate.
+    const out = fuse([e('better'), e('weak')], [e('weak', 0.05)], { mode: 'cosine-gated' });
+    expect(out.map((x) => x.id)).toEqual(['better', 'weak']);
+    expect(out[1].score).toBeCloseTo(1 / 62, 6); // cosine term only — no lexical bonus
+  });
+
+  it('a genuine identifier match still gets its boost', () => {
+    // Real exact-id matches score 0.33–0.96 on this leg, so the bar must not touch them.
+    const out = fuse([e('para'), e('exact')], [e('exact', 0.9)], { mode: 'cosine-gated' });
+    expect(out.map((x) => x.id)).toEqual(['exact', 'para']);
+    expect(out[0].score).toBeCloseTo(1 / 62 + 1 / 61, 6);
+  });
+
+  it('THE SCALE INVERSION: a small pool cannot win slots on weak lexical overlap alone', () => {
+    // The live shape of WI-7154. The lexical leg pulls `depth` PER SCOPE, so a tiny pool
+    // gets most of its corpus into the lexical list on generic token overlap while a large
+    // pool gets ~2% — and every one of those weak hits used to outweigh the entire cosine
+    // ordering. Measured live: the big pool held 5 of the cosine top-12 and 0 of 12 fused.
+    const big = ['b1', 'b2', 'b3', 'b4', 'b5'].map((id) => e(id)); // large pool, no lexical
+    const small = ['s1', 's2', 's3'].map((id) => e(id)); // small pool, weak lexical
+    const cosine = [big[0], big[1], small[0], big[2], small[1], big[3], small[2], big[4]];
+    const weakLexical = small.map((x) => e(x.id, 0.08)); // all below the bar
+
+    const out = fuse(cosine, weakLexical, { mode: 'cosine-gated' });
+    // Cosine order must survive: the big pool keeps its leading slots.
+    expect(out.slice(0, 2).map((x) => x.id)).toEqual(['b1', 'b2']);
+    // and the large pool is not shut out of the top half.
+    expect(out.slice(0, 4).filter((x) => x.id.startsWith('b')).length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('rank is DENSE over qualifying hits — filtered noise leaves no gap', () => {
+    // `real` sits at index 2 of the raw lexical list behind two sub-bar hits. Its bonus
+    // must be 1/(60+1), not 1/(60+3) — otherwise the bar's effect on a genuine match
+    // would depend on how much noise happened to precede it.
+    const out = fuse([e('real')], [e('n1', 0.01), e('n2', 0.02), e('real', 0.8)], {
+      mode: 'cosine-gated',
+    });
+    expect(out[0].score).toBeCloseTo(1 / 61 + 1 / 61, 6);
+  });
+});
