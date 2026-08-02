@@ -36,12 +36,37 @@ export const VEC_TABLE: Record<ResolvedVecMode, string> = {
   harrier: 'memory_vec_harrier',
 };
 
-/** Per-mode vector width — the wrong-width guard must match the mode's space
- *  (harrier is native-1024; every other shipped mode is 384). */
+/**
+ * Per-mode vector width — the wrong-width guard must match the mode's space.
+ *
+ * ⚠ THIS IS A STORAGE FACT: it states the width of each `memory_vec_<mode>`
+ * COLUMN, as created by its migration. It is deliberately NOT derived from
+ * `EMBEDDER_DIM_SPECS` — deriving it would let a change to a model's
+ * `targetDims` silently move the guard with no migration behind it, and the
+ * first symptom would be a pgvector INSERT failure inside a background sweep.
+ * The two are REQUIRED to agree, and `vec-write.test.ts` asserts that
+ * agreement, so a model width change without its migration reds a unit test.
+ * (Same rule, and the same reasoning, as `PROSE_VECTOR_DIMS` in
+ * packages/operator-core/lib/search/prose-vector-dims.ts.)
+ *
+ * gemma and openai moved 384 -> 768 with migration 727: gemma at
+ * EmbeddingGemma-300m's NATIVE width (384 was an untrained MRL cut that
+ * measured ~19-21% worse on prose retrieval, D-003/D-005), and openai
+ * alongside it so it stays prose-eligible (continuous MRL, billed per token
+ * not per dimension, so the width is free).
+ *
+ * NOT moved: `local` is bge-small-en-v1.5, natively 384 with no MRL — it
+ * CANNOT emit 768. `harrier` is native-1024 with no MRL at all.
+ *
+ * ⚠ A STALE ENTRY HERE FAILS SILENTLY, WHICH IS WHY IT IS EASY TO MISS: the
+ * guard below returns `false` on a width mismatch rather than throwing, so a
+ * mode left at the wrong width simply stops writing vectors — no error, no log,
+ * and semantic recall for that mode quietly degrades to nothing.
+ */
 export const MODE_DIMS: Record<ResolvedVecMode, number> = {
-  openai: 384,
+  openai: 768,
   local: 384,
-  gemma: 384,
+  gemma: 768,
   harrier: 1024,
 };
 
