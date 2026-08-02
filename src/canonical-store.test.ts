@@ -289,10 +289,23 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     expect(q.sql).toContain("NOT (payload ? 'entityType')");
     expect(q.sql).toContain("state != 'archived'");
     expect(q.sql).toContain("payload->>'user_id' = $1");
-    expect(q.sql).toContain("payload->>'data' ILIKE");
-    // P-002: all three weighted fields score, one shared param per token.
-    expect(q.sql).toContain("payload->>'name' ILIKE");
-    expect(q.sql).toContain("payload->>'description' ILIKE");
+    // WI-6966: the three weighted fields are PROJECTED ONCE each in the fenced
+    // subquery and matched/scored via their aliases — never re-extracted per token
+    // (each `payload->>'…'` detoasts the whole jsonb; per-token repetition was 28x
+    // the buffers). P-002: all three fields score, one shared param per token.
+    expect(q.sql).toContain("payload->>'name' AS nm");
+    expect(q.sql).toContain("payload->>'description' AS ds");
+    expect(q.sql).toContain("payload->>'data' AS dt");
+    expect(q.sql).toContain('dt ILIKE');
+    expect(q.sql).toContain('nm ILIKE');
+    expect(q.sql).toContain('ds ILIKE');
+    // Exactly one extraction per field, however many tokens the query has.
+    expect(q.sql.match(/payload->>'name'/g)).toHaveLength(1);
+    expect(q.sql.match(/payload->>'description'/g)).toHaveLength(1);
+    expect(q.sql.match(/payload->>'data'/g)).toHaveLength(1);
+    // The optimisation fence that stops the subquery being flattened back (which
+    // would re-inline the per-token extraction and silently restore the old cost).
+    expect(q.sql).toContain('OFFSET 0');
     expect(q.sql).not.toContain('memory_vec'); // never touches an embedding table
     expect(q.params).toContain('scope-a');
     expect(q.params).toContain('%embed%');
@@ -314,13 +327,20 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     await store.lexicalSearch('embed sidecar', 5, { user_id: 'u' });
     const { sql, params } = queries[0];
     // The weights live in SQL: name ×3 > description ×2 > data ×1, per token.
-    expect(sql).toContain("CASE WHEN payload->>'name' ILIKE");
+    expect(sql).toContain('CASE WHEN nm ILIKE');
     expect(sql).toContain('THEN 3 WHEN');
     expect(sql).toContain('THEN 2 WHEN');
     expect(sql).toContain('THEN 1 ELSE 0 END');
     // Ordered by that score; only scoring rows come back.
     expect(sql).toContain('ORDER BY lex_raw DESC');
-    expect(sql).toContain('WHERE lex_raw > 0');
+    // ⚠ WI-6966 — there must be NO outer `lex_raw > 0`. It is provably redundant
+    // given the token match predicate (a row scores > 0 iff ≥1 token hits ≥1 field,
+    // which is exactly that OR), and the planner pushes it back down into the SAME
+    // scan filter, so re-adding it re-evaluates the whole score chain per row on top
+    // of the match chain — measured 761 ms vs 430 ms at 24 tokens. Rows that score 0
+    // are already excluded by the match predicate below.
+    expect(sql).not.toContain('lex_raw > 0');
+    expect(sql).toMatch(/WHERE \(nm ILIKE/);
     // NOT a recency-ranked candidate pull, and no candidate cap above topK.
     expect(sql).not.toContain('ORDER BY created_at DESC');
     expect(params.at(-1)).toBe(5); // the only LIMIT is topK itself
