@@ -86,12 +86,17 @@ describe('every candidate can produce 384 without an untrained cut', () => {
   // 256 and degraded retrieval. Which model ships is decided by the prose
   // gold set (P-003), never by this file.
 
-  it('gemma@384 is an untrained cut, and only passes because it SAYS so', () => {
+  it('gemma@384 WOULD be an untrained cut — which is why gemma no longer takes it', () => {
+    // 384 is still not a trained gemma width; that fact has not changed. What
+    // changed (D-005) is that gemma no longer TARGETS it — the configured width
+    // is now the native 768, so there is no cut to acknowledge.
     expect(isTrainedDim(EMBEDDER_DIM_SPECS.gemma, 384)).toBe(false);
-    expect(EMBEDDER_DIM_SPECS.gemma.untrainedCut).toBeDefined();
-    // The acknowledgement is what makes the tradeoff reviewable — it is not a
-    // verdict that the cut is bad. D-003 found the cut itself blameless; the
-    // loss it flagged was ordinary width loss.
+    expect(EMBEDDER_DIM_SPECS.gemma.targetDims).toBe(768);
+    expect(
+      EMBEDDER_DIM_SPECS.gemma.untrainedCut,
+      'gemma targets its native width, so an untrainedCut ack here would be STALE — ' +
+        'and a stale ack silently pre-authorizes the next untrained cut (D-001).',
+    ).toBeUndefined();
   });
 
   it('granite97 is natively 384, so no truncation happens at all', () => {
