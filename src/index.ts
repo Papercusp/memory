@@ -57,7 +57,9 @@ export {
   type MemoryEntry,
   type ScoreScale,
   type RememberOptions,
+  type SearchFloorPolicy,
   type SearchOptions,
+  type SearchOptionsCommon,
   type UpdatePatch,
 } from './backend';
 export { Mem0Backend, extractAddedIds, type Mem0BackendDeps } from './mem0-backend';
