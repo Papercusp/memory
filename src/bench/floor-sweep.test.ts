@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { queryLevelPRF, renderFloorSweepMarkdown } from './floor-sweep';
-import type { QueryOutcome } from './types';
+import { queryLevelPRF, renderFloorSweepMarkdown, runFloorSweep } from './floor-sweep';
+import type { GoldQuery, QueryOutcome } from './types';
+import type { MemoryBackend } from '../backend';
 
 const pos = (id: string, hit: boolean): QueryOutcome => ({
   queryId: id,

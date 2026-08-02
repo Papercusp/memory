@@ -78,6 +78,23 @@ export interface FloorSweepOptions {
   limit?: number;
   concurrency?: number;
   judgeK?: number;
+  /**
+   * The ADMISSION SHAPE to sweep under. **Pass the one the caller's real path
+   * runs** — a sweep under a different fusion mode measures a different system
+   * and its recommended floor does not transfer.
+   *
+   * This was previously unset, so every sweep silently inherited the backend
+   * default (`floored-union`). Under that mode the lexical leg admits
+   * INDEPENDENTLY of `minScore`, so raising the floor frees cosine slots that
+   * the lexical leg immediately backfills — the sweep then reports a floor
+   * that barely moves precision, which is a property of the mode, not of the
+   * floor. A caller whose real path is `cosine-gated` (where membership IS
+   * governed by the cosine floor) would act on a number measured against
+   * machinery it does not run.
+   */
+  fusionMode?: 'floored-union' | 'cosine-gated';
+  /** Lexical admission bar, for a caller whose real path tightens it. */
+  minLexScore?: number;
   onProgress?: (floor: number, done: number, total: number) => void;
 }
 
@@ -98,6 +115,8 @@ export async function runFloorSweep(
       limit: opts.limit ?? 10,
       concurrency: opts.concurrency ?? 4,
       ...(floor > 0 ? { minScore: floor } : {}),
+      ...(opts.fusionMode !== undefined ? { fusionMode: opts.fusionMode } : {}),
+      ...(opts.minLexScore !== undefined ? { minLexScore: opts.minLexScore } : {}),
       onProgress: opts.onProgress ? (d, t) => opts.onProgress!(floor, d, t) : undefined,
     });
     const positivesEmptied = res.perQuery.filter((o) => o.expected.length > 0 && o.rawHits === 0).length;
