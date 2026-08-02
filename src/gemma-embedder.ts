@@ -129,9 +129,19 @@ type Pipeline = (text: string, opts: unknown) => Promise<{ data: Float32Array }>
  * only for genuine, permanent unavailability; a crashed worker instead
  * self-heals via `ensureWorker`'s respawn), so a transient failure costs at
  * most one degraded call.
+ *
+ * `dims` overrides the truncation width for MEASUREMENT ONLY (the P-002 MRL
+ * sweep scores 768/512/384/256 against one gold set), mirroring the `dims`
+ * knob `buildHarrierEmbedder` already carries. It deliberately does NOT
+ * weaken D-001: the DEFAULT is still derived from `EMBEDDER_DIM_SPECS`, so
+ * every production caller — which passes no `dims` — remains bound to the
+ * declared, guard-checked target, and a bench leg cannot change what ships.
  */
-export function buildGemmaEmbedder(opts: { kind: GemmaEmbedKind }): (text: string) => Promise<number[]> {
-  const { kind } = opts;
+export function buildGemmaEmbedder(opts: {
+  kind: GemmaEmbedKind;
+  dims?: number;
+}): (text: string) => Promise<number[]> {
+  const { kind, dims = GEMMA_TARGET_DIMS } = opts;
   let pipelinePromise: Promise<Pipeline> | null = null;
 
   return async (text: string): Promise<number[]> => {
@@ -141,7 +151,7 @@ export function buildGemmaEmbedder(opts: { kind: GemmaEmbedKind }): (text: strin
       try {
         // normalize:false — MRL requires truncate-then-normalize, done below.
         const full = await embedViaWorker(prompted, { model: GEMMA_MODEL, normalize: false });
-        return mrlTruncate(full, GEMMA_TARGET_DIMS);
+        return mrlTruncate(full, dims);
       } catch (err) {
         warnEmbedFallback('gemma', err);
       }
@@ -157,6 +167,6 @@ export function buildGemmaEmbedder(opts: { kind: GemmaEmbedKind }): (text: strin
     }
     const pipe = await pipelinePromise;
     const result = await pipe(prompted, { pooling: 'mean', normalize: false });
-    return mrlTruncate(Array.from(result.data), GEMMA_TARGET_DIMS);
+    return mrlTruncate(Array.from(result.data), dims);
   };
 }

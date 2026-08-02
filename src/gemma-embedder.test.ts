@@ -48,6 +48,41 @@ describe('mrlTruncate (MRL 768→384 + renormalize)', () => {
   it('leaves a vector already at/under the target untouched in length', () => {
     expect(mrlTruncate([3, 4], 384)).toHaveLength(2); // shorter than target → sliced-noop
   });
+
+  /**
+   * TRUNCATION IS TRANSITIVE — the property the P-002 MRL sweep is built on.
+   *
+   * Scoring gemma@768/512/384/256 as four independent legs would cost four
+   * ~16-minute corpus passes over prose-corpus.v1. It costs ONE, because
+   * re-truncating an already-truncated vector equals truncating the raw
+   * vector to the same width: mrlTruncate renormalizes, and normalization
+   * cancels any positive scalar, so the intermediate renorm leaves no trace.
+   *
+   * If this ever stopped holding, the sweep would silently be comparing
+   * doubly-normalized vectors against singly-normalized ones and attributing
+   * the difference to DIMENSION — a wrong verdict that no metric would flag.
+   * Hence a test rather than a comment.
+   */
+  it('is TRANSITIVE: truncating via an intermediate width equals truncating directly', () => {
+    // Deliberately not smooth/monotonic — a decaying sinusoid gives each
+    // prefix a genuinely different norm, so an accidental no-op would show.
+    const raw = Array.from({ length: 768 }, (_, i) => Math.sin(i * 0.7) * Math.exp(-i / 400) + 0.01 * i);
+
+    for (const [via, target] of [
+      [768, 384],
+      [768, 512],
+      [768, 256],
+      [512, 256],
+    ] as const) {
+      const direct = mrlTruncate(raw, target);
+      const derived = mrlTruncate(mrlTruncate(raw, via), target);
+      expect(derived).toHaveLength(target);
+      for (let i = 0; i < target; i++) expect(derived[i]).toBeCloseTo(direct[i], 10);
+      // And the pair is cosine-identical, which is what retrieval actually sees.
+      const cos = direct.reduce((s, x, i) => s + x * derived[i], 0);
+      expect(cos).toBeCloseTo(1, 10);
+    }
+  });
 });
 
 describe('gemmaPrompt (asymmetric task prompts)', () => {
