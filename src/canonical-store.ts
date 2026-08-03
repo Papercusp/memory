@@ -41,7 +41,7 @@
  * segregated retroactively, no backfill needed).
  */
 
-import { Pool as PgPool } from 'pg';
+import { Pool as PgPool, type QueryResult } from 'pg';
 
 interface VectorStoreResult {
   id: string;
@@ -310,6 +310,84 @@ export class CanonicalVectorStore {
     return this.pool;
   }
 
+  /**
+   * Whether this server understands `hnsw.iterative_scan` (pgvector >= 0.8).
+   * Probed ONCE per store and cached. An older build rejects the GUC with
+   * `unrecognized configuration parameter`, so we must never assume it
+   * exists — failing open (a narrower result) beats failing search entirely.
+   */
+  private iterativeScanSupport: Promise<boolean> | null = null;
+
+  private probeIterativeScan(pool: PgPool): Promise<boolean> {
+    if (!this.iterativeScanSupport) {
+      this.iterativeScanSupport = (async () => {
+        const conn = await pool.connect();
+        try {
+          await conn.query('BEGIN');
+          await conn.query(`SET LOCAL hnsw.iterative_scan = relaxed_order`);
+          return true;
+        } catch {
+          return false;
+        } finally {
+          // The failing SET aborts the transaction; roll back before the
+          // connection goes home to the pool.
+          try {
+            await conn.query('ROLLBACK');
+          } catch {
+            /* already aborted / disconnected — nothing to unwind */
+          }
+          conn.release();
+        }
+      })();
+    }
+    return this.iterativeScanSupport;
+  }
+
+  /**
+   * Run the vector search with HNSW *iterative* scanning enabled.
+   *
+   * Why this is required rather than a tuning nicety: the scope predicate
+   * (`c.payload->>'user_id'`) lives on the JOINED canonical table, so
+   * Postgres can only apply it AFTER the approximate index scan has already
+   * chosen its candidate set. Without iterative scanning that scan stops at
+   * `hnsw.ef_search` (default 40) candidates, and any scope whose rows are
+   * not among those 40 silently yields FEWER rows than LIMIT — with no error
+   * and no signal to the caller. Measured on the live store 2026-08-02
+   * (EI-19386910150607131): a `LIMIT 12` scoped pull returned **0 rows**
+   * against **18,510 eligible** ones. Iterative scanning keeps scanning
+   * until LIMIT is satisfied, bounded by `hnsw.max_scan_tuples` (default
+   * 20k), so a starved scope degrades to "fewer than asked" instead of zero.
+   *
+   * `relaxed_order` over `strict_order`: measured identical top-12 and
+   * identical worst score on the live store at ~4x the speed (8.6ms vs
+   * 35.2ms), and every caller re-ranks downstream anyway.
+   */
+  private async runVectorSearch(
+    pool: PgPool,
+    sql: string,
+    params: unknown[],
+  ): Promise<QueryResult> {
+    if (!(await this.probeIterativeScan(pool))) return pool.query(sql, params);
+    const conn = await pool.connect();
+    try {
+      // SET LOCAL needs a transaction; READ ONLY keeps it honest.
+      await conn.query('BEGIN READ ONLY');
+      await conn.query(`SET LOCAL hnsw.iterative_scan = relaxed_order`);
+      const res = await conn.query(sql, params);
+      await conn.query('COMMIT');
+      return res;
+    } catch (err) {
+      try {
+        await conn.query('ROLLBACK');
+      } catch {
+        /* already aborted / disconnected — nothing to unwind */
+      }
+      throw err;
+    } finally {
+      conn.release();
+    }
+  }
+
   async initialize(): Promise<void> {
     // Schema lives in migration 081 (libs/papercusp/libs/db/sql/),
     // applied at embedded-PG boot. Nothing to do per-instance.
@@ -418,7 +496,7 @@ export class CanonicalVectorStore {
       ORDER BY v.vector <=> $1::vector
       LIMIT $2
     `;
-    const res = await client.query(sql, params);
+    const res = await this.runVectorSearch(client, sql, params);
     return res.rows.map(
       (r: {
         id: string;
