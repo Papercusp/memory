@@ -68,7 +68,40 @@ describe('buildHarrierEmbedder — non-sticky worker fallback (EI-16184)', () =>
     vi.resetModules();
   });
 
+  /**
+   * Stub the INLINE (main-thread) fallback so these tests keep this file's
+   * stated contract — pin the worker-retry semantics "WITHOUT loading the ~0.6B
+   * model" (see the file header). Both tests below deliberately drive the
+   * embedder down the inline path, which really did `pipeline(...)` the
+   * onnx-community/harrier-oss-v1-0.6b-ONNX build: ~5-7s of real model load for
+   * a test whose subject is worker RETRY, not inference. That straddled vitest's
+   * 5s default and red-pinned the fleet green-checkpoint on candidate a94547c8
+   * ("Test timed out in 5000ms") while passing on a warm/idle box — a genuine
+   * timing flake, so the fix is to remove the real-resource dependency rather
+   * than widen the timeout. Real model loading stays covered by the P-006
+   * bake-off smoke, so no coverage moves.
+   *
+   * It must be `./dynamic-import` and not '@huggingface/transformers':
+   * dynamicImport() resolves the package through `new Function('s','return
+   * import(s)')` specifically to hide it from bundler static analysis, and that
+   * also puts it beyond vitest's module interception — mocking the package name
+   * would silently no-op and load the real model anyway.
+   */
+  const stubInlineModel = () => {
+    vi.doMock('./dynamic-import', () => ({
+      dynamicImport: async () => ({
+        pipeline: async () => ({
+          tokenizer: () => ({}),
+          model: async () => ({
+            [HARRIER_GRAPH_OUTPUT]: { data: new Float32Array(HARRIER_NATIVE_DIMS).fill(0.05) },
+          }),
+        }),
+      }),
+    }));
+  };
+
   it('retries the worker path on the NEXT call after a transient failure — does not stick to inline forever', async () => {
+    stubInlineModel();
     const embedViaWorker = vi
       .fn()
       .mockRejectedValueOnce(new Error('transient worker hiccup'))
@@ -94,6 +127,7 @@ describe('buildHarrierEmbedder — non-sticky worker fallback (EI-16184)', () =>
   });
 
   it('skips the worker entirely once the module reports genuine, permanent unavailability', async () => {
+    stubInlineModel();
     const embedViaWorker = vi.fn().mockResolvedValue(new Array(HARRIER_NATIVE_DIMS).fill(0.1));
     const getWorkerState = vi.fn(() => ({ alive: false, disabled: true, pendingCount: 0 }));
     const warnEmbedFallback = vi.fn();
