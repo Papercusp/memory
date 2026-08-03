@@ -19,12 +19,13 @@
  *
  * and become selectable by that name with zero handler changes.
  *
- * Both the registry and the instance cache live on `Symbol.for`-keyed
- * process-global slots — the same fork-safety trick as ./config's host
- * slot (under tsx the package can load twice via the node_modules
- * symlink; module-level singletons would split).
+ * Both the registry and the instance cache live in ONE state object pinned
+ * to the realm by `@papercusp/module-singleton` — the same fork-safety trick
+ * as ./config's host slot (under tsx the package can load twice via the
+ * node_modules symlink; module-level singletons would split).
  */
 
+import { pinModuleState } from '@papercusp/module-singleton';
 import type { MemoryBackend } from './backend';
 import { isMemoryConfigured, memoryHost } from './config';
 import { Mem0Backend } from './mem0-backend';
@@ -32,29 +33,50 @@ import { NoopBackend } from './noop-backend';
 
 type BackendFactory = () => MemoryBackend;
 
-const REGISTRY_KEY = Symbol.for('@papercusp/memory:backend-registry');
-const INSTANCES_KEY = Symbol.for('@papercusp/memory:backend-instances');
+/**
+ * The pin key — also the id this module reports under in
+ * `listModuleDuplications()`, so a split here is visible in the REALM-WIDE
+ * report rather than only through this module's own accessors.
+ *
+ * This module previously hand-rolled TWO `Symbol.for` slots
+ * (`:backend-registry` + `:backend-instances`). They are now ONE pinned state
+ * object under the first of those two strings, because `evaluations` is only a
+ * module-RECORD count when `pinModuleState` is called exactly once per module
+ * evaluation — two keys from one module body would double-count the same
+ * record. Nothing outside this file ever referenced either symbol
+ * (EI-19469900474673886 verified this repo-wide before collapsing them).
+ */
+const STATE_KEY = '@papercusp/memory:backend-registry';
 
-type RegistryGlobal = typeof globalThis & {
-  [REGISTRY_KEY]?: Map<string, BackendFactory>;
-  [INSTANCES_KEY]?: Map<string, MemoryBackend>;
-};
+interface BackendRegistryState {
+  registry: Map<string, BackendFactory>;
+  instances: Map<string, MemoryBackend>;
+}
+
+/** The built-ins, re-seeded on reset. Factories, not instances — nothing is constructed here. */
+function builtinFactories(): Map<string, BackendFactory> {
+  return new Map<string, BackendFactory>([
+    ['mem0', () => new Mem0Backend()],
+    ['noop', () => new NoopBackend()],
+  ]);
+}
+
+/**
+ * Pinned + counted rather than hand-rolled. Must stay at module scope: moving
+ * this inside a function would make `evaluations` count CALLS instead of module
+ * records, and the duplication report would become meaningless for this key.
+ */
+const state = pinModuleState<BackendRegistryState>(STATE_KEY, () => ({
+  registry: builtinFactories(),
+  instances: new Map<string, MemoryBackend>(),
+}));
 
 function registry(): Map<string, BackendFactory> {
-  const g = globalThis as RegistryGlobal;
-  if (!g[REGISTRY_KEY]) {
-    g[REGISTRY_KEY] = new Map<string, BackendFactory>([
-      ['mem0', () => new Mem0Backend()],
-      ['noop', () => new NoopBackend()],
-    ]);
-  }
-  return g[REGISTRY_KEY];
+  return state.registry;
 }
 
 function instances(): Map<string, MemoryBackend> {
-  const g = globalThis as RegistryGlobal;
-  if (!g[INSTANCES_KEY]) g[INSTANCES_KEY] = new Map();
-  return g[INSTANCES_KEY];
+  return state.instances;
 }
 
 /**
@@ -102,9 +124,15 @@ export function getMemoryBackend(): MemoryBackend {
   return built;
 }
 
-/** Test hook: drop cached instances + custom registrations (built-ins re-seed lazily). */
+/**
+ * Test hook: drop cached instances + custom registrations (built-ins re-seed).
+ *
+ * Clears IN PLACE rather than replacing the pinned state object: every module
+ * record holds a reference to that one object, so swapping it out would detach
+ * the other records — reintroducing the very split the pin exists to close.
+ */
 export function _resetMemoryBackendsForTest(): void {
-  const g = globalThis as RegistryGlobal;
-  delete g[INSTANCES_KEY];
-  delete g[REGISTRY_KEY];
+  state.instances.clear();
+  state.registry.clear();
+  for (const [name, factory] of builtinFactories()) state.registry.set(name, factory);
 }

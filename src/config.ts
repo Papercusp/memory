@@ -15,6 +15,8 @@
  */
 
 /** An embedder: text in, a fixed-dimension vector out. */
+import { pinModuleState } from '@papercusp/module-singleton';
+
 export type EmbedFn = (text: string) => Promise<number[]>;
 
 /**
@@ -135,11 +137,27 @@ export function memorySchema(): string {
 // lib/memory/configure.ts) sets `_host` on one, while the store's own
 // `await import('./mem0-connection')` reads `memoryHost()` from the other
 // → "@papercusp/memory is not configured" and memory is dead at runtime.
-// `Symbol.for` keys the global registry, so every forked instance shares
-// this one slot. (require.resolve canonicalizes to one realpath, which is
-// why this only bit the ESM/tsx path, not CJS.)
-const HOST_KEY = Symbol.for('@papercusp/memory:host');
-type HostGlobal = typeof globalThis & { [HOST_KEY]?: MemoryHost | null };
+// `@papercusp/module-singleton` keys that shared slot, so every forked
+// instance sees this one state object. (require.resolve canonicalizes to one
+// realpath, which is why this only bit the ESM/tsx path, not CJS.)
+//
+// It is pinned THROUGH the primitive rather than hand-rolled on
+// `globalThis[Symbol.for(...)]` (EI-19469900474673886): a hand-rolled slot
+// fixes correctness but leaves the split invisible to
+// `listModuleDuplications()`, so the central report answers a clean `[]` while
+// this module is duplicated — the same "the detector cannot see its subject"
+// shape as the outage that motivated the primitive (EI-19451658870832332).
+//
+// The key string is unchanged from the old `Symbol.for(...)` description, and
+// the call must stay at module scope: `evaluations` is only a module-RECORD
+// count if it runs exactly once per evaluation of this body.
+const STATE_KEY = '@papercusp/memory:host';
+
+interface MemoryConfigState {
+  host: MemoryHost | null | undefined;
+}
+
+const state = pinModuleState<MemoryConfigState>(STATE_KEY, () => ({ host: undefined }));
 
 /**
  * Wire the operator host seams. Call once at module load (the operator's
@@ -147,12 +165,12 @@ type HostGlobal = typeof globalThis & { [HOST_KEY]?: MemoryHost | null };
  * last call wins.
  */
 export function configureMemory(host: MemoryHost): void {
-  (globalThis as HostGlobal)[HOST_KEY] = host;
+  state.host = host;
 }
 
 /** Internal accessor — throws if the host hasn't been configured yet. */
 export function memoryHost(): MemoryHost {
-  const host = (globalThis as HostGlobal)[HOST_KEY];
+  const host = state.host;
   if (!host) {
     throw new Error(
       '@papercusp/memory is not configured — call configureMemory({ … }) before using the store (the operator does this in lib/memory/configure.ts).',
@@ -163,5 +181,17 @@ export function memoryHost(): MemoryHost {
 
 /** Test/diagnostic helper: is a host wired? */
 export function isMemoryConfigured(): boolean {
-  return (globalThis as HostGlobal)[HOST_KEY] != null;
+  return state.host != null;
+}
+
+/**
+ * Test hook: set the host slot directly, including to `null`/`undefined`.
+ *
+ * Exists so tests reset through THIS module instead of reaching past it into
+ * `globalThis`. A test that pokes the storage location by hand keeps compiling
+ * and keeps "passing" after the storage moves — it just stops resetting
+ * anything, which is a guard that silently stops guarding.
+ */
+export function __setMemoryHostForTests(host: MemoryHost | null | undefined): void {
+  state.host = host;
 }
