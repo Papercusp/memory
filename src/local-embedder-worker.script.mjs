@@ -26,6 +26,30 @@ const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
 // spin pool → hundreds of busy-waiting threads, loadavg 2000-3000, host-wide
 // stutter (WI-3792, 2026-07-10 — the EmbeddingGemma-default rollout day).
 // Embeds are single-request, latency-tolerant background work: cap the pool.
+//
+// GPU (CUDA) IS DELIBERATELY OUT OF SCOPE — this is CPU-only ON PURPOSE, not
+// an oversight (EI-19363236885307403, 2026-08-02). `onnxruntime-node` ships
+// libonnxruntime_providers_cuda.so, which makes CUDA LOOK available even on
+// this host's idle RTX 3090 — but loading it fails at pipeline-construction
+// time (not at import, not in `nvidia-smi`) on `libcudnn.so.9: cannot open
+// shared object file`: cuDNN 9 is not installed, and Ubuntu's `nvidia-cudnn`
+// apt package only offers cuDNN **8**, so apt cannot close the gap at all.
+// A real cuDNN 9 IS available with no apt/driver involvement at all — the
+// `nvidia-cudnn-cu12` PyPI wheel ships libcudnn.so.9 as plain userspace .so
+// files (no dkms, no kernel module, no risk to the host's live display
+// session) — but wiring that in for real needs: (1) installing + pointing
+// LD_LIBRARY_PATH at it for every process context that spawns this worker
+// (main host, every sidecar, cluster workers — not just this file), (2) a
+// `device:'cuda'` opt-in here with a try/catch fallback to the CPU path
+// above so a host without cuDNN 9 still works, and (3) a thread/session
+// guard for the CUDA provider analogous to the CPU one above so a shared,
+// multi-process host doesn't repeat the WI-3792 failure mode against GPU
+// memory/contexts instead of CPU threads. That is real infra work across a
+// shared production host, not a one-line flag flip — it was deliberately
+// NOT done inside this fix. If the perf need (see EI-19363236885307403 —
+// ~24h single-worker for a one-time 395k-vector re-embed, ~30min/day
+// steady-state CPU) becomes pressing, start from the pip-wheel path above,
+// not from apt.
 const ORT_SESSION_OPTIONS = { intraOpNumThreads: 4, interOpNumThreads: 1 };
 
 // One warm pipeline PER model id, so a process mixing BGE (default local) and
