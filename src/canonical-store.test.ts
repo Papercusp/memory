@@ -24,13 +24,28 @@ import {
 
 type CapturedQuery = { sql: string; params: unknown[] };
 
-function makeStore(collectionName: string): { store: CanonicalVectorStore; queries: CapturedQuery[] } {
+/** BEGIN / COMMIT / ROLLBACK / SET LOCAL — transaction scaffolding, not data. */
+const CONTROL_SQL = /^\s*(BEGIN|COMMIT|ROLLBACK|SET LOCAL)\b/i;
+
+function makeStore(collectionName: string): {
+  store: CanonicalVectorStore;
+  /** Data queries only — the SQL these tests pin. */
+  queries: CapturedQuery[];
+  /** Every statement incl. the transaction scaffolding search() wraps itself in. */
+  allQueries: CapturedQuery[];
+} {
   const queries: CapturedQuery[] = [];
+  const allQueries: CapturedQuery[] = [];
+  const record = async (sql: string, params: unknown[] = []) => {
+    allQueries.push({ sql, params });
+    if (!CONTROL_SQL.test(sql)) queries.push({ sql, params });
+    return { rows: [{ n: 0 }], rowCount: 0 };
+  };
   const fakePool = {
-    query: vi.fn(async (sql: string, params: unknown[] = []) => {
-      queries.push({ sql, params });
-      return { rows: [{ n: 0 }], rowCount: 0 };
-    }),
+    query: vi.fn(record),
+    // search() checks out a dedicated connection so it can SET LOCAL the
+    // HNSW iterative-scan GUC inside a transaction (EI-19386910150607131).
+    connect: vi.fn(async () => ({ query: vi.fn(record), release: () => {} })),
     on: () => {},
   };
   const cfg: CanonicalStoreConfig = {
@@ -46,7 +61,7 @@ function makeStore(collectionName: string): { store: CanonicalVectorStore; queri
   };
   const store = new CanonicalVectorStore(cfg);
   (store as unknown as { pool: unknown }).pool = fakePool;
-  return { store, queries };
+  return { store, queries, allQueries };
 }
 
 const VEC = [0.1, 0.2, 0.3];
@@ -645,5 +660,83 @@ describe('foldValidity', () => {
       superseded_by: null,
       status: 'current',
     });
+  });
+});
+
+/**
+ * HNSW post-filter under-retrieval (EI-19386910150607131).
+ *
+ * The scope predicate lives on the JOINED canonical table, so it can only be
+ * applied AFTER the approximate index scan has picked its candidates. Without
+ * `hnsw.iterative_scan` the scan stops at ef_search (default 40) candidates
+ * and a scoped pull silently returns FEWER rows than LIMIT — measured on the
+ * live store: 0 rows for LIMIT 12 against 18,510 eligible rows.
+ *
+ * These pin the mechanism (the GUC is set, in a transaction, BEFORE the
+ * search, and is not required for correctness on an older pgvector). The
+ * retrieval-count proof itself is the live-store measurement on the item.
+ */
+describe('CanonicalVectorStore HNSW iterative scan', () => {
+  it('sets hnsw.iterative_scan in a transaction BEFORE the search runs', async () => {
+    const { store, allQueries } = makeStore('operator_memory_local');
+    await store.search(VEC, 12, { user_id: 'harness:papercusp' });
+
+    const searchIdx = allQueries.findIndex((q) => q.sql.includes('ORDER BY v.vector'));
+    expect(searchIdx).toBeGreaterThanOrEqual(0);
+    // The SET that matters is the one guarding THIS search, not the one-off
+    // support probe that ran before it.
+    const setIdx = allQueries.findIndex(
+      (q, i) => i < searchIdx && /SET LOCAL hnsw\.iterative_scan/i.test(q.sql) && i > 0,
+    );
+    expect(setIdx).toBeGreaterThanOrEqual(0);
+    // A SET LOCAL issued after the query would be a silent no-op.
+    expect(setIdx).toBeLessThan(searchIdx);
+    // ...and it must be inside a transaction, or SET LOCAL does nothing.
+    expect(allQueries.slice(0, setIdx).some((q) => /^\s*BEGIN/i.test(q.sql))).toBe(true);
+    expect(allQueries.slice(searchIdx).some((q) => /^\s*COMMIT/i.test(q.sql))).toBe(true);
+  });
+
+  it('still returns rows when the server has no iterative_scan (pgvector < 0.8)', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    const pool = (store as unknown as { pool: { connect: unknown } }).pool;
+    // Old pgvector rejects the GUC outright; search must fail OPEN, not throw.
+    pool.connect = vi.fn(async () => ({
+      query: vi.fn(async (sql: string) => {
+        if (/SET LOCAL hnsw\.iterative_scan/i.test(sql)) {
+          throw new Error('unrecognized configuration parameter "hnsw.iterative_scan"');
+        }
+        return { rows: [], rowCount: 0 };
+      }),
+      release: () => {},
+    }));
+
+    // Resolves rather than throwing — the GUC is an optimization, not a
+    // correctness requirement, so an old server degrades to the old behavior.
+    await expect(store.search(VEC, 12, { user_id: 'harness:papercusp' })).resolves.toBeInstanceOf(
+      Array,
+    );
+    // ...and the search itself still went out, on the plain pool path.
+    expect(queries.some((q) => q.sql.includes('ORDER BY v.vector'))).toBe(true);
+  });
+
+  it('rolls back rather than leaking an aborted connection when the search throws', async () => {
+    const { store } = makeStore('operator_memory_local');
+    const seen: string[] = [];
+    let released = false;
+    const pool = (store as unknown as { pool: { connect: unknown } }).pool;
+    pool.connect = vi.fn(async () => ({
+      query: vi.fn(async (sql: string) => {
+        seen.push(sql.trim());
+        if (sql.includes('ORDER BY v.vector')) throw new Error('boom');
+        return { rows: [], rowCount: 0 };
+      }),
+      release: () => {
+        released = true;
+      },
+    }));
+
+    await expect(store.search(VEC, 12, { user_id: 'harness:papercusp' })).rejects.toThrow('boom');
+    expect(seen.some((s) => /^ROLLBACK/i.test(s))).toBe(true);
+    expect(released).toBe(true);
   });
 });
