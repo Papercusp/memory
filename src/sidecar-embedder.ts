@@ -62,6 +62,47 @@ export interface SidecarEmbedResponse {
 }
 
 export const DEFAULT_SIDECAR_TIMEOUT_MS = 15_000;
+
+/**
+ * Per-text allowance added on top of the base budget for a BATCH embed.
+ *
+ * WHY A BATCH CANNOT INHERIT THE SINGLE-EMBED DEFAULT (EI-19464574865993243):
+ * `DEFAULT_SIDECAR_TIMEOUT_MS` is a budget for ONE embed. `sidecarEmbedBatch`
+ * accepts `texts[]`, so a caller that omits `timeoutMs` silently gives N texts
+ * the deadline sized for one — and every real caller omitted it. Measured
+ * 2026-08-03 on papercup-bg-host: `embedBatchSize` is 128 on a server-tier box
+ * and the observed throughput is ~0.22s/text, so a full batch needs ~28s and
+ * was being aborted at 15s on EVERY sweep for hours. The AbortController fires,
+ * fetch rejects with "This operation was aborted", and embed-backfill falls back
+ * to the per-row path — same rows embedded, same success counts, just ~N× slower.
+ *
+ * The failure is HARDWARE-TIERED, which is why it hid: a laptop profile batches
+ * 32 (~7s, fits in 15s) and works fine. The bigger the box, the more certainly
+ * the batch optimization disables itself — it broke exactly where it was meant
+ * to pay off.
+ *
+ * 1s/text is ~4.5× the measured cost: this ceiling exists to catch a SICK
+ * sidecar, not to pace a healthy one, and a false abort here costs the entire
+ * batch optimization (this bug). Erring long is the cheap direction.
+ */
+export const SIDECAR_BATCH_PER_TEXT_MS = 1_000;
+
+/** Absolute ceiling for a batch budget, so a huge `texts[]` cannot produce an
+ *  effectively unbounded request. */
+export const SIDECAR_BATCH_TIMEOUT_CAP_MS = 180_000;
+
+/**
+ * The default budget for a batch of `textCount` texts. Exported so a caller
+ * that also imposes its OWN outer bound can derive it from the SAME number
+ * instead of picking a second one — two independently-chosen deadlines where
+ * the tighter silently wins is precisely how this bug survived: embed-backfill
+ * wrapped the batch in a deliberate 90s race, which could never fire, because
+ * this client aborted it at 15s first.
+ */
+export function sidecarBatchTimeoutMs(textCount: number): number {
+  const scaled = DEFAULT_SIDECAR_TIMEOUT_MS + SIDECAR_BATCH_PER_TEXT_MS * Math.max(0, textCount - 1);
+  return Math.min(SIDECAR_BATCH_TIMEOUT_CAP_MS, scaled);
+}
 /** Attempts per embed when the sidecar is required (fast failures only — the
  *  shared `timeoutMs` budget caps total wall time regardless). */
 export const DEFAULT_SIDECAR_MAX_ATTEMPTS = 3;
@@ -110,8 +151,10 @@ export function isNonRetryableSidecarError(e: unknown): boolean {
  */
 export async function sidecarEmbedBatch(url: string, opts: SidecarEmbedBatchOpts): Promise<SidecarEmbedResponse> {
   const fetchFn = opts.fetchFn ?? fetch;
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_SIDECAR_TIMEOUT_MS;
   const texts = opts.texts.map((t) => (t.length > SIDECAR_MAX_TEXT_CHARS ? t.slice(0, SIDECAR_MAX_TEXT_CHARS) : t));
+  // Scales with the batch: the single-embed default aborts a full batch mid-flight
+  // and every caller omitted `timeoutMs` (EI-19464574865993243).
+  const timeoutMs = opts.timeoutMs ?? sidecarBatchTimeoutMs(texts.length);
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {

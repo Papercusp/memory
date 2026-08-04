@@ -13,7 +13,7 @@
  *    vector for the same text. (The live bit-identical proof against a real
  *    model runs in the P-005 smoke.)
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
@@ -22,6 +22,9 @@ import {
   sidecarEmbedBatch,
   EMBED_SIDECAR_URL_ENV,
   SIDECAR_MAX_TEXT_CHARS,
+  DEFAULT_SIDECAR_TIMEOUT_MS,
+  SIDECAR_BATCH_TIMEOUT_CAP_MS,
+  sidecarBatchTimeoutMs,
   SidecarEmbedHttpError,
   isNonRetryableSidecarError,
 } from './sidecar-embedder';
@@ -147,6 +150,62 @@ describe('sidecarEmbedBatch', () => {
     const sent = (stub.requests[0] as { texts: string[] }).texts;
     expect(sent[0].length).toBe(SIDECAR_MAX_TEXT_CHARS);
     expect(sent[1]).toBe('short'); // untouched
+  });
+
+  /**
+   * RECURRENCE GUARD for EI-19464574865993243.
+   *
+   * `timeoutMs` used to default to DEFAULT_SIDECAR_TIMEOUT_MS — a budget for ONE
+   * embed — while the function accepts `texts[]`. Every real caller omitted it,
+   * so a 128-text batch got 15s, aborted mid-flight on every sweep, and
+   * embed-backfill fell back to the per-row path. Nothing went red: the same
+   * rows were embedded and the sweep reported success, just ~N× slower.
+   *
+   * Asserted on the ABORT SIGNAL under fake timers rather than by sleeping, so
+   * the guard is deterministic and costs no wall time. It fails in BOTH
+   * directions: a regression to the flat default trips the batch expectation,
+   * and a change that stopped bounding batches entirely trips the last one.
+   */
+  it('scales the default timeout with batch size — a batch never inherits the single-embed budget', async () => {
+    vi.useFakeTimers();
+    try {
+      const signals: AbortSignal[] = [];
+      const captureSignal = ((_url: string, init: { signal: AbortSignal }) => {
+        signals.push(init.signal);
+        return new Promise<Response>(() => {}); // never settles; the signal is the subject
+      }) as unknown as typeof fetch;
+
+      const start = (count: number) =>
+        void sidecarEmbedBatch('http://stub', {
+          model: 'gemma',
+          kind: 'document',
+          texts: Array.from({ length: count }, (_, i) => `t${i}`),
+          fetchFn: captureSignal,
+        });
+
+      start(128); // a real server-tier batch (resource-profile embedBatchSize)
+      start(1); // the single-embed case, which must be unchanged
+      await Promise.resolve();
+      expect(signals).toHaveLength(2);
+      const [batchSignal, soloSignal] = signals;
+
+      vi.advanceTimersByTime(DEFAULT_SIDECAR_TIMEOUT_MS + 1_000);
+      expect(soloSignal.aborted).toBe(true); // single embed: budget unchanged
+      expect(batchSignal.aborted).toBe(false); // THE BUG: a batch must outlive 15s
+
+      vi.advanceTimersByTime(sidecarBatchTimeoutMs(128));
+      expect(batchSignal.aborted).toBe(true); // still bounded, just proportionately
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('derives the batch budget from size, leaves n=1 alone, and caps it', () => {
+    expect(sidecarBatchTimeoutMs(1)).toBe(DEFAULT_SIDECAR_TIMEOUT_MS);
+    expect(sidecarBatchTimeoutMs(0)).toBe(DEFAULT_SIDECAR_TIMEOUT_MS);
+    // A server-tier batch needs ~28s at the measured ~0.22s/text; 15s is the bug.
+    expect(sidecarBatchTimeoutMs(128)).toBeGreaterThan(30_000);
+    expect(sidecarBatchTimeoutMs(10_000)).toBe(SIDECAR_BATCH_TIMEOUT_CAP_MS);
   });
 });
 
