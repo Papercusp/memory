@@ -377,7 +377,9 @@ describe('HybridBackend (P-020)', () => {
     });
 
     it('does not forward the reporter to the cosine leg — it would report half as the whole', async () => {
-      const cosineSearch = vi.fn(async () => [e('a', 0.9)]);
+      // Params declared so the mock's call tuple is typed — `vi.fn(async () => …)`
+      // infers `[]`, and indexing [1] on it is a compile error, not a runtime one.
+      const cosineSearch = vi.fn(async (_q: string, _opts: SearchOptions) => [e('a', 0.9)]);
       const cosine = fakeBackend('cosine', [], { search: cosineSearch });
       const lexical = fakeBackend('lexical', []);
       const hy = new HybridBackend(lexical, cosine, { fusionMode: 'floored-union' });
