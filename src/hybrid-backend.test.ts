@@ -311,6 +311,86 @@ describe('HybridBackend (P-020)', () => {
     expect(lexSearch).not.toHaveBeenCalled();
   });
 
+  describe('onLegStats — per-leg reporting (P-002)', () => {
+    it('reports the short-circuited lexical leg as ran:false, NOT as zero candidates', async () => {
+      // THE distinction this seam exists for. The lexical leg contributing
+      // nothing has two causes with OPPOSITE fixes: it ran and found nothing
+      // (a tokenization/identifier problem), or it never ran at all (contracted
+      // cosine-gated behaviour, nothing wrong). Collapsing both to "0" sends a
+      // reader to fix a leg that was never asked a question.
+      const cosine = fakeBackend('cosine', []);
+      const lexSearch = vi.fn(async () => [e('CODEX_HOME', 1.0)]);
+      const lexical = fakeBackend('lexical', [], { search: lexSearch });
+      const hy = new HybridBackend(lexical, cosine, { fusionMode: 'cosine-gated' });
+      const seen: unknown[] = [];
+      await hy.search('CODEX_HOME', {
+        scope: 's',
+        fusionMode: 'cosine-gated',
+        minScore: 0.45,
+        onLegStats: (s) => seen.push(s),
+      });
+      expect(lexSearch).not.toHaveBeenCalled();
+      expect(seen).toEqual([
+        {
+          mode: 'cosine-gated',
+          cosine: { ran: true, candidates: 0, qualifying: 0 },
+          lexical: { ran: false },
+          fused: 0,
+        },
+      ]);
+    });
+
+    it('records each leg its OWN depth — the lexical leg pulls 3x the cosine budget', async () => {
+      // Sharing one budget across both legs would misjudge the other leg's
+      // saturation by exactly that factor, and saturation is what says whether
+      // a pool was under-sampled rather than empty.
+      const cosine = fakeBackend('cosine', [e('a', 0.9)]);
+      const lexical = fakeBackend('lexical', [e('a', 0.9)]);
+      const hy = new HybridBackend(lexical, cosine, { fusionMode: 'floored-union' });
+      let seen: { cosine: { depth?: number }; lexical: { depth?: number } } | null = null;
+      await hy.search('q', {
+        scope: 's',
+        limit: 4,
+        fusionMode: 'floored-union',
+        minScore: 0.45,
+        onLegStats: (s) => {
+          seen = s;
+        },
+      });
+      expect(seen!.cosine.depth).toBe(4);
+      expect(seen!.lexical.depth).toBe(12); // (limit ?? 6) * 3
+    });
+
+    it('a throwing reporter never fails the search', async () => {
+      const cosine = fakeBackend('cosine', [e('a', 0.9)]);
+      const lexical = fakeBackend('lexical', []);
+      const hy = new HybridBackend(lexical, cosine, { fusionMode: 'floored-union' });
+      const out = await hy.search('q', {
+        scope: 's',
+        fusionMode: 'floored-union',
+        minScore: 0.45,
+        onLegStats: () => {
+          throw new Error('reporter exploded');
+        },
+      });
+      expect(out.map((x) => x.id)).toEqual(['a']);
+    });
+
+    it('does not forward the reporter to the cosine leg — it would report half as the whole', async () => {
+      const cosineSearch = vi.fn(async () => [e('a', 0.9)]);
+      const cosine = fakeBackend('cosine', [], { search: cosineSearch });
+      const lexical = fakeBackend('lexical', []);
+      const hy = new HybridBackend(lexical, cosine, { fusionMode: 'floored-union' });
+      await hy.search('q', {
+        scope: 's',
+        fusionMode: 'floored-union',
+        minScore: 0.45,
+        onLegStats: () => {},
+      });
+      expect(cosineSearch.mock.calls[0]![1]).not.toHaveProperty('onLegStats');
+    });
+  });
+
   /**
    * Recurrence guard: in floored-union mode the two legs MUST run CONCURRENTLY.
    *

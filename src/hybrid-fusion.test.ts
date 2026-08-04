@@ -9,6 +9,59 @@ const e = (id: string, score?: number): MemoryEntry => ({
   ...(score !== undefined ? { score } : {}),
 });
 
+describe('per-leg retrieval provenance (P-002)', () => {
+  it('stamps which leg found the entry, and at what rank in each', () => {
+    // cosine: [a, both]; lexical: [both, lexOnly] — one entry per case.
+    const out = fuse([e('a', 0.9), e('both', 0.8)], [e('both', 0.9), e('lexOnly', 0.9)]);
+    const by = Object.fromEntries(out.map((x) => [x.id, x.retrieval]));
+    expect(by.a).toEqual({ cosineRank: 1 });
+    expect(by.both).toEqual({ cosineRank: 2, lexicalRank: 1 });
+    expect(by.lexOnly).toEqual({ lexicalRank: 2 });
+  });
+
+  it('is what makes the fused score decomposable — the score alone is NOT', () => {
+    // The regression this exists to prevent: a SUM cannot be inverted back to
+    // its terms, so without the stamp there is no way to tell a strong
+    // cosine-only hit from a two-leg hit that scored the same.
+    const [cosOnly] = fuse([e('x', 0.9)], []);
+    const [twoLeg] = fuse([e('y', 0.9)], [e('y', 0.9)]);
+    expect(cosOnly!.retrieval).toEqual({ cosineRank: 1 });
+    expect(twoLeg!.retrieval).toEqual({ cosineRank: 1, lexicalRank: 1 });
+  });
+
+  it('omits lexicalRank for a hit the minLexScore bar disqualified — it conferred no rank', () => {
+    // The bar decides whether a hit gets a RANK, so provenance must agree with
+    // the score: an entry below the bar contributed nothing and must not read
+    // as a lexical find.
+    const out = fuse([e('a', 0.9)], [e('a', 0.01)], { minLexScore: 0.4 });
+    expect(out[0]!.retrieval).toEqual({ cosineRank: 1 });
+  });
+
+  it('reports leg counts, separating what the lexical leg returned from what qualified', () => {
+    let seen: { cosineCandidates: number; lexicalCandidates: number; lexicalQualifying: number; fused: number } | null =
+      null;
+    fuse([e('a', 0.9)], [e('a', 0.01), e('b', 0.9)], {
+      minLexScore: 0.4,
+      mode: 'floored-union',
+      onFusionStats: (s) => {
+        seen = s;
+      },
+    });
+    // 2 returned, 1 cleared the bar — the gap IS the bar's measured effect.
+    expect(seen).toEqual({ cosineCandidates: 1, lexicalCandidates: 2, lexicalQualifying: 1, fused: 2 });
+  });
+
+  it('a throwing reporter never breaks retrieval', () => {
+    expect(() =>
+      fuse([e('a', 0.9)], [], {
+        onFusionStats: () => {
+          throw new Error('reporter exploded');
+        },
+      }),
+    ).not.toThrow();
+  });
+});
+
 describe('fuseCosineGated (P-020)', () => {
   it('returns empty when the cosine gate is empty (hard-negative discipline)', () => {
     expect(fuseCosineGated([], [e('x'), e('y')])).toEqual([]);
