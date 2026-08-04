@@ -58,6 +58,78 @@
  */
 export type ScoreScale = 'cosine' | 'rrf' | 'lexical' | 'unknown';
 
+/**
+ * WHICH RETRIEVAL LEG(S) produced an entry, and at what rank within each.
+ *
+ * A fused `score` is a SUM over legs (see `ScoreScale.rrf`), and a sum is not
+ * invertible: 1/(k+3) from cosine alone and 1/(k+7)+1/(k+9) from both legs are
+ * different numbers with no way back to the legs that made them. So the moment
+ * `fuse()` writes the fused score, the answer to "which leg found this?" is
+ * gone — for every downstream reader, permanently.
+ *
+ * That matters because the two legs FAIL DIFFERENTLY and are fixed differently:
+ * a cosine miss is a query/embedding problem, a lexical miss is a tokenization
+ * or identifier problem. Telemetry that records only the fused score can report
+ * a healthy-looking recall while one leg has been contributing nothing at all —
+ * which is exactly what a live measurement found (see the `minLexScore` note in
+ * `hybrid-fusion.ts`: a 1526-memory pool whose cosine candidates shared ZERO ids
+ * with its lexical rows, for 336 of 337 consecutive recalls).
+ *
+ * Ranks are 1-based and LEG-LOCAL — a rank is only comparable within its own
+ * leg and its own call. `undefined` means the entry was absent from that leg,
+ * which is a real observation and not a zero.
+ *
+ * ⚠ This is a per-CALL retrieval fact, deliberately NOT `metadata`. `metadata`
+ * is backend-passthrough state belonging to the STORED fact; a rank belongs to
+ * the query that just ran. Putting it there invites a writer to persist it, and
+ * a persisted rank is wrong the instant any other query runs.
+ */
+export interface RetrievalProvenance {
+  /** 1-based rank in the cosine leg; undefined = the cosine leg did not return it. */
+  cosineRank?: number;
+  /** 1-based rank in the qualifying lexical leg; undefined = absent from it. */
+  lexicalRank?: number;
+}
+
+/** What ONE retrieval leg did on a single call. */
+export interface LegRunStats {
+  /**
+   * Did this leg EXECUTE? `false` is a distinct observation from "ran and
+   * returned nothing", and the two need opposite fixes — `cosine-gated` mode
+   * deliberately never starts the lexical leg when the cosine leg is empty, and
+   * a leg that threw degrades to `[]` as well. A reader that cannot tell those
+   * apart reads a short-circuit as a retrieval failure.
+   */
+  ran: boolean;
+  /** Rows the leg returned, pre-fusion. Undefined when it did not run. */
+  candidates?: number;
+  /**
+   * Rows that cleared this leg's OWN admission bar and were therefore given a
+   * rank in the fusion (the lexical leg's `minLexScore`). Equal to `candidates`
+   * for a leg with no such bar. `candidates - qualifying` is the count the bar
+   * removed — the number that says whether the bar is doing anything.
+   */
+  qualifying?: number;
+  /**
+   * The per-scope row budget IN EFFECT for this leg on this call — recorded,
+   * never inferred later from a constant. Saturation (`candidates` at the
+   * ceiling) means the pool was UNDER-SAMPLED, not that it held nothing more;
+   * computing that against a retuned constant misjudges every older row. Same
+   * contract as `RecallPoolStats.limit` on the operator's telemetry.
+   */
+  depth?: number;
+}
+
+/** What every leg did on one fused call — reported via `SearchOptions.onLegStats`. */
+export interface SearchLegStats {
+  cosine: LegRunStats;
+  lexical: LegRunStats;
+  /** The fusion mode in effect (`floored-union` | `cosine-gated`). */
+  mode: string;
+  /** Distinct entries in the FUSED candidate set, before any caller-side limit. */
+  fused: number;
+}
+
 /** One stored fact, in the neutral shape every surface renders. */
 export interface MemoryEntry {
   id: string;
@@ -69,6 +141,13 @@ export interface MemoryEntry {
   scope: string;
   /** Relevance score for `search` results (backend-native; ordering only). */
   score?: number;
+  /**
+   * Which leg(s) produced this entry, for a multi-leg backend that fuses.
+   * Set by `fuse()`; absent from single-leg backends and from stored entries
+   * (it describes a retrieval, not a fact). Optional on purpose — no existing
+   * constructor of this type is stranded by it.
+   */
+  retrieval?: RetrievalProvenance;
   /** Backend-passthrough metadata (anchors, provenance, timestamps, …). */
   metadata?: Record<string, unknown>;
 }
