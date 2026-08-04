@@ -279,6 +279,25 @@ export interface SearchOptionsCommon {
    * `backend.embedQuery?.(text)`.
    */
   vector?: number[];
+  /**
+   * HYBRID-ONLY, OPT-IN: report what each leg did on this call.
+   *
+   * A callback rather than a field on the result, because `search` returns
+   * `MemoryEntry[]` through the shared `MemoryBackend` interface — widening that
+   * return type would strand every backend and every caller to carry a value
+   * almost none of them want. A callback is opt-in, costs nothing when omitted,
+   * and cannot be forgotten into module state (which on a fan-out path would be
+   * read by whichever concurrent call finished last).
+   *
+   * Invoked at most once per `search`, AFTER fusion, BEFORE the caller-side
+   * limit — so `fused` reports the real candidate pool, not the slice. It is
+   * called inside the backend's own try-scope: a throw from here must never
+   * fail a search, so implementations wrap it.
+   *
+   * Per-ENTRY leg attribution is not here — it rides on `MemoryEntry.retrieval`,
+   * so an entry that reaches a render surface still knows which leg found it.
+   */
+  onLegStats?: (stats: SearchLegStats) => void;
 }
 
 /**

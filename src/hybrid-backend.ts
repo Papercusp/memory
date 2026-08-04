@@ -41,6 +41,7 @@ import type {
   MemoryBackend,
   MemoryEntry,
   RememberOptions,
+  SearchLegStats,
   SearchOptions,
   UpdatePatch,
 } from './backend';
@@ -282,15 +283,70 @@ export class HybridBackend implements MemoryBackend {
     // and a leg that later learned to read it would silently embed the
     // identifier-bearing string this option exists to keep OUT of the vector.
     // Strip an option at the boundary of the leg it is not for.
-    const { diversify, lexicalQuery: _lexicalQuery, ...cosineOpts } = opts;
+    // `onLegStats` is stripped for the same reason as `diversify`/`lexicalQuery`
+    // above — it is THIS backend's reporting seam, not the cosine leg's, and a
+    // leg that later learned to read it would report its own half as the whole.
+    const { diversify, lexicalQuery: _lexicalQuery, onLegStats, ...cosineOpts } = opts;
+    // A reporter must never be able to fail a search (SearchOptions.onLegStats).
+    const report = (stats: SearchLegStats): void => {
+      if (!onLegStats) return;
+      try {
+        onLegStats(stats);
+      } catch {
+        /* swallow — telemetry is never load-bearing */
+      }
+    };
     const cosineHits = await this.cosine.search(query, cosineOpts);
-    if (cosineHits.length === 0 && gated) return []; // lexical leg never started — as contracted
+    if (cosineHits.length === 0 && gated) {
+      // The lexical leg NEVER STARTED — contracted behaviour, not a failure.
+      // Reported as `ran: false` so a reader cannot mistake the short-circuit
+      // for a leg that ran and found nothing; those have opposite fixes.
+      report({
+        mode,
+        cosine: { ran: true, candidates: 0, qualifying: 0, ...(opts.limit !== undefined ? { depth: opts.limit } : {}) },
+        lexical: { ran: false },
+        fused: 0,
+      });
+      return []; // lexical leg never started — as contracted
+    }
     const lexicalHits = await (inFlightLexical ?? runLexical());
     const fused = fuse(cosineHits, lexicalHits, {
       k: this.opts.rrfK ?? DEFAULT_RRF_K,
       mode,
       ...(minLexScore !== undefined ? { minLexScore } : {}),
       ...(this.opts.lexWeight !== undefined ? { lexWeight: this.opts.lexWeight } : {}),
+      ...(onLegStats
+        ? {
+            onFusionStats: (s) =>
+              report({
+                mode,
+                // The cosine leg carries no post-hoc admission bar of its own
+                // (its FP floor is applied inside the leg), so qualifying ===
+                // candidates there. The lexical leg's bar is `minLexScore`, and
+                // its two numbers are what say whether that bar is doing
+                // anything on this workload.
+                //
+                // ⚠ The two legs have DIFFERENT budgets and each records its
+                // own: the cosine leg gets `opts.limit`, the lexical leg pulls
+                // `depth` (= lexicalDepth ?? limit*3) PER SCOPE. Recording one
+                // for both would make every saturation read on the other leg
+                // wrong by a factor of three.
+                cosine: {
+                  ran: true,
+                  candidates: s.cosineCandidates,
+                  qualifying: s.cosineCandidates,
+                  ...(opts.limit !== undefined ? { depth: opts.limit } : {}),
+                },
+                lexical: {
+                  ran: true,
+                  candidates: s.lexicalCandidates,
+                  qualifying: s.lexicalQualifying,
+                  depth,
+                },
+                fused: s.fused,
+              }),
+          }
+        : {}),
     });
     const diversified = this.diversify(fused, diversify, opts.limit);
     return opts.limit !== undefined ? diversified.slice(0, opts.limit) : diversified;

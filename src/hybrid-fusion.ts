@@ -27,7 +27,7 @@
  * fused score is written onto entry.score (ordering-only, per the MemoryEntry
  * contract). The exact mode + the two gate values are swept in P-031 (D-006).
  */
-import type { MemoryEntry } from './backend';
+import type { MemoryEntry, RetrievalProvenance } from './backend';
 
 export const DEFAULT_RRF_K = 60;
 /**
@@ -69,6 +69,27 @@ export interface FusionOptions {
    * paraphrase recall.
    */
   lexWeight?: number;
+  /**
+   * OPT-IN: report the leg-level counts this fusion observed.
+   *
+   * `lexicalQualifying` is the reason this lives here rather than being
+   * recomputed by the caller: the `minLexScore` bar is applied in exactly one
+   * place below, and a second copy of that predicate outside this function would
+   * drift from it silently — reporting a bar's effect from a stale copy of the
+   * bar is worse than not reporting it. Everything else is passed through for
+   * free while we are already counting.
+   *
+   * Invoked at most once, after the candidate set is built. Never throws into
+   * the fusion: callers wrap it.
+   */
+  onFusionStats?: (stats: {
+    cosineCandidates: number;
+    lexicalCandidates: number;
+    /** Lexical hits that cleared `minLexScore` and were given a rank. */
+    lexicalQualifying: number;
+    /** Distinct entries in the fused candidate set. */
+    fused: number;
+  }) => void;
 }
 
 /**
@@ -199,9 +220,36 @@ export function fuse(
     const cr = cosRank.get(key);
     const lr = lexRank.get(key);
     const score = (cr !== undefined ? 1 / (k + cr) : 0) + (lr !== undefined ? lexWeight / (k + lr) : 0);
-    return { ...e, score };
+    // Stamp WHICH LEGS produced this entry, alongside the score that fuses them.
+    // The score is a SUM, so it cannot be inverted back to its terms — this is
+    // the only point in the system where the answer is still available. See
+    // `RetrievalProvenance` for why it is not folded into `metadata`.
+    //
+    // Both ranks omitted is unreachable: a candidate slot exists only because
+    // some leg ranked it. The object is still written unconditionally so a
+    // reader never has to distinguish "no provenance recorded" from "no legs".
+    const retrieval: RetrievalProvenance = {
+      ...(cr !== undefined ? { cosineRank: cr } : {}),
+      ...(lr !== undefined ? { lexicalRank: lr } : {}),
+    };
+    return { ...e, score, retrieval };
   });
   fused.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  if (opts.onFusionStats) {
+    // Telemetry must never be able to fail a search — the same posture the
+    // operator's recall-stats writer takes. A throwing reporter loses its own
+    // numbers and nothing else.
+    try {
+      opts.onFusionStats({
+        cosineCandidates: cosineHits.length,
+        lexicalCandidates: lexicalHits.length,
+        lexicalQualifying: qualifyingLexical.length,
+        fused: fused.length,
+      });
+    } catch {
+      /* swallow — a reporter must not break retrieval */
+    }
+  }
   return fused;
 }
 
