@@ -11,21 +11,30 @@
  *     paths branch on (true iff a host is wired).
  *  3. LAST-CALL-WINS — configureMemory is idempotent; the newest host is what
  *     memoryHost() returns, by reference (no clone).
- *  4. FORK-SAFETY — the host lives on the Symbol.for('@papercusp/memory:host')
- *     process-global, NOT a module-level singleton (the tsx symlink double-load
- *     that config.ts's own docstring warns about). This test PINS the slot
- *     location: a value written by configureMemory is readable at that exact
- *     global key, and a value planted there is seen by memoryHost().
+ *  4. FORK-SAFETY — the host lives in realm-pinned state keyed
+ *     '@papercusp/memory:host', NOT a module-level singleton (the tsx symlink
+ *     double-load that config.ts's own docstring warns about). This test PINS
+ *     the property that matters: a value written by configureMemory is seen by
+ *     a SECOND module record, and a value written by that second record is seen
+ *     here.
  *  5. memorySchema() = host.schema ?? 'public' — nullish default, a set schema
  *     passes through.
  *
- * No vi.mock: config.ts has no runtime deps (type-only imports). We drive the
- * REAL global slot and reset it around every test so no state leaks.
+ * No vi.mock: config.ts has no runtime deps beyond the pin primitive. We drive
+ * the REAL pinned state and reset it around every test so no state leaks.
+ *
+ * ⚠ This file used to poke `globalThis[Symbol.for('@papercusp/memory:host')]`
+ * directly — the storage LOCATION rather than the module's own seam. When the
+ * storage moved into @papercusp/module-singleton (EI-19469900474673886) those
+ * writes would have kept compiling and kept "passing" while resetting nothing.
+ * Reset and plant through the module's exported hooks, never past them.
  *
  * Run: cd libs/generic/memory && npx vitest run src/config.test.ts
  */
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { listPinnedModuleKeys, pinModuleState } from '@papercusp/module-singleton';
 import {
+  __setMemoryHostForTests,
   configureMemory,
   memoryHost,
   isMemoryConfigured,
@@ -33,8 +42,15 @@ import {
   type MemoryHost,
 } from './config';
 
-const HOST_KEY = Symbol.for('@papercusp/memory:host');
-type HostGlobal = typeof globalThis & { [HOST_KEY]?: MemoryHost | null };
+/** The pinned key config.ts reports under — asserted below, not assumed. */
+const STATE_KEY = '@papercusp/memory:host';
+
+/** What a duplicate module record gets on evaluation: the SAME state object. */
+function asSecondModuleRecord(): { host: MemoryHost | null | undefined } {
+  return pinModuleState<{ host: MemoryHost | null | undefined }>(STATE_KEY, () => ({
+    host: undefined,
+  }));
+}
 
 /** A minimal valid host; override just the field under test. */
 function host(over: Partial<MemoryHost> = {}): MemoryHost {
@@ -47,17 +63,17 @@ function host(over: Partial<MemoryHost> = {}): MemoryHost {
   };
 }
 
-/** Snapshot whatever the worker's global slot held, so we can restore it. */
-const savedSlot = (globalThis as HostGlobal)[HOST_KEY];
+/** Snapshot whatever the worker's pinned slot held, so we can restore it. */
+const savedHost = isMemoryConfigured() ? memoryHost() : undefined;
 
 beforeEach(() => {
   // Start every case UNCONFIGURED (isMemoryConfigured checks `!= null`).
-  (globalThis as HostGlobal)[HOST_KEY] = undefined;
+  __setMemoryHostForTests(undefined);
 });
 
 afterAll(() => {
   // Be a good worker citizen — leave the slot as we found it.
-  (globalThis as HostGlobal)[HOST_KEY] = savedSlot;
+  __setMemoryHostForTests(savedHost);
 });
 
 describe('isMemoryConfigured / memoryHost — unconfigured state', () => {
@@ -71,7 +87,7 @@ describe('isMemoryConfigured / memoryHost — unconfigured state', () => {
   });
 
   it('a null slot (explicitly cleared) also reads as not-configured', () => {
-    (globalThis as HostGlobal)[HOST_KEY] = null;
+    __setMemoryHostForTests(null);
     expect(isMemoryConfigured()).toBe(false);
     expect(() => memoryHost()).toThrow(/not configured/);
   });
@@ -95,16 +111,25 @@ describe('configureMemory — wires the host', () => {
   });
 });
 
-describe('fork-safety — the host lives on the Symbol.for process-global, not a module singleton', () => {
-  it('configureMemory writes to the exact Symbol.for global slot', () => {
-    const h = host();
-    configureMemory(h);
-    expect((globalThis as HostGlobal)[HOST_KEY]).toBe(h);
+describe('fork-safety — the host is realm-pinned, not a module singleton', () => {
+  it('registers its key with @papercusp/module-singleton (so a split here is REPORTED)', () => {
+    // Pinning through the primitive rather than hand-rolling a Symbol.for slot
+    // is what puts this module in `listModuleDuplications()`. A hand-rolled pin
+    // is equally correct and completely invisible there, so the realm-wide
+    // report would answer a clean `[]` while this module is duplicated — the
+    // "detector cannot see its subject" shape (EI-19469900474673886).
+    expect(listPinnedModuleKeys()).toContain(STATE_KEY);
   });
 
-  it('a host planted directly on that global slot is seen by memoryHost() (the shared-slot read)', () => {
+  it('configureMemory writes state a SECOND module record can read', () => {
     const h = host();
-    (globalThis as HostGlobal)[HOST_KEY] = h; // simulate a second forked module instance
+    configureMemory(h);
+    expect(asSecondModuleRecord().host).toBe(h);
+  });
+
+  it('a host planted by a second module record is seen by memoryHost() (the shared-slot read)', () => {
+    const h = host();
+    asSecondModuleRecord().host = h; // what a forked module instance's configureMemory does
     expect(isMemoryConfigured()).toBe(true);
     expect(memoryHost()).toBe(h);
   });
