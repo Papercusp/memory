@@ -14,9 +14,9 @@ describe('per-leg retrieval provenance (P-002)', () => {
     // cosine: [a, both]; lexical: [both, lexOnly] — one entry per case.
     const out = fuse([e('a', 0.9), e('both', 0.8)], [e('both', 0.9), e('lexOnly', 0.9)]);
     const by = Object.fromEntries(out.map((x) => [x.id, x.retrieval]));
-    expect(by.a).toEqual({ cosineRank: 1 });
-    expect(by.both).toEqual({ cosineRank: 2, lexicalRank: 1 });
-    expect(by.lexOnly).toEqual({ lexicalRank: 2 });
+    expect(by.a).toEqual({ cosineRank: 1, cosineScore: 0.9 });
+    expect(by.both).toEqual({ cosineRank: 2, cosineScore: 0.8, lexicalRank: 1, lexicalScore: 0.9 });
+    expect(by.lexOnly).toEqual({ lexicalRank: 2, lexicalScore: 0.9 });
   });
 
   it('is what makes the fused score decomposable — the score alone is NOT', () => {
@@ -25,8 +25,8 @@ describe('per-leg retrieval provenance (P-002)', () => {
     // cosine-only hit from a two-leg hit that scored the same.
     const [cosOnly] = fuse([e('x', 0.9)], []);
     const [twoLeg] = fuse([e('y', 0.9)], [e('y', 0.9)]);
-    expect(cosOnly!.retrieval).toEqual({ cosineRank: 1 });
-    expect(twoLeg!.retrieval).toEqual({ cosineRank: 1, lexicalRank: 1 });
+    expect(cosOnly!.retrieval).toEqual({ cosineRank: 1, cosineScore: 0.9 });
+    expect(twoLeg!.retrieval).toEqual({ cosineRank: 1, cosineScore: 0.9, lexicalRank: 1, lexicalScore: 0.9 });
   });
 
   it('omits lexicalRank for a hit the minLexScore bar disqualified — it conferred no rank', () => {
@@ -34,7 +34,60 @@ describe('per-leg retrieval provenance (P-002)', () => {
     // the score: an entry below the bar contributed nothing and must not read
     // as a lexical find.
     const out = fuse([e('a', 0.9)], [e('a', 0.01)], { minLexScore: 0.4 });
-    expect(out[0]!.retrieval).toEqual({ cosineRank: 1 });
+    expect(out[0]!.retrieval).toEqual({ cosineRank: 1, cosineScore: 0.9 });
+    // ...and the disqualified hit's SCORE is withheld with its rank. Recording
+    // 0.01 here would say the lexical leg contributed a (very weak) match when
+    // in fact the bar removed it entirely — the two readings have opposite fixes.
+    expect(out[0]!.retrieval?.lexicalScore).toBeUndefined();
+  });
+
+  it('carries the PRE-FUSION native scores through — the fused score cannot express relevance', () => {
+    // The defect this closes: `fuse` overwrites `score` with an RRF sum computed
+    // from RANKS, so two entries of wildly different similarity fuse identically.
+    // Without the stamp, "how relevant was what we injected?" is unanswerable
+    // from anything downstream — which is how a 0.58 cosine floor came to be
+    // compared against a value whose ceiling is 0.0328.
+    const strong = fuse([e('strong', 0.97)], [])[0]!;
+    const barelyAdmitted = fuse([e('weak', 0.59)], [])[0]!;
+    // Identical rank ⇒ identical fused score: the fused value is BLIND to the
+    // 0.38 similarity gap. This is the calibration case — if it ever fails, the
+    // premise of the whole stamp has changed.
+    expect(strong.score).toBe(barelyAdmitted.score);
+    // ...and the stamp is what recovers the difference.
+    expect(strong.retrieval?.cosineScore).toBe(0.97);
+    expect(barelyAdmitted.retrieval?.cosineScore).toBe(0.59);
+  });
+
+  it('reads each leg score from the entry THAT leg returned, not from the surviving row', () => {
+    // The cosine entry wins the slot (it is canonical), so a naive
+    // `lexicalScore: e.score` would record the COSINE number twice — a shape
+    // that reads as two independent legs agreeing on relevance when in fact the
+    // lexical score was never looked at. Distinct values on purpose: an
+    // implementation that reuses `e.score` returns 0.62 for both and fails here.
+    const [hit] = fuse([e('both', 0.62)], [e('both', 0.91)]);
+    expect(hit!.retrieval?.cosineScore).toBe(0.62);
+    expect(hit!.retrieval?.lexicalScore).toBe(0.91);
+  });
+
+  it('omits cosineScore for a lexical-ONLY admit — there is no cosine score to record', () => {
+    // `floored-union` admits entries the cosine leg never returned. There `e` IS
+    // the lexical entry, so an unguarded `cosineScore: e.score` would stamp a
+    // LEXICAL score into the cosine field — silently populating the relevance
+    // column with numbers off a different scale, i.e. re-creating the exact
+    // mixed-scale trap this work exists to remove.
+    const out = fuse([], [e('lexOnly', 0.8)], { mode: 'floored-union' });
+    expect(out[0]!.retrieval).toEqual({ lexicalRank: 1, lexicalScore: 0.8 });
+    expect(out[0]!.retrieval?.cosineScore).toBeUndefined();
+  });
+
+  it('treats an UNSCORED leg entry as absent, never as zero', () => {
+    // 0 sits inside the real value range, so recording it would read as
+    // "maximally irrelevant, admitted anyway" — a defect-shaped reading of an
+    // entry that simply never carried a score.
+    const [hit] = fuse([e('noscore')], [e('noscore')]);
+    expect(hit!.retrieval?.cosineScore).toBeUndefined();
+    expect(hit!.retrieval?.lexicalScore).toBeUndefined();
+    expect(hit!.retrieval?.cosineRank).toBe(1);
   });
 
   it('reports leg counts, separating what the lexical leg returned from what qualified', () => {

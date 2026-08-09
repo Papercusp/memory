@@ -89,6 +89,37 @@ export interface RetrievalProvenance {
   cosineRank?: number;
   /** 1-based rank in the qualifying lexical leg; undefined = absent from it. */
   lexicalRank?: number;
+  /**
+   * The cosine leg's NATIVE pre-fusion score for this entry — the actual
+   * similarity, on 0..1, that the relevance floor (`SearchOptions.minScore`)
+   * was applied to. Undefined when the cosine leg did not return this entry
+   * (`cosineRank` undefined) or returned it unscored.
+   *
+   * ⚠ THIS IS THE ONLY SURVIVING COPY. `fuse()` REPLACES `MemoryEntry.score`
+   * with the fused RRF sum, so after fusion the native score is unrecoverable:
+   * RRF is computed from RANKS, so the fused value carries no information about
+   * how similar anything actually was. Two entries at cosine 0.95 and 0.59 fuse
+   * to identical scores if they hold the same ranks.
+   *
+   * That is not a theoretical loss. It made "how relevant was what we
+   * injected?" unanswerable from telemetry BY CONSTRUCTION — the recall table
+   * recorded only the post-fusion value, whose ceiling is 0.0328, and an agent
+   * comparing that column against the 0.58 cosine floor reported "99.9% of
+   * injections are below the floor" (2026-07-28). The floor was working fine;
+   * the two numbers were simply never on the same scale.
+   */
+  cosineScore?: number;
+  /**
+   * The lexical leg's NATIVE pre-fusion score, recorded for the same reason and
+   * with the same lifetime as `cosineScore`. Undefined when the lexical leg did
+   * not rank this entry (`lexicalRank` undefined) or returned it unscored.
+   *
+   * Note this is the score of the LEXICAL entry, which for a cross-leg hit is a
+   * different row object than the one carried in the result (the cosine entry
+   * wins the slot — it is canonical). Both legs' scores are therefore present
+   * on a hit that neither leg alone could have produced.
+   */
+  lexicalScore?: number;
 }
 
 /** What ONE retrieval leg did on a single call. */

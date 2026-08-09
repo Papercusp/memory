@@ -228,9 +228,33 @@ export function fuse(
     // Both ranks omitted is unreachable: a candidate slot exists only because
     // some leg ranked it. The object is still written unconditionally so a
     // reader never has to distinguish "no provenance recorded" from "no legs".
+    //
+    // The NATIVE per-leg scores are stamped here for the same reason and at the
+    // same last-possible moment (`RetrievalProvenance.cosineScore`): the line
+    // below overwrites `e.score` with the RRF sum, and RRF is computed from
+    // RANKS, so nothing downstream can recover how SIMILAR anything actually
+    // was. Recording the rank without the score leaves the ordering auditable
+    // and the RELEVANCE unmeasurable, which is the state that made the recall
+    // telemetry unable to answer the one question it exists for.
+    //
+    // Read each score from the entry that leg actually returned, never from
+    // `e`: for a cross-leg hit `e` is the COSINE entry (it wins the slot as
+    // canonical), so `e.score` is a cosine score and taking it as the lexical
+    // one would silently record the same number twice, in a shape that reads
+    // like two independent legs agreeing. A lexical-ONLY admit (`floored-union`)
+    // inverts that — there `e` IS the lexical entry and no cosine score exists
+    // at all, which the `cr !== undefined` guard is what keeps honest.
+    const cosNative = cr !== undefined ? e.score : undefined;
+    const lexNative = lr !== undefined ? lexEntry.get(key)?.score : undefined;
     const retrieval: RetrievalProvenance = {
       ...(cr !== undefined ? { cosineRank: cr } : {}),
       ...(lr !== undefined ? { lexicalRank: lr } : {}),
+      // Finite-only: an unscored leg entry is ABSENT, not zero. Recording a 0
+      // would land inside the real value range and read as "maximally
+      // irrelevant, admitted anyway" — a defect-shaped reading of a hand-built
+      // or test-double entry that simply never carried a score.
+      ...(typeof cosNative === 'number' && Number.isFinite(cosNative) ? { cosineScore: cosNative } : {}),
+      ...(typeof lexNative === 'number' && Number.isFinite(lexNative) ? { lexicalScore: lexNative } : {}),
     };
     return { ...e, score, retrieval };
   });
