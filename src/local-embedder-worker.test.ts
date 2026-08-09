@@ -123,30 +123,34 @@ describe('local-embedder-worker (EI-19464316359123796: exit-without-crash)', () 
     expect(mod.shutdownLocalEmbedder).toBe(mod._resetWorker);
   });
 
-  it('installs exactly one process-level beforeExit listener no matter how many times the worker (re)spawns', async () => {
+  it('installs at most one NEW process-level beforeExit listener per spawn, never leaks one on respawn, and the hook tears the worker down cleanly (self-heals after)', async () => {
     const mod = await import('./local-embedder-worker');
-    const before = process.listenerCount('beforeExit');
-    await mod.embedViaWorker('one').catch(() => { /* */ });
-    const afterFirst = process.listenerCount('beforeExit');
-    expect(afterFirst).toBe(before + 1);
+    // Diff against whatever is ALREADY registered rather than assuming a
+    // zero baseline — an earlier test in this file (or module) may already
+    // have installed the hook once, and that is equally correct: the guard's
+    // job is "at most one, ever," not "exactly one per test."
+    const before = new Set(process.listeners('beforeExit'));
+    await mod.embedViaWorker('one').catch(() => { /* protocol may throw */ });
+    const addedByFirstSpawn = process.listeners('beforeExit').filter((fn) => !before.has(fn));
+    expect(addedByFirstSpawn.length).toBeLessThanOrEqual(1);
+    const countAfterFirst = process.listenerCount('beforeExit');
 
     // Reset (simulating a crash/respawn cycle) and spawn again — the guard
     // must stop a second listener from ever being added.
     await mod._resetWorker();
     await mod.embedViaWorker('two').catch(() => { /* */ });
-    expect(process.listenerCount('beforeExit')).toBe(afterFirst);
-  }, 30_000);
-
-  it('the beforeExit hook tears the worker down without throwing, and it self-heals on the next call', async () => {
-    const mod = await import('./local-embedder-worker');
-    await mod.embedViaWorker('warm').catch(() => { /* */ });
+    expect(process.listenerCount('beforeExit')).toBe(countAfterFirst);
     expect(mod.getWorkerState().alive || mod.getWorkerState().disabled).toBe(true);
 
-    // Fire the installed listener(s) directly rather than emitting a real
-    // process-wide 'beforeExit' (which would race the test runner's own
-    // idle-detection). This exercises exactly the async body the real event
-    // would invoke.
-    await Promise.all(process.listeners('beforeExit').map((fn) => fn('beforeExit' as never)));
+    // Exercise the ACTUAL installed hook by invoking exactly the listener(s)
+    // this module's lifetime added (never every unrelated beforeExit listener
+    // some other module/test may have registered on the shared `process`).
+    const ours = process.listeners('beforeExit').filter((fn) => !before.has(fn));
+    expect(ours.length).toBe(1);
+    // The listener RETURNS its promise (see installBeforeExitHook's doc) —
+    // awaiting what it returns is what makes this deterministic instead of
+    // racing a fire-and-forget teardown.
+    await Promise.all(ours.map((fn) => fn('beforeExit' as never)));
 
     expect(mod.getWorkerState().alive).toBe(false);
     // Self-heals: a subsequent call must be able to respawn cleanly rather

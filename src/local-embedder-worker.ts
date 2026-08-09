@@ -37,6 +37,8 @@ let _workerDisabled = false;
  *  most once for the life of the process, no matter how many times
  *  `ensureWorker()` (re)spawns a worker. */
 let _beforeExitHookInstalled = false;
+/** The actual listener function, kept so a test can remove exactly it. */
+let _beforeExitListener: (() => Promise<void>) | null = null;
 
 function workerPath(): string {
   // The worker script is co-located in the same dir as this module.
@@ -232,15 +234,30 @@ export const shutdownLocalEmbedder = _resetWorker;
 function installBeforeExitHook(): void {
   if (_beforeExitHookInstalled) return;
   _beforeExitHookInstalled = true;
-  process.on('beforeExit', () => {
-    // Fire-and-forget: `beforeExit` cannot be `async` itself, but scheduling
-    // this promise is enough to keep the loop alive until it settles (Node
-    // re-checks for idle after every `beforeExit` emission), and a worker
-    // left over from a previous cycle is harmless — `ensureWorker` respawns
-    // one lazily on the next real embed call, exactly as it already does
-    // after any other worker crash/reset.
-    void _resetWorker();
-  });
+  // `beforeExit` listeners cannot be declared `async`, but returning the
+  // promise (rather than `void`-ing it) is still correct and matters for two
+  // reasons: (1) it is what lets `Worker#terminate()`'s own pending work keep
+  // the event loop alive long enough to finish — Node re-checks for idle
+  // after a `beforeExit` listener returns, and a still-in-flight termination
+  // naturally does that on its own, the return value itself isn't what
+  // Node awaits; (2) it makes the hook directly testable by invoking the
+  // registered listener function and awaiting what it returns, instead of
+  // needing to emit a real process-wide `beforeExit`. A worker left torn
+  // down after this fires is harmless either way — `ensureWorker` respawns
+  // one lazily on the next real embed call, exactly as it already does after
+  // any other worker crash/reset.
+  _beforeExitListener = () => _resetWorker();
+  process.on('beforeExit', _beforeExitListener);
+}
+
+/** Test-only: remove the installed `beforeExit` hook (if any) and clear the
+ *  guard, so a test can assert on install-lifecycle behavior from a clean
+ *  baseline instead of inheriting whatever an earlier test in the same file
+ *  already installed. Mirrors `_resetFallbackWarnForTest` above. */
+export function _resetBeforeExitHookForTest(): void {
+  if (_beforeExitListener) process.off('beforeExit', _beforeExitListener);
+  _beforeExitListener = null;
+  _beforeExitHookInstalled = false;
 }
 
 /** Telemetry for /settings/user/memory diagnostics. */
