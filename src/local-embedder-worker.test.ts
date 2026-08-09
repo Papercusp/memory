@@ -125,28 +125,30 @@ describe('local-embedder-worker (EI-19464316359123796: exit-without-crash)', () 
 
   it('installs at most one NEW process-level beforeExit listener per spawn, never leaks one on respawn, and the hook tears the worker down cleanly (self-heals after)', async () => {
     const mod = await import('./local-embedder-worker');
-    // Diff against whatever is ALREADY registered rather than assuming a
-    // zero baseline — an earlier test in this file (or module) may already
-    // have installed the hook once, and that is equally correct: the guard's
-    // job is "at most one, ever," not "exactly one per test."
+    // Start from a genuinely clean baseline — an earlier test in this same
+    // file already spawned a worker (and therefore already installed the
+    // module-lifetime hook), so a diff against "whatever is registered right
+    // now" would always read zero-added here. Reset it explicitly instead.
+    (mod as unknown as { _resetBeforeExitHookForTest: () => void })._resetBeforeExitHookForTest();
     const before = new Set(process.listeners('beforeExit'));
+
     await mod.embedViaWorker('one').catch(() => { /* protocol may throw */ });
     const addedByFirstSpawn = process.listeners('beforeExit').filter((fn) => !before.has(fn));
-    expect(addedByFirstSpawn.length).toBeLessThanOrEqual(1);
+    expect(addedByFirstSpawn.length).toBe(1);
     const countAfterFirst = process.listenerCount('beforeExit');
 
-    // Reset (simulating a crash/respawn cycle) and spawn again — the guard
-    // must stop a second listener from ever being added.
+    // Reset the WORKER (simulating a crash/respawn cycle) — but NOT the
+    // hook guard, matching production: `_resetWorker` never clears
+    // `_beforeExitHookInstalled`. Respawning must not add a second listener.
     await mod._resetWorker();
     await mod.embedViaWorker('two').catch(() => { /* */ });
     expect(process.listenerCount('beforeExit')).toBe(countAfterFirst);
     expect(mod.getWorkerState().alive || mod.getWorkerState().disabled).toBe(true);
 
-    // Exercise the ACTUAL installed hook by invoking exactly the listener(s)
-    // this module's lifetime added (never every unrelated beforeExit listener
-    // some other module/test may have registered on the shared `process`).
-    const ours = process.listeners('beforeExit').filter((fn) => !before.has(fn));
-    expect(ours.length).toBe(1);
+    // Exercise the ACTUAL installed hook by invoking exactly the listener
+    // this test installed (never every unrelated beforeExit listener some
+    // other module/test may have registered on the shared `process`).
+    const ours = addedByFirstSpawn;
     // The listener RETURNS its promise (see installBeforeExitHook's doc) —
     // awaiting what it returns is what makes this deterministic instead of
     // racing a fire-and-forget teardown.
