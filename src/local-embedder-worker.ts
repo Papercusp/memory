@@ -33,6 +33,10 @@ let _workerReady: Promise<void> | null = null;
 let _nextId = 0;
 const _pending = new Map<number, PendingRequest>();
 let _workerDisabled = false;
+/** Guards the process-level `beforeExit` hook below so it is registered at
+ *  most once for the life of the process, no matter how many times
+ *  `ensureWorker()` (re)spawns a worker. */
+let _beforeExitHookInstalled = false;
 
 function workerPath(): string {
   // The worker script is co-located in the same dir as this module.
@@ -64,6 +68,20 @@ function ensureWorker(): Promise<void> {
     _worker.on('message', (msg: { kind: string; id?: number; vector?: number[]; error?: string }) => {
       if (msg.kind === 'ready') {
         initialized = true;
+        // EI-19464316359123796: a persistent, REF'd worker thread keeps the
+        // event loop alive forever, so any one-off driver that just wants an
+        // embedding and then exits has no way to finish naturally — which is
+        // exactly why the reported repro script reaches for `process.exit(0)`.
+        // `process.exit()` tears the whole process (and every worker thread's
+        // native addon state, mid-flight) down WITHOUT running Node's normal
+        // per-Environment cleanup hooks, and that abrupt teardown is what
+        // surfaces as the unlabelled `Napi::Error` at termination — the ONNX
+        // native addon never gets the clean shutdown `Worker#terminate()`
+        // (or a natural process exit) gives it. Unref'ing lets a script with
+        // no other pending work exit ON ITS OWN once it's done, which is the
+        // fix that removes the NEED for `process.exit()` in future scripts.
+        _worker?.unref();
+        installBeforeExitHook();
         resolveReady();
         return;
       }
@@ -156,7 +174,10 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
   });
 }
 
-/** Test seam — drop the worker and reset state. */
+/** Test seam — drop the worker and reset state. Kept as the underlying
+ *  implementation `_resetWorker` for backward compatibility (tests import it
+ *  directly); {@link shutdownLocalEmbedder} is the same function under a
+ *  discoverable public name — see its doc for why both exist. */
 export async function _resetWorker(): Promise<void> {
   if (_worker) {
     try { await _worker.terminate(); } catch { /* noop */ }
@@ -166,6 +187,60 @@ export async function _resetWorker(): Promise<void> {
   _workerDisabled = false;
   _pending.clear();
   _nextId = 0;
+}
+
+/**
+ * Gracefully terminate the persistent embedding worker, if one is running.
+ *
+ * `_resetWorker` under a name that does not read as test-only-private (EI-19464316359123796):
+ * the underscore prefix on the original name signals "don't call this" to anyone scanning the
+ * package's exports, which is backwards — this is the one thing an ad-hoc script SHOULD call.
+ *
+ * **Call this and `await` it before an explicit `process.exit(...)`** in any standalone
+ * script/driver that touches a local (BGE/Gemma/harrier) embedder — directly, or indirectly via
+ * `sync-resolver` / anything that resolves a `learning.*`/search-backed query. `Worker#terminate()`
+ * runs Node's normal per-Environment cleanup for the worker's isolate (including the ONNX native
+ * addon's own finalizers); `process.exit()` does not — it tears the whole process down mid-flight,
+ * which is what surfaces as an unlabelled `terminate called after throwing an instance of
+ * 'Napi::Error'` AFTER your script's real output has already printed.
+ *
+ * Scripts that never call `process.exit()` at all no longer need this: the worker unrefs itself
+ * once ready, so a script with no other pending work exits on its own once it's done, running the
+ * same graceful worker teardown automatically (see the `beforeExit` hook below). This export exists
+ * for the case an explicit `process.exit()` is unavoidable.
+ */
+export const shutdownLocalEmbedder = _resetWorker;
+
+/**
+ * Best-effort automatic teardown for the common case: a script that just lets
+ * itself exit naturally (no explicit `process.exit()`). Installed once, lazily,
+ * the first time a worker actually spins up — never eagerly at module load, so
+ * merely importing this module never adds a process-level listener.
+ *
+ * `beforeExit` (unlike `exit`) permits async work, which is required here —
+ * `Worker#terminate()` returns a Promise. It only fires once the event loop
+ * would otherwise go idle, which is exactly why the worker unrefs itself
+ * above: a still-ref'd worker keeps the loop alive and `beforeExit` would
+ * never be reached at all.
+ *
+ * Deliberately NOT a substitute for `shutdownLocalEmbedder()` before an
+ * explicit `process.exit()` — that call skips `beforeExit` entirely by
+ * design (Node's own semantics), so this hook cannot help that case. The
+ * two are complementary, not redundant: this covers "the script just ends";
+ * the exported function covers "the script forces itself to end".
+ */
+function installBeforeExitHook(): void {
+  if (_beforeExitHookInstalled) return;
+  _beforeExitHookInstalled = true;
+  process.on('beforeExit', () => {
+    // Fire-and-forget: `beforeExit` cannot be `async` itself, but scheduling
+    // this promise is enough to keep the loop alive until it settles (Node
+    // re-checks for idle after every `beforeExit` emission), and a worker
+    // left over from a previous cycle is harmless — `ensureWorker` respawns
+    // one lazily on the next real embed call, exactly as it already does
+    // after any other worker crash/reset.
+    void _resetWorker();
+  });
 }
 
 /** Telemetry for /settings/user/memory diagnostics. */

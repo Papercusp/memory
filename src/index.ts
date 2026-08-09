@@ -146,6 +146,7 @@ export {
   buildLocalEmbedder,
   getWorkerState,
   _resetWorker,
+  shutdownLocalEmbedder,
   LOCAL_EMBEDDER_MODEL,
 } from './local-embedder-worker';
 
