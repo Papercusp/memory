@@ -16,29 +16,38 @@
  *    google/embeddinggemma-300m's model card the officially supported ones are
  *    768, 512, 256 and 128 — **384 is NOT among them**. So do NOT read this as
  *    "any prefix is a valid lower-dim embedding": an intermediate prefix is an
- *    UNTRAINED cut. It degrades gracefully rather than breaking (the space is
- *    still coherent — this is a quality question, not a correctness one), but
- *    it is not optimized, and 384 sits between two trained points with NO
- *    published measurement. It may sit BELOW the 512/256 interpolation rather
- *    than on it. Published curve (MTEB Multilingual v2, Mean(Task)):
+ *    UNTRAINED cut.
+ *
+ *    ⚠ WE RUN AT THE NATIVE 768 AND TRUNCATE NOTHING. This file previously
+ *    truncated to 384 to fit the then-existing `vector(384)` columns, and said
+ *    so here at length. That cut is GONE (D-005, migration 727 widened every
+ *    prose column to 768) — it was an untrained intermediate prefix and it
+ *    MEASURED badly: prose retrieval MRR @384 .2889 vs @512 .3435 and @768
+ *    .3492, with the paired bootstrap excluding zero for both
+ *    (@768 +.0603, CI [.0210,.1022]) — D-003, plan
+ *    `prose-embedding-384-untrained-mrl-fix-2026-08-02`, which measured this
+ *    rather than assuming either way. Published curve for reference
+ *    (MTEB Multilingual v2, Mean(Task)):
  *      768 -> 61.15 | 512 -> 60.71 | 256 -> 59.68 | 128 -> 58.23   (384: unmeasured)
  *
- *    We nonetheless truncate to 384 + L2-renormalize (`mrlTruncate`) so it
- *    reuses the entire existing 384-dim vector infrastructure (the vector(384)
- *    columns, incl. the 5 shared-column prose surfaces) with NO wide column
- *    migration. That is a deliberate infrastructure-fit tradeoff, NOT a claim
- *    that 384 is a supported MRL dim — the original docblock asserted the
- *    latter, and that is precisely what licensed this cut unexamined
- *    (EI-19301722864393687). The correct MRL procedure is
- *    truncate-THEN-normalize, so we ask the pipeline for an UN-normalized
- *    vector (`normalize: false`) and normalize the 384-slice ourselves.
+ *    The fix was to REMOVE the truncation, not relocate it to a trained point:
+ *    at `targetDims === nativeDims` the untrained-cut bug class is structurally
+ *    impossible rather than one config typo away, and it costs no extra compute
+ *    (the model always runs a native-768 forward pass; MRL is only a slice
+ *    afterwards). See `EMBEDDER_DIM_SPECS.gemma` in ./embedder-dims, which is
+ *    the single place the width is declared.
  *
- *    If you are changing this target: prefer a TRAINED dim (512/256), or a
- *    natively-384 model (granite-embedding-97m-multilingual-r2), over another
- *    intermediate prefix. Full 768 remains a deferred max-quality follow-up
- *    (needs wider column migrations). Tracked by plan
- *    `prose-embedding-384-untrained-mrl-fix-2026-08-02`, which MEASURES this
- *    rather than assuming either way.
+ *    `mrlTruncate` is still on the write path and still load-bearing: at 768
+ *    its slice is an identity, but it performs the L2 renormalization. The
+ *    correct MRL procedure is truncate-THEN-normalize, so we ask the pipeline
+ *    for an UN-normalized vector (`normalize: false`) and normalize ourselves.
+ *
+ *    If you are ever changing this target: a width change is a multi-hour,
+ *    all-at-once migration (~395k vectors; pgvector cannot cast between
+ *    widths), and any narrower value must be a TRAINED dim (512/256) — never
+ *    another intermediate prefix. The original docblock's claim that 384 was a
+ *    supported MRL dim is exactly what licensed the cut unexamined
+ *    (EI-19301722864393687).
  *
  * 3. TASK PROMPTS — EmbeddingGemma is an asymmetric dual-encoder trained with
  *    task prefixes. Documents and queries get DIFFERENT prompts, and the two
@@ -48,8 +57,10 @@
  *    suboptimal — so this is a quality knob, never a correctness footgun.
  *
  * SPACE: EmbeddingGemma vectors are a DISTINCT embedding space from BGE and
- * OpenAI (the embedding-space-vs-dimension scar / EI-8913) — same 384 dims,
- * incomparable cosine. They live in their own `memory_vec_gemma` table
+ * OpenAI (the embedding-space-vs-dimension scar / EI-8913) — and the scar is
+ * SHARPER now, not milder: gemma and openai are both 768-wide, so a shared
+ * dimension is emphatically not a shared space and their cosines remain
+ * incomparable. They live in their own `memory_vec_gemma` table
  * (migration 534), selected by `ResolvedEmbedder.mode === 'gemma'`.
  */
 
@@ -61,10 +72,10 @@ import { dynamicImport } from './dynamic-import';
 export const GEMMA_MODEL = 'onnx-community/embeddinggemma-300m-ONNX';
 /** The @huggingface/transformers package (lazily resolved — optional dep). */
 const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
-/** MRL truncation target — chosen to match the existing vector(384) columns,
- *  NOT because 384 is a trained MRL dim. EmbeddingGemma's supported MRL dims are
- *  768/512/256/128; 384 is an untrained intermediate cut. See the DIMENSION note
- *  in the file docblock before changing this (EI-19301722864393687).
+/** MRL truncation target — currently the model's NATIVE 768, so this slice is
+ *  an identity and no untrained cut happens (the former 384 is gone; D-005).
+ *  EmbeddingGemma's supported MRL dims are 768/512/256/128. See the DIMENSION
+ *  note in the file docblock before changing this (EI-19301722864393687).
  *
  *  DERIVED from the declared spec rather than restated, so the dim this file
  *  truncates to is by construction the dim `embedder-dims.ts` declares — and

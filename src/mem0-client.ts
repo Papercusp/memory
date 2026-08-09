@@ -573,7 +573,8 @@ async function buildClient(): Promise<MemoryClient | null> {
   const collectionName = `${MEM0_COLLECTION_PREFIX}_${resolved.mode}`;
   // Per-embedder-model vec table = the embedding SPACE (embedding-space-vs-dimension
   // / EI-8913). Each mode writes to its own table so vectors from different models
-  // never mix. 'gemma' = EmbeddingGemma-300m @ MRL-384 (migration 534);
+  // never mix. 'gemma' = EmbeddingGemma-300m @ native 768 (table added by
+  // migration 534 at 384, widened to 768 by migration 727 / D-005);
   // 'harrier' = harrier-oss-0.6b @ native-1024 (migration 547).
   const vecTable =
     resolved.mode === 'openai'
