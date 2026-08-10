@@ -32,6 +32,22 @@ let _worker: Worker | null = null;
 let _workerReady: Promise<void> | null = null;
 let _nextId = 0;
 const _pending = new Map<number, PendingRequest>();
+/**
+ * Set ONLY for genuine, permanent unavailability — the worker could not be
+ * CONSTRUCTED at all (no `worker_threads`, missing script, spawn threw). A
+ * runtime crash deliberately does NOT set this: it clears the worker handle so
+ * the next call respawns one.
+ *
+ * That asymmetry is the point (EI-16184's lesson, re-learned here as
+ * EI-20012631851693581): treating a transient crash as permanent condemns every
+ * later call in the process to the inline, main-thread-blocking path — i.e. one
+ * hiccup silently undoes this whole module for the rest of the process's life.
+ * EI-16184 removed that stickiness from the per-CLOSURE booleans; an equivalent
+ * one had survived at module scope, here.
+ *
+ * ⚠ If you add a new assignment site, it must be a CONSTRUCTION failure. There
+ * is a guard test for exactly this (`a transient runtime crash does not latch`).
+ */
 let _workerDisabled = false;
 /** Guards the process-level `beforeExit` hook below so it is registered at
  *  most once for the life of the process, no matter how many times
@@ -39,6 +55,53 @@ let _workerDisabled = false;
 let _beforeExitHookInstalled = false;
 /** The actual listener function, kept so a test can remove exactly it. */
 let _beforeExitListener: (() => Promise<void>) | null = null;
+
+/**
+ * Whether the worker is currently holding the event loop open. Mirrors the last
+ * `ref()`/`unref()` we issued, because `Worker` exposes no way to read it back.
+ */
+let _refd = false;
+
+/**
+ * Hold the loop open for EXACTLY as long as a request is in flight, and not one
+ * moment longer.
+ *
+ * WHY BOTH HALVES ARE LOAD-BEARING (WI-37683, the sibling of WI-37680 in
+ * `libs/generic/rerank/src/local-reranker-worker.ts` — this module is the one
+ * that was copied from). An always-ref'd worker keeps a one-shot script alive
+ * forever, which is the bug the original `unref()` below fixed. But an
+ * always-UNREF'd worker is worse in a way that is *silent*: while the caller
+ * awaits its vector, neither the unref'd worker nor the awaited Promise counts
+ * as loop work, so a host with nothing else ref'd is considered IDLE
+ * **mid-request**. `beforeExit` then fires, the hook terminates the worker, and
+ * because `_resetWorker` used to CLEAR `_pending` rather than reject it, the
+ * caller's promise never settled at all — the process just exited 0 having
+ * produced neither a vector nor an error.
+ *
+ * So the whole worker-thread mechanism silently did not apply on any host whose
+ * loop is otherwise empty: every CLI, bench, migration driver and one-off
+ * script. The operator was never affected, because an HTTP server's loop is
+ * never idle — i.e. it failed only where nobody watches and worked everywhere
+ * anybody looks, which is how it survived this long.
+ *
+ * The window is the whole model load, not just inference: the worker script
+ * posts `{kind:'ready'}` as soon as its message handler is installed, BEFORE
+ * building any pipeline. Measured 2026-08-10: a standalone script awaiting one
+ * `embedViaWorker` was stranded 3/3, with `beforeExit` observing
+ * `pendingCount: 1`; the byte-identical script with a `setInterval` holding the
+ * loop ref'd returned a 384-dim vector in 683ms.
+ *
+ * Ref'ing only while `_pending` is non-empty satisfies both: a script that
+ * awaits an embedding stays alive until its vector arrives, then exits on its
+ * own.
+ */
+function syncWorkerRef(): void {
+  const want = _pending.size > 0;
+  if (!_worker || want === _refd) return;
+  if (want) _worker.ref();
+  else _worker.unref();
+  _refd = want;
+}
 
 function workerPath(): string {
   // The worker script is co-located in the same dir as this module.
@@ -82,7 +145,11 @@ function ensureWorker(): Promise<void> {
         // (or a natural process exit) gives it. Unref'ing lets a script with
         // no other pending work exit ON ITS OWN once it's done, which is the
         // fix that removes the NEED for `process.exit()` in future scripts.
-        _worker?.unref();
+        //
+        // WI-37683: unconditionally unref'ing here strands any request already
+        // in flight, so let `syncWorkerRef` decide — idle ⇒ unref (the
+        // behaviour above), a request pending ⇒ ref until it lands.
+        syncWorkerRef();
         installBeforeExitHook();
         resolveReady();
         return;
@@ -91,6 +158,9 @@ function ensureWorker(): Promise<void> {
       const p = _pending.get(msg.id);
       if (!p) return;
       _pending.delete(msg.id);
+      // Release the loop as soon as the LAST request lands, so a one-off script
+      // still exits on its own (WI-37683 — the other half of syncWorkerRef).
+      syncWorkerRef();
       if (msg.kind === 'embed_ok' && Array.isArray(msg.vector)) {
         p.resolve(msg.vector);
       } else {
@@ -101,17 +171,39 @@ function ensureWorker(): Promise<void> {
       // Reject every pending request — the worker crashed.
       for (const [, p] of _pending) p.reject(err);
       _pending.clear();
-      _workerDisabled = true;
+      // EI-20012631851693581: deliberately NOT `_workerDisabled`. A runtime
+      // crash is TRANSIENT; clearing the handle is what makes the next call
+      // respawn. Latching here condemned every later embed in the process to
+      // the inline, main-thread-blocking path (~6s vs ~36ms per embed,
+      // WI-4196's numbers) for the rest of its life — one hiccup silently
+      // undoing this whole module. That is the exact stickiness EI-16184
+      // removed from the per-closure booleans; it had survived one level up,
+      // at module scope, while this file's own doc claimed a crash self-heals.
+      //
+      // Measured before the fix: injecting one 'error' event left
+      // getWorkerState() at `disabled: true` and the next embed rejected
+      // `worker disabled` permanently.
       _worker = null;
       _workerReady = null;
+      _refd = false;
       if (!initialized) rejectReady(err);
     });
     _worker.on('exit', (code) => {
       if (code !== 0 && !initialized) {
         rejectReady(new Error(`worker exited with code ${code} before ready`));
       }
+      // WI-37683: a worker that exits with requests still pending must REJECT
+      // them. Dropping them silently is what turned the old unref bug into a
+      // process that exited 0 with neither a vector nor an error — the caller's
+      // promise simply never settled, so there was nothing to notice.
+      if (_pending.size > 0) {
+        const err = new Error(`embedder worker exited with code ${code} while ${_pending.size} request(s) were in flight`);
+        for (const [, p] of _pending) p.reject(err);
+        _pending.clear();
+      }
       _worker = null;
       _workerReady = null;
+      _refd = false;
     });
   });
 
@@ -164,6 +256,10 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
   const id = _nextId++;
   return new Promise<number[]>((resolveEmbed, rejectEmbed) => {
     _pending.set(id, { resolve: resolveEmbed, reject: rejectEmbed });
+    // Ref BEFORE posting: between the post and the reply the caller is awaiting
+    // a Promise, which is not loop work — an unref'd worker would leave the loop
+    // looking idle and let `beforeExit` terminate this very request (WI-37683).
+    syncWorkerRef();
     _worker!.postMessage({
       kind: 'embed',
       id,
@@ -187,7 +283,16 @@ export async function _resetWorker(): Promise<void> {
   _worker = null;
   _workerReady = null;
   _workerDisabled = false;
+  // WI-37683: reject, never silently drop. `terminate()` normally fires the
+  // `exit` handler above (which rejects), but that is not guaranteed to have
+  // run by the time we get here, and a `_pending.clear()` on its own is exactly
+  // how a stranded caller ends up awaiting a promise that settles never.
+  if (_pending.size > 0) {
+    const err = new Error(`embedder worker was shut down while ${_pending.size} request(s) were in flight`);
+    for (const [, p] of _pending) p.reject(err);
+  }
   _pending.clear();
+  _refd = false;
   _nextId = 0;
 }
 
@@ -206,10 +311,11 @@ export async function _resetWorker(): Promise<void> {
  * which is what surfaces as an unlabelled `terminate called after throwing an instance of
  * 'Napi::Error'` AFTER your script's real output has already printed.
  *
- * Scripts that never call `process.exit()` at all no longer need this: the worker unrefs itself
- * once ready, so a script with no other pending work exits on its own once it's done, running the
- * same graceful worker teardown automatically (see the `beforeExit` hook below). This export exists
- * for the case an explicit `process.exit()` is unavoidable.
+ * Scripts that never call `process.exit()` at all no longer need this: the worker holds the loop
+ * open only while a request is actually in flight and releases it the moment the last one lands
+ * (`syncWorkerRef`), so a script with no other pending work exits on its own once it's done,
+ * running the same graceful worker teardown automatically (see the `beforeExit` hook below). This
+ * export exists for the case an explicit `process.exit()` is unavoidable.
  */
 export const shutdownLocalEmbedder = _resetWorker;
 
@@ -246,7 +352,16 @@ function installBeforeExitHook(): void {
   // down after this fires is harmless either way — `ensureWorker` respawns
   // one lazily on the next real embed call, exactly as it already does after
   // any other worker crash/reset.
-  _beforeExitListener = () => _resetWorker();
+  //
+  // The pending guard is belt-and-braces: `syncWorkerRef` should make an idle
+  // loop impossible while a request is in flight, so this branch is unreachable
+  // by design. It stays because the failure it prevents (terminating a worker
+  // mid-request) was SILENT for the whole life of this module, and because a
+  // future ref bug would otherwise re-open it (WI-37683).
+  _beforeExitListener = async () => {
+    if (_pending.size > 0) return;
+    await _resetWorker();
+  };
   process.on('beforeExit', _beforeExitListener);
 }
 
@@ -265,11 +380,20 @@ export function getWorkerState(): {
   alive: boolean;
   disabled: boolean;
   pendingCount: number;
+  /**
+   * Whether the worker is currently holding the event loop open. The invariant
+   * is `keepAlive === (pendingCount > 0)`; a worker NOT holding the loop while
+   * it still owes an answer is the WI-37683 defect (`beforeExit` fires
+   * mid-request and terminates the worker), so this is exported to be asserted
+   * rather than inferred.
+   */
+  keepAlive: boolean;
 } {
   return {
     alive: _worker !== null,
     disabled: _workerDisabled,
     pendingCount: _pending.size,
+    keepAlive: _refd,
   };
 }
 
