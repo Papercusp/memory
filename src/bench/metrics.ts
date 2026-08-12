@@ -14,9 +14,20 @@ export function precisionAtK(expected: readonly string[], ranked: readonly strin
   return hits / k;
 }
 
-/** Recall@k: relevant∩top-k / |relevant|. 0 when nothing was expected. */
-export function recallAtK(expected: readonly string[], ranked: readonly string[], k: number): number {
-  if (expected.length === 0 || k <= 0) return 0;
+/**
+ * Recall@k for the benchmark's set-based contract: relevant∩top-k / |relevant|.
+ *
+ * The explicit name prevents accidental substitution with search-core's
+ * `recallAtK`, whose two string-array arguments are ordered retrieved-first.
+ * `null` means that no ground truth was supplied; it is not a measured miss.
+ */
+export function recallAtKBySet(
+  expected: readonly string[],
+  ranked: readonly string[],
+  k: number,
+): number | null {
+  if (expected.length === 0) return null;
+  if (k <= 0) return 0;
   const exp = new Set(expected);
   const top = ranked.slice(0, k);
   const hits = top.filter((key) => exp.has(key)).length;
@@ -53,7 +64,11 @@ export function aggregateOutcomes(outcomes: readonly QueryOutcome[]): RankMetric
   const metrics: RankMetrics = {
     n: outcomes.length,
     p5: mean(positives.map((o) => precisionAtK(o.expected, o.rankedKeys, 5))),
-    r10: mean(positives.map((o) => recallAtK(o.expected, o.rankedKeys, 10))),
+    r10: mean(
+      positives
+        .map((o) => recallAtKBySet(o.expected, o.rankedKeys, 10))
+        .filter((value): value is number => value !== null),
+    ),
     mrr: mean(positives.map((o) => reciprocalRank(o.expected, o.rankedKeys))),
   };
   const scored = outcomes.filter((o) => typeof o.topScore === 'number');

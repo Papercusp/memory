@@ -30,7 +30,7 @@ import {
   aggregateOutcomes,
   latencyStats,
   precisionAtK,
-  recallAtK,
+  recallAtKBySet,
   reciprocalRank,
 } from './metrics';
 import { rankedCorpusKeys, runGoldSet } from './retrieval';
@@ -124,8 +124,9 @@ describe('rank metrics', () => {
   it('precision/recall/RR hand cases', () => {
     expect(precisionAtK(['a'], ['a', 'b', 'c', 'd', 'e'], 5)).toBeCloseTo(1 / 5);
     expect(precisionAtK(['a', 'b'], ['b', 'x', 'a', 'y', 'z'], 5)).toBeCloseTo(2 / 5);
-    expect(recallAtK(['a', 'b'], ['b', 'x', 'a'], 10)).toBeCloseTo(1);
-    expect(recallAtK(['a', 'b'], ['b'], 10)).toBeCloseTo(0.5);
+    expect(recallAtKBySet(['a', 'b'], ['b', 'x', 'a'], 10)).toBeCloseTo(1);
+    expect(recallAtKBySet(['a', 'b'], ['b'], 10)).toBeCloseTo(0.5);
+    expect(recallAtKBySet([], ['x'], 10)).toBeNull();
     expect(reciprocalRank(['a'], ['x', 'a'])).toBeCloseTo(0.5);
     expect(reciprocalRank(['a'], ['a'])).toBe(1);
     expect(reciprocalRank(['a'], ['x', 'y'])).toBe(0);

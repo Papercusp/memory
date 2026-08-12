@@ -30,7 +30,7 @@ export {
   aggregateOutcomes,
   latencyStats,
   precisionAtK,
-  recallAtK,
+  recallAtKBySet,
   reciprocalRank,
 } from './metrics';
 
