@@ -333,11 +333,13 @@ describe('HybridBackend (P-020)', () => {
       expect(seen).toEqual([
         {
           mode: 'cosine-gated',
-          cosine: { ran: true, candidates: 0, qualifying: 0 },
+          cosine: { ran: true, candidates: 0, qualifying: 0, durationMs: expect.any(Number) },
           lexical: { ran: false },
           fused: 0,
+          totalMs: expect.any(Number),
         },
       ]);
+      expect(seen[0]).not.toHaveProperty('fusionMs');
     });
 
     it('records each leg its OWN depth — the lexical leg pulls 3x the cosine budget', async () => {
@@ -359,6 +361,35 @@ describe('HybridBackend (P-020)', () => {
       });
       expect(seen!.cosine.depth).toBe(4);
       expect(seen!.lexical.depth).toBe(12); // (limit ?? 6) * 3
+    });
+
+    it('reports per-leg, fusion, and end-to-end durations on a fused call', async () => {
+      const cosine = fakeBackend('cosine', [e('a', 0.9)]);
+      const lexical = fakeBackend('lexical', [e('a', 0.9)]);
+      const hy = new HybridBackend(lexical, cosine, { fusionMode: 'floored-union' });
+      let seen: SearchLegStats | null = null;
+      await hy.search('q', {
+        scope: 's',
+        limit: 4,
+        fusionMode: 'floored-union',
+        minScore: 0.45,
+        onLegStats: (stats) => {
+          seen = stats;
+        },
+      });
+
+      expect(seen).toMatchObject({
+        cosine: { durationMs: expect.any(Number) },
+        lexical: { durationMs: expect.any(Number) },
+        fusionMs: expect.any(Number),
+        totalMs: expect.any(Number),
+      });
+      expect(seen!.cosine.durationMs).toBeGreaterThanOrEqual(0);
+      expect(seen!.lexical.durationMs).toBeGreaterThanOrEqual(0);
+      expect(seen!.fusionMs).toBeGreaterThanOrEqual(0);
+      expect(seen!.totalMs).toBeGreaterThanOrEqual(seen!.fusionMs!);
+      expect(seen!.totalMs).toBeGreaterThanOrEqual(seen!.cosine.durationMs!);
+      expect(seen!.totalMs).toBeGreaterThanOrEqual(seen!.lexical.durationMs!);
     });
 
     it('a throwing reporter never fails the search', async () => {

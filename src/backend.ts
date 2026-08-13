@@ -149,6 +149,8 @@ export interface LegRunStats {
    * contract as `RecallPoolStats.limit` on the operator's telemetry.
    */
   depth?: number;
+  /** Wall time spent inside this leg for this call (monotonic milliseconds). */
+  durationMs?: number;
 }
 
 /** What every leg did on one fused call — reported via `SearchOptions.onLegStats`. */
@@ -159,6 +161,10 @@ export interface SearchLegStats {
   mode: string;
   /** Distinct entries in the FUSED candidate set, before any caller-side limit. */
   fused: number;
+  /** Wall time spent building the fused ranking. Undefined when fusion did not run. */
+  fusionMs?: number;
+  /** End-to-end wall time inside the hybrid backend's `search()` call. */
+  totalMs?: number;
 }
 
 /** One stored fact, in the neutral shape every surface renders. */

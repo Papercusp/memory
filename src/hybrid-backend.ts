@@ -58,6 +58,9 @@ import { createTextSimilarity, diversityDisabledByEnv, diversityRerank } from '.
  */
 const RERANK_DEPTH_FACTOR = 3;
 
+/** Monotonic where available; Date.now keeps the generic package portable. */
+const nowMs = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
 export interface HybridBackendOptions {
   /** RRF damping constant (default 60). */
   rrfK?: number;
@@ -214,6 +217,7 @@ export class HybridBackend implements MemoryBackend {
   }
 
   async search(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
+    const totalStartedAt = nowMs();
     // Per-call overrides (the P-031 sweep) win over the constructor defaults.
     const mode = opts.fusionMode ?? this.opts.fusionMode ?? 'floored-union';
     const minLexScore = opts.minLexScore ?? this.opts.minLexScore;
@@ -252,12 +256,16 @@ export class HybridBackend implements MemoryBackend {
     // embeds ONE vector, so identifiers dilute it; the lexical leg is the leg
     // that wins on them) and for the length warning that comes with it.
     const lexicalText = opts.lexicalQuery?.trim() ? opts.lexicalQuery : query;
+    let lexicalDurationMs: number | undefined;
     const runLexical = (): Promise<MemoryEntry[]> =>
       (async () => {
+        const startedAt = nowMs();
         try {
           return await this.lexical.search(lexicalText, { scope: opts.scope, limit: depth });
         } catch {
           return [];
+        } finally {
+          lexicalDurationMs = Math.max(0, nowMs() - startedAt);
         }
       })();
 
@@ -296,20 +304,36 @@ export class HybridBackend implements MemoryBackend {
         /* swallow — telemetry is never load-bearing */
       }
     };
+    const cosineStartedAt = nowMs();
     const cosineHits = await this.cosine.search(query, cosineOpts);
+    const cosineDurationMs = Math.max(0, nowMs() - cosineStartedAt);
     if (cosineHits.length === 0 && gated) {
       // The lexical leg NEVER STARTED — contracted behaviour, not a failure.
       // Reported as `ran: false` so a reader cannot mistake the short-circuit
       // for a leg that ran and found nothing; those have opposite fixes.
       report({
         mode,
-        cosine: { ran: true, candidates: 0, qualifying: 0, ...(opts.limit !== undefined ? { depth: opts.limit } : {}) },
+        cosine: {
+          ran: true,
+          candidates: 0,
+          qualifying: 0,
+          ...(opts.limit !== undefined ? { depth: opts.limit } : {}),
+          durationMs: cosineDurationMs,
+        },
         lexical: { ran: false },
         fused: 0,
+        totalMs: Math.max(0, nowMs() - totalStartedAt),
       });
       return []; // lexical leg never started — as contracted
     }
     const lexicalHits = await (inFlightLexical ?? runLexical());
+    let fusionStats: {
+      cosineCandidates: number;
+      lexicalCandidates: number;
+      lexicalQualifying: number;
+      fused: number;
+    } | null = null;
+    const fusionStartedAt = nowMs();
     const fused = fuse(cosineHits, lexicalHits, {
       k: this.opts.rrfK ?? DEFAULT_RRF_K,
       mode,
@@ -317,39 +341,47 @@ export class HybridBackend implements MemoryBackend {
       ...(this.opts.lexWeight !== undefined ? { lexWeight: this.opts.lexWeight } : {}),
       ...(onLegStats
         ? {
-            onFusionStats: (s) =>
-              report({
-                mode,
-                // The cosine leg carries no post-hoc admission bar of its own
-                // (its FP floor is applied inside the leg), so qualifying ===
-                // candidates there. The lexical leg's bar is `minLexScore`, and
-                // its two numbers are what say whether that bar is doing
-                // anything on this workload.
-                //
-                // ⚠ The two legs have DIFFERENT budgets and each records its
-                // own: the cosine leg gets `opts.limit`, the lexical leg pulls
-                // `depth` (= lexicalDepth ?? limit*3) PER SCOPE. Recording one
-                // for both would make every saturation read on the other leg
-                // wrong by a factor of three.
-                cosine: {
-                  ran: true,
-                  candidates: s.cosineCandidates,
-                  qualifying: s.cosineCandidates,
-                  ...(opts.limit !== undefined ? { depth: opts.limit } : {}),
-                },
-                lexical: {
-                  ran: true,
-                  candidates: s.lexicalCandidates,
-                  qualifying: s.lexicalQualifying,
-                  depth,
-                },
-                fused: s.fused,
-              }),
+            onFusionStats: (s) => {
+              fusionStats = s;
+            },
           }
         : {}),
     });
+    const fusionMs = Math.max(0, nowMs() - fusionStartedAt);
     const diversified = this.diversify(fused, diversify, opts.limit);
-    return opts.limit !== undefined ? diversified.slice(0, opts.limit) : diversified;
+    const result = opts.limit !== undefined ? diversified.slice(0, opts.limit) : diversified;
+    if (fusionStats) {
+      // The cosine leg carries no post-hoc admission bar of its own (its FP floor
+      // is applied inside the leg), so qualifying === candidates there. The
+      // lexical leg's bar is `minLexScore`, and its two numbers are what say
+      // whether that bar is doing anything on this workload.
+      //
+      // ⚠ The two legs have DIFFERENT budgets and each records its own: the cosine
+      // leg gets `opts.limit`, the lexical leg pulls `depth` (= lexicalDepth ??
+      // limit*3) PER SCOPE. Recording one for both would make every saturation
+      // read on the other leg wrong by a factor of three.
+      report({
+        mode,
+        cosine: {
+          ran: true,
+          candidates: fusionStats.cosineCandidates,
+          qualifying: fusionStats.cosineCandidates,
+          ...(opts.limit !== undefined ? { depth: opts.limit } : {}),
+          durationMs: cosineDurationMs,
+        },
+        lexical: {
+          ran: true,
+          candidates: fusionStats.lexicalCandidates,
+          qualifying: fusionStats.lexicalQualifying,
+          depth,
+          durationMs: lexicalDurationMs,
+        },
+        fused: fusionStats.fused,
+        fusionMs,
+        totalMs: Math.max(0, nowMs() - totalStartedAt),
+      });
+    }
+    return result;
   }
 
   /**
