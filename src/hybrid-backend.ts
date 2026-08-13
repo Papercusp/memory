@@ -353,12 +353,14 @@ export class HybridBackend implements MemoryBackend {
       return []; // lexical leg never started — as contracted
     }
     const lexicalHits = await (inFlightLexical ?? runLexical());
-    let fusionStats: {
-      cosineCandidates: number;
-      lexicalCandidates: number;
-      lexicalQualifying: number;
-      fused: number;
-    } | null = null;
+    const observedFusion: {
+      current?: {
+        cosineCandidates: number;
+        lexicalCandidates: number;
+        lexicalQualifying: number;
+        fused: number;
+      };
+    } = {};
     const fusionStartedAt = nowMs();
     const fused = fuse(cosineHits, lexicalHits, {
       k: this.opts.rrfK ?? DEFAULT_RRF_K,
@@ -370,7 +372,7 @@ export class HybridBackend implements MemoryBackend {
       ...(onLegStats
         ? {
             onFusionStats: (s) => {
-              fusionStats = s;
+              observedFusion.current = s;
             },
           }
         : {}),
@@ -379,6 +381,7 @@ export class HybridBackend implements MemoryBackend {
     const diversified = this.diversify(fused, diversify, opts.limit);
     const result =
       opts.limit !== undefined ? diversified.slice(0, opts.limit) : diversified;
+    const fusionStats = observedFusion.current;
     if (fusionStats) {
       // The cosine leg carries no post-hoc admission bar of its own (its FP floor
       // is applied inside the leg), so qualifying === candidates there. The
