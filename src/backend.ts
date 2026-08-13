@@ -56,7 +56,7 @@
  * - `unknown` — the backend declined to say. Treated as its own bucket and
  *               NEVER pooled with a labelled one.
  */
-export type ScoreScale = 'cosine' | 'rrf' | 'lexical' | 'unknown';
+export type ScoreScale = "cosine" | "rrf" | "lexical" | "unknown";
 
 /**
  * WHICH RETRIEVAL LEG(S) produced an entry, and at what rank within each.
@@ -378,7 +378,7 @@ export type SearchFloorPolicy =
       /** No relevance floor requested — fusion mode is a free choice. */
       minScore?: undefined;
       minScoreRatio?: undefined;
-      fusionMode?: 'floored-union' | 'cosine-gated';
+      fusionMode?: "floored-union" | "cosine-gated";
     }
   | {
       /**
@@ -401,7 +401,7 @@ export type SearchFloorPolicy =
        * hits independently of that floor — correct for recall-oriented callers,
        * wrong for a push path, and never what you should get by accident.
        */
-      fusionMode: 'floored-union' | 'cosine-gated';
+      fusionMode: "floored-union" | "cosine-gated";
     };
 
 export type SearchOptions = SearchOptionsCommon & SearchFloorPolicy;
@@ -439,7 +439,7 @@ export type MemoryAvailability = { ok: true } | { ok: false; reason: string };
 export class MemoryUnavailableError extends Error {
   constructor(public readonly reason: string) {
     super(`memory backend unavailable: ${reason}`);
-    this.name = 'MemoryUnavailableError';
+    this.name = "MemoryUnavailableError";
   }
 }
 
@@ -472,7 +472,10 @@ export interface MemoryBackend {
    * Backends that can't distinguish merges may omit it; callers fall
    * back to `ids.length`.
    */
-  remember(text: string, opts: RememberOptions): Promise<{ ids: string[]; storedEvents?: number }>;
+  remember(
+    text: string,
+    opts: RememberOptions,
+  ): Promise<{ ids: string[]; storedEvents?: number }>;
 
   /** Semantic/text search. See `SearchOptions` for limit semantics. */
   search(query: string, opts: SearchOptions): Promise<MemoryEntry[]>;
@@ -547,7 +550,10 @@ export interface MemoryBackend {
    * `invalidate()` above. Backends without validity semantics omit it;
    * callers feature-test (`backend.invalidateEntry?.(…)`).
    */
-  invalidateEntry?(id: string, opts?: { supersededBy?: string }): Promise<boolean>;
+  invalidateEntry?(
+    id: string,
+    opts?: { supersededBy?: string },
+  ): Promise<boolean>;
 
   /**
    * OPTIONAL capability (EI-12992): embed `text` ONCE with this backend's own
@@ -563,6 +569,6 @@ export interface MemoryBackend {
 
 /** Normalize a `scope: string | readonly string[]` arg to a de-duped array. */
 export function scopesOf(scope: string | readonly string[]): string[] {
-  const arr = typeof scope === 'string' ? [scope] : [...scope];
-  return [...new Set(arr.filter((s) => typeof s === 'string' && s.length > 0))];
+  const arr = typeof scope === "string" ? [scope] : [...scope];
+  return [...new Set(arr.filter((s) => typeof s === "string" && s.length > 0))];
 }

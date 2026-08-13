@@ -44,9 +44,13 @@ import type {
   SearchLegStats,
   SearchOptions,
   UpdatePatch,
-} from './backend';
-import { DEFAULT_RRF_K, fuse, type FusionMode } from './hybrid-fusion';
-import { createTextSimilarity, diversityDisabledByEnv, diversityRerank } from './diversity-rerank';
+} from "./backend";
+import { DEFAULT_RRF_K, fuse, type FusionMode } from "./hybrid-fusion";
+import {
+  createTextSimilarity,
+  diversityDisabledByEnv,
+  diversityRerank,
+} from "./diversity-rerank";
 
 /**
  * How deep into the fused list the optional diversity re-rank looks, as a
@@ -59,7 +63,8 @@ import { createTextSimilarity, diversityDisabledByEnv, diversityRerank } from '.
 const RERANK_DEPTH_FACTOR = 3;
 
 /** Monotonic where available; Date.now keeps the generic package portable. */
-const nowMs = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+const nowMs = (): number =>
+  typeof performance !== "undefined" ? performance.now() : Date.now();
 
 export interface HybridBackendOptions {
   /** RRF damping constant (default 60). */
@@ -121,11 +126,11 @@ export class HybridBackend implements MemoryBackend {
    * early return, which yields an EMPTY array (no scores at all). So this is a
    * constant, not a mode-dependent value.
    */
-  readonly scoreScale = 'rrf' as const;
+  readonly scoreScale = "rrf" as const;
 
   /** `searchLexical()` delegates to the cosine leg's own lexical capability
    *  and does NOT fuse — those scores stay on the raw lexical scale. */
-  readonly lexicalScoreScale = 'lexical' as const;
+  readonly lexicalScoreScale = "lexical" as const;
 
   /**
    * Shared-embed capability (EI-12992) — delegated to the COSINE leg, which is
@@ -154,7 +159,7 @@ export class HybridBackend implements MemoryBackend {
     private readonly cosine: MemoryBackend,
     private readonly opts: HybridBackendOptions = {},
   ) {
-    this.name = opts.name ?? 'hybrid';
+    this.name = opts.name ?? "hybrid";
     const cosineEmbed = cosine.embedQuery?.bind(cosine);
     if (cosineEmbed) this.embedQuery = cosineEmbed;
   }
@@ -163,7 +168,10 @@ export class HybridBackend implements MemoryBackend {
     return this.cosine.available();
   }
 
-  async remember(text: string, opts: RememberOptions): Promise<{ ids: string[]; storedEvents?: number }> {
+  async remember(
+    text: string,
+    opts: RememberOptions,
+  ): Promise<{ ids: string[]; storedEvents?: number }> {
     // The CANONICAL write — the cosine (PG) store owns ids + durability.
     const result = await this.cosine.remember(text, opts);
     // Write-through PROJECTION into the lexical native surface so its leg can
@@ -181,7 +189,11 @@ export class HybridBackend implements MemoryBackend {
     const lexOpts: RememberOptions = linkId
       ? { ...opts, metadata: { ...(opts.metadata ?? {}), link_id: linkId } }
       : opts;
-    try { await this.lexical.remember(text, lexOpts); } catch { /* projection is best-effort */ }
+    try {
+      await this.lexical.remember(text, lexOpts);
+    } catch {
+      /* projection is best-effort */
+    }
     return result;
   }
 
@@ -199,12 +211,18 @@ export class HybridBackend implements MemoryBackend {
    * capability. The lexical projection is reconciled by re-projection, not
    * per-id mirroring (same posture as forget/update above).
    */
-  invalidateEntry(id: string, opts?: { supersededBy?: string }): Promise<boolean> {
+  invalidateEntry(
+    id: string,
+    opts?: { supersededBy?: string },
+  ): Promise<boolean> {
     const impl = this.cosine.invalidateEntry?.bind(this.cosine);
     // A false here would read as "not found" upstream — a missing capability
     // must surface as an error, not a clean negative. (The live cosine leg is
     // the Mem0Backend, which always has it.)
-    if (!impl) throw new Error('invalidateEntry: the cosine leg has no validity-window support');
+    if (!impl)
+      throw new Error(
+        "invalidateEntry: the cosine leg has no validity-window support",
+      );
     return impl(id, opts);
   }
 
@@ -219,7 +237,7 @@ export class HybridBackend implements MemoryBackend {
   async search(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
     const totalStartedAt = nowMs();
     // Per-call overrides (the P-031 sweep) win over the constructor defaults.
-    const mode = opts.fusionMode ?? this.opts.fusionMode ?? 'floored-union';
+    const mode = opts.fusionMode ?? this.opts.fusionMode ?? "floored-union";
     const minLexScore = opts.minLexScore ?? this.opts.minLexScore;
     const depth = this.opts.lexicalDepth ?? (opts.limit ?? 6) * 3;
     // ⚠ The two legs run CONCURRENTLY — they are INDEPENDENT (different rankings of the
@@ -261,7 +279,10 @@ export class HybridBackend implements MemoryBackend {
       (async () => {
         const startedAt = nowMs();
         try {
-          return await this.lexical.search(lexicalText, { scope: opts.scope, limit: depth });
+          return await this.lexical.search(lexicalText, {
+            scope: opts.scope,
+            limit: depth,
+          });
         } catch {
           return [];
         } finally {
@@ -269,7 +290,7 @@ export class HybridBackend implements MemoryBackend {
         }
       })();
 
-    const gated = mode === 'cosine-gated';
+    const gated = mode === "cosine-gated";
     // Union mode: start the lexical leg NOW so it overlaps the embed-bound cosine call.
     const inFlightLexical = gated ? null : runLexical();
 
@@ -294,7 +315,12 @@ export class HybridBackend implements MemoryBackend {
     // `onLegStats` is stripped for the same reason as `diversify`/`lexicalQuery`
     // above — it is THIS backend's reporting seam, not the cosine leg's, and a
     // leg that later learned to read it would report its own half as the whole.
-    const { diversify, lexicalQuery: _lexicalQuery, onLegStats, ...cosineOpts } = opts;
+    const {
+      diversify,
+      lexicalQuery: _lexicalQuery,
+      onLegStats,
+      ...cosineOpts
+    } = opts;
     // A reporter must never be able to fail a search (SearchOptions.onLegStats).
     const report = (stats: SearchLegStats): void => {
       if (!onLegStats) return;
@@ -338,7 +364,9 @@ export class HybridBackend implements MemoryBackend {
       k: this.opts.rrfK ?? DEFAULT_RRF_K,
       mode,
       ...(minLexScore !== undefined ? { minLexScore } : {}),
-      ...(this.opts.lexWeight !== undefined ? { lexWeight: this.opts.lexWeight } : {}),
+      ...(this.opts.lexWeight !== undefined
+        ? { lexWeight: this.opts.lexWeight }
+        : {}),
       ...(onLegStats
         ? {
             onFusionStats: (s) => {
@@ -349,7 +377,8 @@ export class HybridBackend implements MemoryBackend {
     });
     const fusionMs = Math.max(0, nowMs() - fusionStartedAt);
     const diversified = this.diversify(fused, diversify, opts.limit);
-    const result = opts.limit !== undefined ? diversified.slice(0, opts.limit) : diversified;
+    const result =
+      opts.limit !== undefined ? diversified.slice(0, opts.limit) : diversified;
     if (fusionStats) {
       // The cosine leg carries no post-hoc admission bar of its own (its FP floor
       // is applied inside the leg), so qualifying === candidates there. The
@@ -408,12 +437,15 @@ export class HybridBackend implements MemoryBackend {
    */
   private diversify(
     fused: MemoryEntry[],
-    diversify: SearchOptions['diversify'],
+    diversify: SearchOptions["diversify"],
     limit: number | undefined,
   ): MemoryEntry[] {
-    if (!diversify || diversityDisabledByEnv() || fused.length <= 1) return fused;
+    if (!diversify || diversityDisabledByEnv() || fused.length <= 1)
+      return fused;
     const depth =
-      limit === undefined ? fused.length : Math.min(fused.length, limit * RERANK_DEPTH_FACTOR);
+      limit === undefined
+        ? fused.length
+        : Math.min(fused.length, limit * RERANK_DEPTH_FACTOR);
     if (depth <= 1) return fused;
     const head = diversityRerank(fused.slice(0, depth), {
       lambda: diversify.lambda,
@@ -430,7 +462,10 @@ export class HybridBackend implements MemoryBackend {
    * leg's search is itself embed-free, so it serves as the last resort. No
    * fusion here: this is an emergency recall path, not the ranked product.
    */
-  async searchLexical(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
+  async searchLexical(
+    query: string,
+    opts: SearchOptions,
+  ): Promise<MemoryEntry[]> {
     const cosineLex = this.cosine.searchLexical?.bind(this.cosine);
     if (cosineLex) {
       try {
@@ -439,6 +474,9 @@ export class HybridBackend implements MemoryBackend {
         /* fall through to the native lexical leg */
       }
     }
-    return this.lexical.search(query, { scope: opts.scope, ...(opts.limit !== undefined ? { limit: opts.limit } : {}) });
+    return this.lexical.search(query, {
+      scope: opts.scope,
+      ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+    });
   }
 }
