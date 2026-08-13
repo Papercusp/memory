@@ -8,6 +8,7 @@ import type {
   MemoryBackend,
   MemoryEntry,
   RememberOptions,
+  SearchLegStats,
   SearchOptions,
 } from "./backend";
 
