@@ -180,7 +180,13 @@ describe('ONNX Runtime thread-pool cap (WI-3792 big-host + EI-20493854163389792 
     expect(src).toContain('MAX_INTRA_OP_THREADS');
     expect(src).toContain('BACKGROUND_HOST_SHARE_DIVISOR');
     expect(src).toContain('hostParallelism()');
-    // The literal that caused the bug must not come back.
-    expect(src).not.toMatch(/intraOpNumThreads:\s*\d+/);
+
+    // The literal that caused the bug must not come back — asserted against
+    // CODE ONLY. The file's own comments quote `intraOpNumThreads: 4` while
+    // explaining the incident, and a naive match on the raw source flags that
+    // prose as the defect it describes.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[^\n]*?\/\/.*$/gm, '');
+    expect(code).toMatch(/intraOpNumThreads:\s*Math\.max\(/);
+    expect(code).not.toMatch(/intraOpNumThreads:\s*\d+/);
   });
 });
