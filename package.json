@@ -1,0 +1,32 @@
+{
+  "name": "@papercusp/memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Persistent-memory store behind a swappable MemoryBackend seam: neutral remember/search/list/forget/update verbs over {id,text,kind,scope,score,metadata}, a backend registry + selector (configureMemory({backend})), and three shipped impls — mem0 (mem0ai/oss + canonical pgvector store, per-embedder vec tables, local BGE embedder, re-embed pass), noop (clean 'no store'), and claude-file (Claude Code topic-file bridge). Host-agnostic — admin URL, LLM credentials, embedder, and backend choice are injected via configureMemory(). Zero @papercusp/@restart runtime deps.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./bench": {
+      "types": "./src/bench/index.ts",
+      "import": "./src/bench/index.ts",
+      "default": "./src/bench/index.ts"
+    }
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@papercusp/module-singleton": "*",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.15.5",
+    "vitest": "^4.1.4"
+  }
+}

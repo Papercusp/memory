@@ -1,0 +1,161 @@
+/**
+ * Harrier-oss-0.6b embedder pure-function tests (P-013). These pin the
+ * contracts that make harrier land in its OWN space correctly WITHOUT loading
+ * the ~0.6B model:
+ *   - the asymmetric instruct-query / raw-document prompts
+ *   - native-1024 vs exploratory truncated-384 widths (via mrlTruncate)
+ *   - the graph-output contract (pooling+normalize are IN the ONNX graph;
+ *     the sole output is 'sentence_embedding')
+ * The model-loading path (buildHarrierEmbedder) is exercised by the P-006
+ * bake-off smoke; here we pin the math + the prompt contract.
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import {
+  harrierPrompt,
+  HARRIER_MODEL,
+  HARRIER_NATIVE_DIMS,
+  HARRIER_GRAPH_OUTPUT,
+  HARRIER_QUERY_TASK,
+} from './harrier-embedder';
+import { mrlTruncate } from './gemma-embedder';
+
+describe('harrierPrompt (asymmetric instruct prompts)', () => {
+  it('queries get the Instruct+Query prefix with the web_search_query task', () => {
+    expect(harrierPrompt('query', 'red shoes')).toBe(
+      `Instruct: ${HARRIER_QUERY_TASK}\nQuery: red shoes`,
+    );
+  });
+
+  it('documents are embedded RAW — no prefix', () => {
+    expect(harrierPrompt('document', 'hello world')).toBe('hello world');
+  });
+
+  it('query and document prompts differ (dual-encoder)', () => {
+    expect(harrierPrompt('query', 'x')).not.toBe(harrierPrompt('document', 'x'));
+  });
+});
+
+describe('width handling (native 1024 / exploratory 384)', () => {
+  it('mrlTruncate at native width is a plain L2 norm (no truncation)', () => {
+    const v = Array.from({ length: 1024 }, (_, i) => i + 1);
+    const out = mrlTruncate(v, HARRIER_NATIVE_DIMS);
+    expect(out).toHaveLength(1024);
+    const norm = Math.sqrt(out.reduce((s, x) => s + x * x, 0));
+    expect(norm).toBeCloseTo(1, 6);
+  });
+
+  it('truncated-384 is truncate-THEN-normalize (unit norm over the slice)', () => {
+    const v = Array.from({ length: 1024 }, (_, i) => i + 1);
+    const out = mrlTruncate(v, 384);
+    expect(out).toHaveLength(384);
+    const norm = Math.sqrt(out.reduce((s, x) => s + x * x, 0));
+    expect(norm).toBeCloseTo(1, 6);
+  });
+
+  it('truncating an already-normalized vector equals truncating the raw one (scale invariance)', () => {
+    // The graph L2-normalizes sentence_embedding; truncate-then-normalize on
+    // that must equal the canonical MRL procedure on the raw vector.
+    const raw = Array.from({ length: 1024 }, (_, i) => Math.sin(i + 1) * (i + 1));
+    const unit = mrlTruncate(raw, 1024); // plain L2 norm
+    const a = mrlTruncate(raw, 384);
+    const b = mrlTruncate(unit, 384);
+    for (let i = 0; i < 384; i++) expect(b[i]).toBeCloseTo(a[i], 10);
+  });
+});
+
+describe('buildHarrierEmbedder — non-sticky worker fallback (EI-16184)', () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  /**
+   * Stub the INLINE (main-thread) fallback so these tests keep this file's
+   * stated contract — pin the worker-retry semantics "WITHOUT loading the ~0.6B
+   * model" (see the file header). Both tests below deliberately drive the
+   * embedder down the inline path, which really did `pipeline(...)` the
+   * onnx-community/harrier-oss-v1-0.6b-ONNX build: ~5-7s of real model load for
+   * a test whose subject is worker RETRY, not inference. That straddled vitest's
+   * 5s default and red-pinned the fleet green-checkpoint on candidate a94547c8
+   * ("Test timed out in 5000ms") while passing on a warm/idle box — a genuine
+   * timing flake, so the fix is to remove the real-resource dependency rather
+   * than widen the timeout. Real model loading stays covered by the P-006
+   * bake-off smoke, so no coverage moves.
+   *
+   * It must be `./dynamic-import` and not '@huggingface/transformers':
+   * dynamicImport() resolves the package through `new Function('s','return
+   * import(s)')` specifically to hide it from bundler static analysis, and that
+   * also puts it beyond vitest's module interception — mocking the package name
+   * would silently no-op and load the real model anyway.
+   */
+  const stubInlineModel = () => {
+    vi.doMock('./dynamic-import', () => ({
+      dynamicImport: async () => ({
+        pipeline: async () => ({
+          tokenizer: () => ({}),
+          model: async () => ({
+            [HARRIER_GRAPH_OUTPUT]: { data: new Float32Array(HARRIER_NATIVE_DIMS).fill(0.05) },
+          }),
+        }),
+      }),
+    }));
+  };
+
+  it('retries the worker path on the NEXT call after a transient failure — does not stick to inline forever', async () => {
+    stubInlineModel();
+    const embedViaWorker = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('transient worker hiccup'))
+      .mockResolvedValueOnce(new Array(HARRIER_NATIVE_DIMS).fill(0.1));
+    const getWorkerState = vi.fn(() => ({ alive: true, disabled: false, pendingCount: 0 }));
+    const warnEmbedFallback = vi.fn();
+    vi.doMock('./local-embedder-worker', () => ({
+      embedViaWorker,
+      getWorkerState,
+      warnEmbedFallback,
+      ORT_SESSION_OPTIONS: {},
+    }));
+
+    const { buildHarrierEmbedder } = await import('./harrier-embedder');
+    const embed = buildHarrierEmbedder({ kind: 'query' });
+
+    await embed('hello').catch(() => {});
+
+    const result = await embed('hello again');
+    expect(embedViaWorker).toHaveBeenCalledTimes(2);
+    expect(result).toHaveLength(HARRIER_NATIVE_DIMS);
+    expect(warnEmbedFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it('skips the worker entirely once the module reports genuine, permanent unavailability', async () => {
+    stubInlineModel();
+    const embedViaWorker = vi.fn().mockResolvedValue(new Array(HARRIER_NATIVE_DIMS).fill(0.1));
+    const getWorkerState = vi.fn(() => ({ alive: false, disabled: true, pendingCount: 0 }));
+    const warnEmbedFallback = vi.fn();
+    vi.doMock('./local-embedder-worker', () => ({
+      embedViaWorker,
+      getWorkerState,
+      warnEmbedFallback,
+      ORT_SESSION_OPTIONS: {},
+    }));
+
+    const { buildHarrierEmbedder } = await import('./harrier-embedder');
+    const embed = buildHarrierEmbedder({ kind: 'query' });
+    await embed('hello').catch(() => {});
+
+    expect(embedViaWorker).not.toHaveBeenCalled();
+  });
+});
+
+describe('constants', () => {
+  it('points at the Transformers.js/ONNX harrier-oss-v1-0.6b build', () => {
+    expect(HARRIER_MODEL).toBe('onnx-community/harrier-oss-v1-0.6b-ONNX');
+  });
+
+  it('is natively 1024-dim (own vector(1024) table when adopted — P-014)', () => {
+    expect(HARRIER_NATIVE_DIMS).toBe(1024);
+  });
+
+  it('reads the pre-pooled graph output (no JS-side pooling exists for this export)', () => {
+    expect(HARRIER_GRAPH_OUTPUT).toBe('sentence_embedding');
+  });
+});
