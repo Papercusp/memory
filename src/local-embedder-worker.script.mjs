@@ -17,8 +17,21 @@
  */
 
 import { parentPort } from 'node:worker_threads';
+import { availableParallelism } from 'node:os';
 
 const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
+
+/** Host parallelism, defensively — a 0/NaN/throwing reading must degrade to the
+ *  single-thread floor, never to ONNX's all-cores default. Mirrors
+ *  `hostParallelism` in local-embedder-worker.ts. */
+function hostParallelism() {
+  try {
+    const n = availableParallelism();
+    return Number.isFinite(n) && n >= 1 ? n : 1;
+  } catch {
+    return 1;
+  }
+}
 
 // ONNX Runtime defaults its intra-op thread pool to EVERY core and SPIN-WAITS
 // idle threads. On a 128-core host each operator process (main host + every
@@ -50,7 +63,25 @@ const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
 // ~24h single-worker for a one-time 395k-vector re-embed, ~30min/day
 // steady-state CPU) becomes pressing, start from the pip-wheel path above,
 // not from apt.
-const ORT_SESSION_OPTIONS = { intraOpNumThreads: 4, interOpNumThreads: 1 };
+//
+// EI-20493854163389792: WI-3792's fix was a hardcoded `intraOpNumThreads: 4`,
+// an ABSOLUTE constant — it capped the 128-core host and never scaled DOWN. On
+// the packaged 0.0.16 desktop's fresh 8-vCPU Ubuntu guest that is HALF the
+// machine, and the first-run backfill kept it saturated: 415.2% average process
+// CPU while the UI sat idle (loopLag pressure=ok — the burn is on native ORT
+// threads, not the event loop). The cap is now a SHARE of the host, not a
+// constant. KEEP IN SYNC with local-embedder-worker.ts
+// (MAX_INTRA_OP_THREADS / BACKGROUND_HOST_SHARE_DIVISOR /
+// resolveIntraOpNumThreads); ort-thread-cap.test.ts is the mechanical guard.
+const MAX_INTRA_OP_THREADS = 4;
+const BACKGROUND_HOST_SHARE_DIVISOR = 4;
+const ORT_SESSION_OPTIONS = {
+  intraOpNumThreads: Math.max(
+    1,
+    Math.min(MAX_INTRA_OP_THREADS, Math.floor(hostParallelism() / BACKGROUND_HOST_SHARE_DIVISOR)),
+  ),
+  interOpNumThreads: 1,
+};
 
 // One warm pipeline PER model id, so a process mixing BGE (default local) and
 // EmbeddingGemma (via an explicit model) keeps both loaded rather than

@@ -19,6 +19,7 @@
  */
 
 import { Worker } from 'node:worker_threads';
+import { availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname } from 'node:path';
 import { dynamicImport } from './dynamic-import';
@@ -440,12 +441,68 @@ type TransformersModule = {
 };
 type Pipeline = (text: string, opts: unknown) => Promise<{ data: Float32Array }>;
 
-/** ONNX Runtime defaults intraOp threads to EVERY core and spin-waits them —
- *  on a 128-core host each embedding-loading process grew a ~128-thread spin
- *  pool (loadavg 2000-3000 host stutter, WI-3792). Cap it: embeds are
- *  latency-tolerant background work. Mirrored in local-embedder-worker.script.mjs
- *  (plain-JS worker, can't import this) — keep the two in sync. */
-export const ORT_SESSION_OPTIONS = { intraOpNumThreads: 4, interOpNumThreads: 1 } as const;
+/** Ceiling on the intra-op pool, whatever the host size (WI-3792): a 128-core
+ *  box must never get a 128-thread spin pool back. */
+export const MAX_INTRA_OP_THREADS = 4;
+
+/** Embedding is BACKGROUND work behind an idle UI, so it may claim at most
+ *  ~1/Nth of the host. See `resolveIntraOpNumThreads` for why this exists. */
+export const BACKGROUND_HOST_SHARE_DIVISOR = 4;
+
+/**
+ * Size the ONNX intra-op thread pool RELATIVE TO THE HOST.
+ *
+ * ONNX Runtime defaults intraOp threads to EVERY core and spin-waits them — on
+ * the 128-core dev host each embedding-loading process grew a ~128-thread spin
+ * pool (loadavg 2000-3000 host stutter, WI-3792). That incident was fixed with
+ * a hardcoded `intraOpNumThreads: 4`, which capped the big host and left the
+ * SMALL host unfixed: 4 is an ABSOLUTE constant, so it never scaled DOWN.
+ *
+ * EI-20493854163389792: the packaged 0.0.16 desktop on a fresh 8-vCPU Ubuntu
+ * guest measured 415.2% average process CPU (360/418/422/465/411 over 5×1s)
+ * while the first-run UI sat idle — ≈4 saturated intra-op threads plus main.
+ * `/api/health/deep` simultaneously reported loopLag pressure=ok, which is the
+ * tell: the burn is on NATIVE ORT threads, not the JS event loop. First run is
+ * the worst case because the whole seeded corpus is unembedded, so the
+ * embed-backfill sweep keeps the pool hot; and the packaged default runs the
+ * embedder IN-PROCESS (the embed sidecar is opt-in via PAPERCUSP_EMBED_SIDECAR),
+ * which is why the cost lands on the operator's own PID. On that guest the
+ * hardcoded 4 is HALF the machine — a first-run user watching an idle screen
+ * sees the app peg their CPU.
+ *
+ * So the cap is now a SHARE, not a constant: at most `MAX_INTRA_OP_THREADS`,
+ * and never more than 1/`BACKGROUND_HOST_SHARE_DIVISOR` of the host, floor 1.
+ *   1-7 cores → 1  ·  8 → 2  ·  16+ → 4 (WI-3792's ceiling, unchanged)
+ * Mirrored in local-embedder-worker.script.mjs (plain-JS worker, can't import
+ * this) — keep the two in sync; ort-thread-cap.test.ts is the mechanical guard.
+ */
+export function resolveIntraOpNumThreads(hostCores: number): number {
+  if (!Number.isFinite(hostCores) || hostCores < 1) return 1;
+  return Math.max(
+    1,
+    Math.min(MAX_INTRA_OP_THREADS, Math.floor(hostCores / BACKGROUND_HOST_SHARE_DIVISOR)),
+  );
+}
+
+/** Host parallelism, defensively: `availableParallelism` respects the CPU
+ *  affinity mask (so a pinned/containerised process sizes to what it may
+ *  actually use) and exists on every Node we ship, but a 0/NaN reading must
+ *  degrade to the single-thread floor rather than to ORT's all-cores default. */
+function hostParallelism(): number {
+  try {
+    return availableParallelism();
+  } catch {
+    return 1;
+  }
+}
+
+export const ORT_SESSION_OPTIONS: {
+  readonly intraOpNumThreads: number;
+  readonly interOpNumThreads: number;
+} = {
+  intraOpNumThreads: resolveIntraOpNumThreads(hostParallelism()),
+  interOpNumThreads: 1,
+};
 
 /**
  * Build a local (free, offline) BGE-small embedder.
