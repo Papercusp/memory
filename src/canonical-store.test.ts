@@ -134,6 +134,10 @@ describe('EI-10183 entity-quality gate — isLowQualityCompoundEntity', () => {
     'nothing else drained',
     'the folder', // single generic head after stripping the article
     'of the', // pure function words
+    'discovering files/scripts', // sentence-leading action residue
+    "the fleet's release gate", // possessive sentence-local description
+    'a genuine removal reds', // vague modifier + nominalized/plural residue
+    'a TEST against the tree', // internal clause marker
     'x', // too short
     '', // empty
   ])('rejects junk fragment %j', (frag) => {

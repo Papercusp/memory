@@ -98,8 +98,51 @@ const ENTITY_STOPWORDS = new Set([
   'these', 'those', 'with', 'as', 'by', 'from', 'just', 'else', 'before', 'after',
   'nothing', 'something', 'anything', 'one', 'mid', 're', 've', 'll', 'no', 'not',
   'than', 'then', 'up', 'out', 'off', 'over', 'per', 'via', 'their', 'there', 'here',
-  'when', 'while', 'into', 'onto', 'about', 'above', 'below',
+  'when', 'while', 'into', 'onto', 'about', 'above', 'below', 'against', 'through',
+  'during', 'without', 'between', 'among', 'because', 'although', 'though', 'if',
+  'until', 'unless', 'whether', 'which', 'who', 'whom', 'whose', 'what', 'where',
+  'why', 'how', 'has', 'have', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+  'should', 'may', 'might', 'must',
 ]);
+
+/**
+ * Words that are strong evidence that a candidate is a sentence fragment rather
+ * than a noun phrase. Benign prepositions such as `in` and `of` intentionally do
+ * not appear here: phrases like "the one-liner in the folder" are valid entities.
+ */
+const ENTITY_CLAUSE_WORDS = new Set([
+  'against', 'and', 'or', 'but', 'so', 'because', 'although', 'though', 'if', 'when',
+  'while', 'until', 'unless', 'then', 'than', 'whether', 'which', 'who', 'whom',
+  'whose', 'what', 'where', 'why', 'how', 'is', 'was', 'are', 'were', 'be', 'been',
+  'being', 'has', 'have', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+  'should', 'may', 'might', 'must',
+]);
+
+/** Sentence-leading -ing words that are common technical noun modifiers. */
+const ENTITY_NOUN_GERUNDS = new Set([
+  'embedding', 'building', 'testing', 'training', 'routing', 'running', 'linking',
+  'indexing', 'caching', 'logging', 'parsing', 'streaming', 'rendering', 'deploying',
+  'releasing', 'scoping', 'staging', 'handling', 'loading', 'writing', 'reading',
+  'searching', 'matching', 'ranking', 'federating', 'migrating', 'processing',
+  'querying', 'fetching', 'syncing', 'spawning', 'checkpointing', 'compacting',
+  'orchestrating', 'scheduling', 'validating', 'reviewing', 'working', 'waiting',
+  'passing', 'failing',
+]);
+
+/** Vague sentence-leading modifiers need a second signal before rejection. */
+const ENTITY_VAGUE_LEADERS = new Set([
+  'actual', 'apparent', 'different', 'entire', 'false', 'genuine', 'likely', 'new',
+  'only', 'other', 'possible', 'potential', 'prior', 'previous', 'real', 'same',
+  'single', 'true', 'whole',
+]);
+
+const ENTITY_ARTIFACT_PUNCTUATION = /[\`"'|()[\]{}+,;:!?<>—–]/;
+const ENTITY_NOMINALIZATION = /(?:tion|sion|ment|ance|ence|ity|ness|al)$/;
+const ENTITY_PLURAL = /(?:s|es|ies)$/;
+
+function normalizeEntityWord(word: string): string {
+  return word.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '');
+}
 
 /** True when a COMPOUND entity span is a low-value sentence fragment. */
 export function isLowQualityCompoundEntity(text: string): boolean {
@@ -108,10 +151,38 @@ export function isLowQualityCompoundEntity(text: string): boolean {
   // Strip a leading article — a good phrase legitimately starts with "the"
   // ("the one-liner in the folder"); don't let that alone condemn it.
   t = t.replace(/^(?:the|a|an)\s+/, '');
-  const words = t.split(/\s+/).filter(Boolean);
+  const words = t.split(/\s+/).filter(Boolean).map(normalizeEntityWord).filter(Boolean);
   if (words.length < 2) return true; // a lone/generic head is not a useful COMPOUND
   // A real phrase is not bounded by a function word.
   if (ENTITY_STOPWORDS.has(words[0]) || ENTITY_STOPWORDS.has(words[words.length - 1])) return true;
+  // The fallback extractor and occasional NLP residue can return punctuation or
+  // clause fragments as if they were noun phrases. These markers are not part of
+  // a useful COMPOUND payload and are safe to reject at this storage boundary.
+  if (ENTITY_ARTIFACT_PUNCTUATION.test(t)) return true;
+  if (words.some((word) => ENTITY_CLAUSE_WORDS.has(word))) return true;
+
+  // A possessive span with three or more words is usually a sentence-local
+  // description ("the fleet's release gate"), not a reusable entity. Keep short
+  // lexical phrases such as "user's guide" eligible.
+  if (words.length >= 3 && words.some((word) => /['’]s$/.test(word))) return true;
+
+  // A sentence-leading gerund is an action residue more often than a stable
+  // entity. Keep the common technical noun modifiers explicitly allowlisted.
+  const first = words[0];
+  if (first.length >= 8 && first.endsWith('ing') && !ENTITY_NOUN_GERUNDS.has(first)) return true;
+
+  // "a genuine removal reds" is a representative lowercase regex span: a vague
+  // sentence modifier followed by a nominalization and a plural tail. Require all
+  // three signals so ordinary phrases such as "the current release gate" survive.
+  const hasNominalizedWord = words.slice(1).some(
+    (word) => word.length >= 5 && ENTITY_NOMINALIZATION.test(word),
+  );
+  const lastWord = words[words.length - 1];
+  const hasPluralTail = ENTITY_PLURAL.test(lastWord) && !/(?:ss|us|is)$/.test(lastWord);
+  if (words.length >= 3 && ENTITY_VAGUE_LEADERS.has(first) && hasNominalizedWord && hasPluralTail) {
+    return true;
+  }
+
   // Must carry at least one content token (guards pure function-word runs).
   const hasContent = words.some((w) => w.length >= 3 && !ENTITY_STOPWORDS.has(w) && /[a-z]/.test(w));
   return !hasContent;
