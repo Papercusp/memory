@@ -210,16 +210,36 @@ describe("HybridBackend (P-020)", () => {
     ]);
   });
 
-  it("writes the canonical id from the cosine leg; forget/update target it", async () => {
+  it("writes the canonical id and forget removes linked lexical projections before the canonical row", async () => {
     const remember = vi.fn(async () => ({ ids: ["1"] }));
-    const forget = vi.fn(async () => {});
-    const cosine = fakeBackend("cosine", [], { remember, forget });
-    const hy = new HybridBackend(fakeBackend("lexical", []), cosine);
+    const order: string[] = [];
+    const forget = vi.fn(async () => { order.push("canonical"); });
+    const cosine = fakeBackend("cosine", [], { remember, forget, get: async () => e("1") });
+    const lexicalForget = vi.fn(async () => { order.push("lexical"); });
+    const lexical = fakeBackend("lexical", [], {
+      list: async () => [
+        { ...e("projection-1"), metadata: { link_id: "1" } },
+        { ...e("unrelated"), metadata: { link_id: "other" } },
+      ],
+      forget: lexicalForget,
+    });
+    const hy = new HybridBackend(lexical, cosine);
     const out = await hy.remember("fact", { scope: "s" });
     await hy.forget("1");
     expect(remember).toHaveBeenCalledOnce();
     expect(out.ids).toEqual(["1"]); // canonical (cosine) ids are returned
+    expect(lexicalForget).toHaveBeenCalledWith("projection-1");
     expect(forget).toHaveBeenCalledWith("1");
+    expect(order).toEqual(["lexical", "canonical"]);
+  });
+
+  it("does not delete the canonical row when lexical projection cleanup fails", async () => {
+    const canonicalForget = vi.fn(async () => {});
+    const cosine = fakeBackend("cosine", [], { get: async () => e("1"), forget: canonicalForget });
+    const lexical = fakeBackend("lexical", [], { list: async () => { throw new Error("projection unavailable"); } });
+    const hy = new HybridBackend(lexical, cosine);
+    await expect(hy.forget("1")).rejects.toThrow("projection unavailable");
+    expect(canonicalForget).not.toHaveBeenCalled();
   });
 
   it("write-throughs the projection into the lexical leg (best-effort), still returns cosine ids", async () => {

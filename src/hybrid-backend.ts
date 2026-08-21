@@ -201,8 +201,23 @@ export class HybridBackend implements MemoryBackend {
     return this.cosine.get(id);
   }
 
-  forget(id: string): Promise<void> {
-    return this.cosine.forget(id);
+  async forget(id: string): Promise<void> {
+    // The lexical leg stores a projection under its OWN id, linked back to the
+    // canonical id through metadata.link_id. Deleting only the cosine row left
+    // that copy recallable — especially bad for the hard/privacy forget path.
+    // Resolve and remove projections FIRST: if cleanup fails, the canonical row
+    // remains available for a safe retry (no half-delete that loses its scope).
+    const canonical = await this.cosine.get(id);
+    if (canonical) {
+      if (!canonical.scope) {
+        throw new Error(`forget: canonical memory ${id} has no scope for lexical projection cleanup`);
+      }
+      const projections = await this.lexical.list({ scope: canonical.scope });
+      for (const projection of projections) {
+        if (projection.metadata?.link_id === id) await this.lexical.forget(projection.id);
+      }
+    }
+    await this.cosine.forget(id);
   }
 
   /**
