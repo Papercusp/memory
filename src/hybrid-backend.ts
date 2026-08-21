@@ -179,8 +179,8 @@ export class HybridBackend implements MemoryBackend {
     // (otherwise the lexical leg is empty and the hybrid degrades to cosine-only,
     // losing the exact-id column). Best-effort: a cold/missing lexical leg (e.g.
     // no ~/.claude dir) is non-fatal — the cosine gate still carries recall.
-    // forget/update target the canonical leg; the lexical projection is
-    // reconciled by re-projection, not per-delete id-mapping (P-022 / D-002).
+    // Lifecycle removal uses link_id for strict projection cleanup; update
+    // continues to target the canonical leg (P-022 / D-002).
     //
     // Stamp `link_id` = the canonical id onto the projection so fusion can DEDUPE
     // a memory that surfaces from BOTH legs (the legs assign different native ids
@@ -201,9 +201,7 @@ export class HybridBackend implements MemoryBackend {
     return this.cosine.get(id);
   }
 
-  /** Remove any separate-store lexical copies linked to a canonical id.
-   * `LexicalLegBackend` (hybrid-pg) is a shared-store ranking adapter, so its
-   * rows carry no link_id and this is naturally a no-op there. */
+  /** Remove separate-store lexical copies; shared-store rows have no link_id, so this is a no-op there. */
   private async removeLexicalProjections(id: string): Promise<void> {
     // The lexical leg stores a projection under its OWN id, linked back to the
     // canonical id through metadata.link_id. Mutating only the cosine row left
@@ -226,12 +224,7 @@ export class HybridBackend implements MemoryBackend {
     await this.cosine.forget(id);
   }
 
-  /**
-   * Temporal-lite validity close — delegates to the COSINE (canonical PG)
-   * leg like every lifecycle write; exposed only when that leg has the
-   * capability. The lexical projection is reconciled by re-projection, not
-   * per-id mirroring (same posture as forget/update above).
-   */
+  /** Close temporal validity only after removing linked separate-store lexical projections. */
   async invalidateEntry(
     id: string,
     opts?: { supersededBy?: string },

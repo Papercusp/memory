@@ -825,12 +825,12 @@ describe("HybridBackend.invalidateEntry (temporal-lite lifecycle delegation)", (
     expect(order).toEqual(["lexical", "canonical"]);
   });
 
-  it('a cosine leg WITHOUT the capability throws — a false would read as "not found" upstream', () => {
+  it('a cosine leg WITHOUT the capability throws — a false would read as "not found" upstream', async () => {
     const hybrid = new HybridBackend(
       fakeBackend("lex", []),
       fakeBackend("cosine", []),
     );
-    expect(() => hybrid.invalidateEntry("old")).toThrow(/validity-window/);
+    await expect(hybrid.invalidateEntry("old")).rejects.toThrow(/validity-window/);
   });
 });
 
