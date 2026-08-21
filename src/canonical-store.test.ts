@@ -497,6 +497,17 @@ describe('CanonicalVectorStore temporal-lite validity windows (P-002, migration 
     expect(queries[0].sql).not.toContain('invalid_at IS NULL OR');
   });
 
+  it('as_of remains authoritative when include_superseded is also true', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.search(VEC, 5, {
+      user_id: 'scope-a',
+      as_of: '2026-07-01T00:00:00Z',
+      include_superseded: true,
+    });
+    expect(queries[0].sql).toContain('COALESCE(c.valid_at, c.created_at) <= $4::timestamptz');
+    expect(queries[0].sql).toContain('c.invalid_at > $4::timestamptz');
+  });
+
   it('entity-kind search gets NO validity clause (mem0 lifecycle exempt) but temporal keys are still stripped', async () => {
     const { store, queries } = makeStore('operator_memory_local_entities');
     await store.search(VEC, 5, { user_id: 'scope-a', as_of: '2026-07-01T00:00:00Z' });
@@ -622,8 +633,8 @@ describe('splitTemporalControls', () => {
     }
   });
 
-  it('an unparseable as_of is dropped (never a NaN timestamp in SQL)', () => {
-    expect(splitTemporalControls({ as_of: 'not-a-date' }).temporal.asOf).toBeUndefined();
+  it('an unparseable as_of fails closed instead of silently becoming a current read', () => {
+    expect(() => splitTemporalControls({ as_of: 'not-a-date' })).toThrow('as_of must be a parseable timestamp');
   });
 });
 

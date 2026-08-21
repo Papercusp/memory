@@ -209,10 +209,18 @@ export function splitTemporalControls(filters?: SearchFilters): {
     as_of?: unknown;
     include_superseded?: unknown;
   } & SearchFilters;
+  const hasAsOf = as_of !== undefined && as_of !== null;
   const asOfMs = typeof as_of === 'string' || typeof as_of === 'number' ? new Date(as_of).getTime() : NaN;
+  // Public tools validate this at their Zod boundary, but the canonical store
+  // is also called directly by internal/degraded paths. Silently dropping an
+  // invalid timestamp would turn a requested historical read into a current
+  // read — a plausible but false answer. Fail closed at the shared seam too.
+  if (hasAsOf && !Number.isFinite(asOfMs)) {
+    throw new RangeError('as_of must be a parseable timestamp');
+  }
   return {
     temporal: {
-      ...(Number.isFinite(asOfMs) ? { asOf: new Date(asOfMs).toISOString() } : {}),
+      ...(hasAsOf ? { asOf: new Date(asOfMs).toISOString() } : {}),
       includeSuperseded:
         include_superseded === true ||
         include_superseded === 1 ||
