@@ -201,22 +201,28 @@ export class HybridBackend implements MemoryBackend {
     return this.cosine.get(id);
   }
 
-  async forget(id: string): Promise<void> {
+  /** Remove any separate-store lexical copies linked to a canonical id.
+   * `LexicalLegBackend` (hybrid-pg) is a shared-store ranking adapter, so its
+   * rows carry no link_id and this is naturally a no-op there. */
+  private async removeLexicalProjections(id: string): Promise<void> {
     // The lexical leg stores a projection under its OWN id, linked back to the
-    // canonical id through metadata.link_id. Deleting only the cosine row left
-    // that copy recallable — especially bad for the hard/privacy forget path.
+    // canonical id through metadata.link_id. Mutating only the cosine row left
+    // that copy recallable after either hard forget OR soft invalidation.
     // Resolve and remove projections FIRST: if cleanup fails, the canonical row
-    // remains available for a safe retry (no half-delete that loses its scope).
+    // remains current and available for a safe retry.
     const canonical = await this.cosine.get(id);
-    if (canonical) {
-      if (!canonical.scope) {
-        throw new Error(`forget: canonical memory ${id} has no scope for lexical projection cleanup`);
-      }
-      const projections = await this.lexical.list({ scope: canonical.scope });
-      for (const projection of projections) {
-        if (projection.metadata?.link_id === id) await this.lexical.forget(projection.id);
-      }
+    if (!canonical) return;
+    if (!canonical.scope) {
+      throw new Error(`memory ${id} has no scope for lexical projection cleanup`);
     }
+    const projections = await this.lexical.list({ scope: canonical.scope });
+    for (const projection of projections) {
+      if (projection.metadata?.link_id === id) await this.lexical.forget(projection.id);
+    }
+  }
+
+  async forget(id: string): Promise<void> {
+    await this.removeLexicalProjections(id);
     await this.cosine.forget(id);
   }
 
@@ -226,7 +232,7 @@ export class HybridBackend implements MemoryBackend {
    * capability. The lexical projection is reconciled by re-projection, not
    * per-id mirroring (same posture as forget/update above).
    */
-  invalidateEntry(
+  async invalidateEntry(
     id: string,
     opts?: { supersededBy?: string },
   ): Promise<boolean> {
@@ -238,6 +244,7 @@ export class HybridBackend implements MemoryBackend {
       throw new Error(
         "invalidateEntry: the cosine leg has no validity-window support",
       );
+    await this.removeLexicalProjections(id);
     return impl(id, opts);
   }
 

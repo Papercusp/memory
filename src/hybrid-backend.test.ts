@@ -796,14 +796,33 @@ describe("HybridBackend searchLexical (WI-4214 embed-free fallback)", () => {
 });
 
 describe("HybridBackend.invalidateEntry (temporal-lite lifecycle delegation)", () => {
-  it("delegates to the COSINE leg (the canonical store owns lifecycle) with the supersededBy option", async () => {
-    const inv = vi.fn(async () => true);
-    const cosine = fakeBackend("cosine", [], { invalidateEntry: inv });
-    const hybrid = new HybridBackend(fakeBackend("lex", []), cosine);
+  it("removes linked lexical projections before closing the canonical validity window", async () => {
+    const order: string[] = [];
+    const inv = vi.fn(async () => {
+      order.push("canonical");
+      return true;
+    });
+    const cosine = fakeBackend("cosine", [], {
+      get: async () => e("old"),
+      invalidateEntry: inv,
+    });
+    const lexicalForget = vi.fn(async () => {
+      order.push("lexical");
+    });
+    const lexical = fakeBackend("lex", [], {
+      list: async () => [
+        { ...e("projection-old"), metadata: { link_id: "old" } },
+        { ...e("projection-other"), metadata: { link_id: "other" } },
+      ],
+      forget: lexicalForget,
+    });
+    const hybrid = new HybridBackend(lexical, cosine);
     await expect(
       hybrid.invalidateEntry("old", { supersededBy: "new" }),
     ).resolves.toBe(true);
+    expect(lexicalForget).toHaveBeenCalledWith("projection-old");
     expect(inv).toHaveBeenCalledWith("old", { supersededBy: "new" });
+    expect(order).toEqual(["lexical", "canonical"]);
   });
 
   it('a cosine leg WITHOUT the capability throws — a false would read as "not found" upstream', () => {
