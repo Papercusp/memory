@@ -151,6 +151,7 @@ describe('EI-10183 entity-quality gate — isLowQualityCompoundEntity', () => {
     'harrier embedder sidecar',
     'in-memory cache',
     'release trigger routine',
+    "user's guide", // short possessive lexical phrase is still reusable
   ])('keeps real phrase %j', (phrase) => {
     expect(isLowQualityCompoundEntity(phrase)).toBe(false);
   });
@@ -159,6 +160,17 @@ describe('EI-10183 entity-quality gate — isLowQualityCompoundEntity', () => {
 describe('EI-10183 entity-quality gate — insert filtering', () => {
   const junk = { data: 'just before end of', entityType: 'COMPOUND', linkedMemoryIds: ['m1'] };
   const good = { data: 'harrier embedder sidecar', entityType: 'COMPOUND', linkedMemoryIds: ['m1'] };
+
+  it.each([
+    'discovering files/scripts',
+    "the fleet's release gate",
+    'a genuine removal reds',
+    'a TEST against the tree',
+  ])('drops observed sentence residue %j before either table write', async (data) => {
+    const { store, queries } = makeStore('operator_memory_local_entities');
+    await store.insert([VEC], [`id-${data.slice(0, 4)}`], [{ data, entityType: 'COMPOUND' }]);
+    expect(queries).toHaveLength(0);
+  });
 
   it('drops a junk COMPOUND entity — no canonical or vec write', async () => {
     const { store, queries } = makeStore('operator_memory_local_entities');

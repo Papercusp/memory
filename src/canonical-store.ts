@@ -136,7 +136,7 @@ const ENTITY_VAGUE_LEADERS = new Set([
   'single', 'true', 'whole',
 ]);
 
-const ENTITY_ARTIFACT_PUNCTUATION = /[\`"'|()[\]{}+,;:!?<>—–]/;
+const ENTITY_ARTIFACT_PUNCTUATION = /[\`"|()[\]{}+,;:!?<>—–]/;
 const ENTITY_NOMINALIZATION = /(?:tion|sion|ment|ance|ence|ity|ness|al)$/;
 const ENTITY_PLURAL = /(?:s|es|ies)$/;
 
