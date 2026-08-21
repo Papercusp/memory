@@ -697,7 +697,10 @@ export class CanonicalVectorStore {
     };
     return {
       id: row.id,
-      payload: this.storeKind === 'memory' ? foldValidity(row.payload, row, {}) : row.payload,
+      payload:
+        this.storeKind === 'memory'
+          ? foldValidity(row.payload, row, { includeSuperseded: false })
+          : row.payload,
     };
   }
 
