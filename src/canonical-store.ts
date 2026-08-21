@@ -683,11 +683,22 @@ export class CanonicalVectorStore {
   async get(id: string): Promise<VectorStoreResult | null> {
     const client = await this.getClient();
     const res = await client.query(
-      `SELECT id, payload FROM ${this.cfg.schema}.memory_canonical WHERE id = $1`,
+      `SELECT id, payload, valid_at, invalid_at, superseded_by
+         FROM ${this.cfg.schema}.memory_canonical WHERE id = $1`,
       [id],
     );
     if (res.rowCount === 0) return null;
-    return { id: res.rows[0].id, payload: res.rows[0].payload };
+    const row = res.rows[0] as {
+      id: string;
+      payload: Record<string, unknown>;
+      valid_at?: unknown;
+      invalid_at?: unknown;
+      superseded_by?: unknown;
+    };
+    return {
+      id: row.id,
+      payload: this.storeKind === 'memory' ? foldValidity(row.payload, row, {}) : row.payload,
+    };
   }
 
   async update(id: string, vector: number[], payload: Record<string, unknown>): Promise<void> {
