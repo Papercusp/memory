@@ -713,7 +713,30 @@ export class CanonicalVectorStore {
   }
 
   async update(id: string, vector: number[], payload: Record<string, unknown>): Promise<void> {
-    await this.insert([vector], [id], [payload]);
+    if (vector.length !== this.cfg.embeddingModelDims) {
+      throw new Error(
+        `CanonicalVectorStore.update: vector dim ${vector.length} !== expected ${this.cfg.embeddingModelDims}`,
+      );
+    }
+    const client = await this.getClient();
+    const vecTable = `${this.cfg.schema}.${this.cfg.vecTable}`;
+    // mem0's OSS update payload contains the replacement text and timestamps,
+    // but omits arbitrary metadata. Merge it over the existing canonical row so
+    // a text edit cannot erase taxonomy, scope, provenance, or other fields.
+    // Echo defense: `validity` is a read-side fold, never a stored payload key.
+    const { validity: _validity, ...nextPayload } = payload ?? {};
+    await client.query(
+      `UPDATE ${this.cfg.schema}.memory_canonical
+          SET payload = payload || $2::jsonb, updated_at = now()
+        WHERE id = $1`,
+      [id, JSON.stringify(nextPayload)],
+    );
+    await client.query(
+      `INSERT INTO ${vecTable} (memory_id, vector, embedded_at)
+       VALUES ($1, $2::vector, now())
+       ON CONFLICT (memory_id) DO UPDATE SET vector = EXCLUDED.vector, embedded_at = now()`,
+      [id, toVectorLiteral(vector)],
+    );
   }
 
   /**

@@ -249,6 +249,47 @@ describe('CanonicalVectorStore insert guards (GAP 9)', () => {
   });
 });
 
+describe('CanonicalVectorStore update', () => {
+  it('merges text payload over the existing row so arbitrary metadata survives', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.update('id-1', VEC, {
+      data: 'replacement text',
+      hash: 'replacement-hash',
+      updatedAt: '2026-08-21T12:00:00.000Z',
+    });
+
+    expect(queries).toHaveLength(2);
+    const canonical = queries[0];
+    expect(canonical.sql).toContain('UPDATE harness_shared.memory_canonical');
+    expect(canonical.sql).toContain('SET payload = payload || $2::jsonb');
+    expect(canonical.sql).toContain('WHERE id = $1');
+    expect(JSON.parse(String(canonical.params[1]))).toEqual({
+      data: 'replacement text',
+      hash: 'replacement-hash',
+      updatedAt: '2026-08-21T12:00:00.000Z',
+    });
+    // The separate vector upsert still tracks the re-embedded replacement text.
+    expect(queries[1].sql).toContain('memory_vec_local');
+  });
+
+  it('rejects a wrong-DIMENSION vector before touching either table', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await expect(
+      store.update('id-1', [0.1, 0.2, 0.3, 0.4], { data: 'replacement text' }),
+    ).rejects.toThrow(/dim 4 !== expected 3/);
+    expect(queries).toHaveLength(0);
+  });
+
+  it('does not persist the read-side validity fold during a text update', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.update('id-1', VEC, {
+      data: 'replacement text',
+      validity: { status: 'superseded' },
+    });
+    expect(JSON.parse(String(queries[0].params[1]))).toEqual({ data: 'replacement text' });
+  });
+});
+
 describe('CanonicalVectorStore.deleteCol — the shared-table data-loss guard (GAP 9)', () => {
   it('REFUSES to delete with no userId scope: warns and emits NO delete', async () => {
     const { store, queries } = makeStore('operator_memory_local');
