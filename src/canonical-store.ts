@@ -41,7 +41,7 @@
  * segregated retroactively, no backfill needed).
  */
 
-import { Pool as PgPool, type QueryResult } from 'pg';
+import { Pool as PgPool, type PoolClient, type QueryResult } from 'pg';
 
 interface VectorStoreResult {
   id: string;
@@ -77,6 +77,16 @@ export interface CanonicalStoreConfig {
 
 function safeKey(k: string): string {
   return k.replace(/[^a-zA-Z0-9_]/g, '');
+}
+
+function isMissingIterativeScanParameter(error: unknown): boolean {
+  const candidate = error as { code?: unknown; message?: unknown } | null;
+  const code = candidate?.code;
+  const message = typeof candidate?.message === 'string' ? candidate.message : '';
+  // PostgreSQL's SQLSTATE for an unknown configuration parameter is
+  // undefined_object (42704). The message fallback keeps test doubles and
+  // drivers that omit SQLSTATE from taking the transient path.
+  return code === '42704' || /unrecognized configuration parameter[\s\S]*hnsw\.iterative_scan/i.test(message);
 }
 
 /**
