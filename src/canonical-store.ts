@@ -401,33 +401,52 @@ export class CanonicalVectorStore {
 
   /**
    * Whether this server understands `hnsw.iterative_scan` (pgvector >= 0.8).
-   * Probed ONCE per store and cached. An older build rejects the GUC with
-   * `unrecognized configuration parameter`, so we must never assume it
-   * exists — failing open (a narrower result) beats failing search entirely.
+   * Probed once per store and cached when the result is stable. An older build
+   * rejects the GUC with `unrecognized configuration parameter`, so that
+   * permanent capability answer is cached. A transient connection failure must
+   * not poison the process: failing open for that call (a narrower result)
+   * beats failing search entirely, and the next call gets another chance.
    */
   private iterativeScanSupport: Promise<boolean> | null = null;
 
   private probeIterativeScan(pool: PgPool): Promise<boolean> {
     if (!this.iterativeScanSupport) {
-      this.iterativeScanSupport = (async () => {
-        const conn = await pool.connect();
+      let probe!: Promise<boolean>;
+      probe = (async () => {
+        let conn: PoolClient | null = null;
         try {
+          conn = await pool.connect();
           await conn.query('BEGIN');
           await conn.query(`SET LOCAL hnsw.iterative_scan = relaxed_order`);
           return true;
-        } catch {
+        } catch (error) {
+          const permanentUnsupported = isMissingIterativeScanParameter(error);
+          console.warn(
+            permanentUnsupported
+              ? '[memory] server does not support hnsw.iterative_scan; using the legacy capped scan'
+              : '[memory] capability probe failed transiently; using the legacy capped scan for this call and will retry',
+          );
+          // An undefined GUC is a stable server capability result and remains
+          // cached. Any other failure may be a pool hiccup or restart; remove
+          // only THIS probe so a newer probe that raced with it is preserved.
+          if (!permanentUnsupported && this.iterativeScanSupport === probe) {
+            this.iterativeScanSupport = null;
+          }
           return false;
         } finally {
-          // The failing SET aborts the transaction; roll back before the
-          // connection goes home to the pool.
-          try {
-            await conn.query('ROLLBACK');
-          } catch {
-            /* already aborted / disconnected — nothing to unwind */
+          if (conn) {
+            // The failing SET aborts the transaction; roll back before the
+            // connection goes home to the pool.
+            try {
+              await conn.query('ROLLBACK');
+            } catch {
+              /* already aborted / disconnected — nothing to unwind */
+            }
+            conn.release();
           }
-          conn.release();
         }
       })();
+      this.iterativeScanSupport = probe;
     }
     return this.iterativeScanSupport;
   }

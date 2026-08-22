@@ -767,6 +767,7 @@ describe('CanonicalVectorStore HNSW iterative scan', () => {
   it('still returns rows when the server has no iterative_scan (pgvector < 0.8)', async () => {
     const { store, queries } = makeStore('operator_memory_local');
     const pool = (store as unknown as { pool: { connect: unknown } }).pool;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     // Old pgvector rejects the GUC outright; search must fail OPEN, not throw.
     pool.connect = vi.fn(async () => ({
       query: vi.fn(async (sql: string) => {
@@ -783,8 +784,45 @@ describe('CanonicalVectorStore HNSW iterative scan', () => {
     await expect(store.search(VEC, 12, { user_id: 'harness:papercusp' })).resolves.toBeInstanceOf(
       Array,
     );
+    // The server capability answer is permanent, so a second search reuses
+    // the negative probe rather than repeatedly probing a known-old server.
+    await expect(store.search(VEC, 12, { user_id: 'harness:papercusp' })).resolves.toBeInstanceOf(
+      Array,
+    );
+    expect(pool.connect).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
     // ...and the search itself still went out, on the plain pool path.
-    expect(queries.some((q) => q.sql.includes('ORDER BY v.vector'))).toBe(true);
+    expect(queries.filter((q) => q.sql.includes('ORDER BY v.vector'))).toHaveLength(2);
+    warn.mockRestore();
+  });
+
+  it('does not permanently cache a transient probe failure', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    const pool = (store as unknown as { pool: { connect: unknown } }).pool;
+    let probeBegins = 0;
+    pool.connect = vi.fn(async () => ({
+      query: vi.fn(async (sql: string) => {
+        if (/^BEGIN$/i.test(sql.trim())) probeBegins += 1;
+        if (/SET LOCAL hnsw\.iterative_scan/i.test(sql) && probeBegins === 1) {
+          throw Object.assign(new Error('connection reset by peer'), { code: '08006' });
+        }
+        return { rows: [], rowCount: 0 };
+      }),
+      release: () => {},
+    }));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await expect(store.search(VEC, 12, { user_id: 'harness:papercusp' })).resolves.toBeInstanceOf(
+      Array,
+    );
+    await expect(store.search(VEC, 12, { user_id: 'harness:papercusp' })).resolves.toBeInstanceOf(
+      Array,
+    );
+
+    expect(probeBegins).toBe(2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('transiently'));
+    warn.mockRestore();
   });
 
   it('rolls back rather than leaking an aborted connection when the search throws', async () => {
