@@ -89,6 +89,52 @@ describe('local-embedder-worker (protocol contract)', () => {
   }, 30_000);
 });
 
+describe('local-embedder-worker script path resolution (EI-21265479628494986)', () => {
+  it('repairs a tsx eval pseudo-path through the package/cwd layout', async () => {
+    const mod = await import('./local-embedder-worker');
+    const repoRoot = resolve(__dirname, '../../../..');
+    const expected = resolve(__dirname, 'local-embedder-worker.script.mjs');
+
+    expect(
+      mod.resolveWorkerScriptPath({
+        filename: '[eval]',
+        metaUrl: undefined,
+        packageEntry: null,
+        cwd: repoRoot,
+      }),
+    ).toBe(expected);
+  });
+
+  it('prefers a valid file URL over a pseudo filename', async () => {
+    const mod = await import('./local-embedder-worker');
+    const expected = resolve(__dirname, 'local-embedder-worker.script.mjs');
+    const metaUrl = new URL(`file://${expected}`).href;
+
+    expect(
+      mod.resolveWorkerScriptPath({
+        filename: '[eval]',
+        metaUrl,
+        packageEntry: null,
+        cwd: '/definitely/not-a-memory-checkout',
+      }),
+    ).toBe(expected);
+  });
+
+  it('fails closed when no validated candidate exists', async () => {
+    const mod = await import('./local-embedder-worker');
+
+    expect(() =>
+      mod.resolveWorkerScriptPath({
+        filename: '[eval]',
+        metaUrl: undefined,
+        cwd: '/definitely/not-a-memory-checkout',
+        packageEntry: null,
+        exists: () => false,
+      }),
+    ).toThrow(/Unable to locate local-embedder-worker\.script\.mjs/);
+  });
+});
+
 /**
  * EI-19464316359123796: a standalone tsx driver that imports the sync-resolver
  * (which can transitively spin up this worker) and then calls `process.exit(0)`

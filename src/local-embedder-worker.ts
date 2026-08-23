@@ -19,9 +19,11 @@
  */
 
 import { Worker } from 'node:worker_threads';
+import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, isAbsolute, join } from 'node:path';
 import { dynamicImport } from './dynamic-import';
 
 interface PendingRequest {
@@ -104,14 +106,134 @@ function syncWorkerRef(): void {
   _refd = want;
 }
 
+const WORKER_SCRIPT_NAME = 'local-embedder-worker.script.mjs';
+
+interface WorkerScriptPathProbe {
+  /** Override the runtime module filename (used by the pseudo-path regression test). */
+  filename?: string | null;
+  /** Override the runtime module URL (used by the pseudo-path regression test). */
+  metaUrl?: string | null;
+  /** Override cwd and package resolution for deterministic tests. */
+  cwd?: string | null;
+  packageEntry?: string | null;
+  exists?: (path: string) => boolean;
+}
+
+function runtimeFilename(): string | undefined {
+  try {
+    return typeof __filename === 'string' ? __filename : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function runtimeMetaUrl(): string | undefined {
+  try {
+    return typeof import.meta.url === 'string' ? import.meta.url : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function packageEntry(): string | undefined {
+  try {
+    // In tsx's CJS eval mode `__filename` is `[eval]`, but the imported module
+    // can still have a working package resolver. In ESM, bind require to this
+    // module URL instead. Both paths are optional: the co-located module path
+    // and bounded cwd search below cover normal source/bundle layouts.
+    const requireFn =
+      typeof require === 'function'
+        ? require
+        : (() => {
+            const url = runtimeMetaUrl();
+            const filename = runtimeFilename();
+            if (url?.startsWith('file:')) return createRequire(url);
+            if (filename && isAbsolute(filename)) return createRequire(filename);
+            return undefined;
+          })();
+    return requireFn?.resolve('@papercusp/memory');
+  } catch {
+    return undefined;
+  }
+}
+
+function ancestorDirectories(start: string, maxDepth = 8): string[] {
+  const roots: string[] = [];
+  let current = resolve(start);
+  for (let i = 0; i <= maxDepth; i += 1) {
+    roots.push(current);
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return roots;
+}
+
+/**
+ * Resolve the plain-JS worker script without trusting pseudo module paths.
+ *
+ * `tsx -e` gives imported CJS modules the literal `__filename` value
+ * `[eval]`; `dirname('[eval]')` is `.`, which turns a bad module identity into
+ * a plausible but wrong cwd-relative path. Candidate paths are therefore
+ * validated before Worker construction, and the package/cwd layouts are
+ * bounded fallbacks for eval and bundled entrypoints.
+ */
+export function resolveWorkerScriptPath(probe: WorkerScriptPathProbe = {}): string {
+  const exists = probe.exists ?? existsSync;
+  const filename = probe.filename === undefined ? runtimeFilename() : probe.filename ?? undefined;
+  const metaUrl = probe.metaUrl === undefined ? runtimeMetaUrl() : probe.metaUrl ?? undefined;
+  const cwd = probe.cwd === undefined ? process.cwd() : probe.cwd ?? undefined;
+  const entry = probe.packageEntry === undefined ? packageEntry() : probe.packageEntry ?? undefined;
+  const candidates: string[] = [];
+  const add = (candidate: string | undefined): void => {
+    if (!candidate) return;
+    const absolute = resolve(candidate);
+    if (!candidates.includes(absolute)) candidates.push(absolute);
+  };
+
+  // Prefer a real file URL, then a real absolute filename. A pseudo filename
+  // such as `[eval]` is deliberately ignored rather than normalized.
+  if (metaUrl?.startsWith('file:')) {
+    try {
+      add(join(dirname(fileURLToPath(metaUrl)), WORKER_SCRIPT_NAME));
+    } catch {
+      // Try the remaining bounded candidates.
+    }
+  }
+  if (filename && isAbsolute(filename)) add(join(dirname(filename), WORKER_SCRIPT_NAME));
+
+  if (entry) {
+    add(join(dirname(entry), WORKER_SCRIPT_NAME));
+    add(join(dirname(dirname(entry)), 'src', WORKER_SCRIPT_NAME));
+    add(join(dirname(dirname(entry)), 'dist', WORKER_SCRIPT_NAME));
+  }
+
+  if (cwd) {
+    for (const root of ancestorDirectories(cwd)) {
+      add(join(root, WORKER_SCRIPT_NAME));
+      add(join(root, 'src', WORKER_SCRIPT_NAME));
+      add(join(root, 'dist', WORKER_SCRIPT_NAME));
+      add(join(root, 'libs', 'generic', 'memory', 'src', WORKER_SCRIPT_NAME));
+      add(join(root, 'libs', 'generic', 'memory', 'dist', WORKER_SCRIPT_NAME));
+    }
+  }
+
+  const found = candidates.find((candidate) => {
+    try {
+      return exists(candidate);
+    } catch {
+      return false;
+    }
+  });
+  if (found) return found;
+
+  throw new Error(
+    `Unable to locate ${WORKER_SCRIPT_NAME}; checked ${candidates.slice(0, 8).join(', ') || '(no candidates)'}.`,
+  );
+}
+
 function workerPath(): string {
-  // The worker script is co-located in the same dir as this module.
-  // Resolved at runtime so the path works after build-time bundling
-  // (Next standalone copies the file alongside).
-  const here = typeof __filename !== 'undefined'
-    ? __filename
-    : fileURLToPath(import.meta.url);
-  return resolve(dirname(here), 'local-embedder-worker.script.mjs');
+  return resolveWorkerScriptPath();
 }
 
 function ensureWorker(): Promise<void> {
