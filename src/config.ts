@@ -14,10 +14,12 @@
  * Part of papercusp-systems-abstraction-2026-05-29 (P-021).
  */
 
-/** An embedder: text in, a fixed-dimension vector out. */
+/** An embedder: text in, a fixed-dimension vector out. Transport-backed
+ * implementations may honor the optional caller lifetime; pure/in-process
+ * implementations remain valid when they ignore it. */
 import { pinModuleState } from '@papercusp/module-singleton';
 
-export type EmbedFn = (text: string) => Promise<number[]>;
+export type EmbedFn = (text: string, signal?: AbortSignal) => Promise<number[]>;
 
 /**
  * The embedder resolved for the *current* user preference. The host runs
