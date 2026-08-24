@@ -256,6 +256,36 @@ describe('buildSidecarFirstEmbedder', () => {
     expect(transitions).toEqual(['down']); // transition-only, not per-attempt
   });
 
+  it('caller abort closes the sidecar attempt and never retries stale work (WI-41248)', async () => {
+    let fetchAttempts = 0;
+    const abortingFetch = ((_url: string, init: RequestInit) => {
+      fetchAttempts++;
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init.signal!;
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    }) as typeof fetch;
+    const transitions: string[] = [];
+    const embed = buildSidecarFirstEmbedder({
+      model: 'gemma',
+      kind: 'query',
+      url: 'http://127.0.0.1:3384',
+      fallback: () => async () => [1],
+      fetchFn: abortingFetch,
+      sleepFn: async () => {},
+      onTransition: (state) => transitions.push(state),
+    });
+    const caller = new AbortController();
+    const reason = new Error('outer embed budget expired');
+    const pending = embed('stale query', caller.signal);
+    await Promise.resolve();
+    caller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+    expect(fetchAttempts).toBe(1);
+    expect(transitions).toEqual([]); // cancellation is not a sidecar outage
+  });
+
   it('blip recovery: a restart-window failure recovers on a retry within the same call', async () => {
     const stub = await startStubSidecar();
     closers.push(stub.close);

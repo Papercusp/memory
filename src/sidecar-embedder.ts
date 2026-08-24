@@ -34,7 +34,7 @@
 
 import type { GemmaEmbedKind } from './gemma-embedder';
 
-type EmbedFn = (text: string) => Promise<number[]>;
+type EmbedFn = (text: string, signal?: AbortSignal) => Promise<number[]>;
 
 /** Consumers point at a sidecar by setting this (e.g. http://127.0.0.1:3384). */
 export const EMBED_SIDECAR_URL_ENV = 'PAPERCUSP_EMBED_SIDECAR_URL';
@@ -51,6 +51,10 @@ export interface SidecarEmbedBatchOpts {
   kind: GemmaEmbedKind;
   texts: string[];
   timeoutMs?: number;
+  /** Optional caller lifetime. Aborting it closes the HTTP request immediately
+   *  instead of leaving stale work in the shared sidecar FIFO until the
+   *  client's independent timeout expires. */
+  signal?: AbortSignal;
   fetchFn?: typeof fetch;
 }
 
@@ -157,6 +161,9 @@ export async function sidecarEmbedBatch(url: string, opts: SidecarEmbedBatchOpts
   const timeoutMs = opts.timeoutMs ?? sidecarBatchTimeoutMs(texts.length);
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  const abortFromCaller = (): void => ctl.abort(opts.signal?.reason);
+  if (opts.signal?.aborted) abortFromCaller();
+  else opts.signal?.addEventListener('abort', abortFromCaller, { once: true });
   try {
     const res = await fetchFn(`${url.replace(/\/$/, '')}/embed`, {
       method: 'POST',
@@ -179,6 +186,7 @@ export async function sidecarEmbedBatch(url: string, opts: SidecarEmbedBatchOpts
     return body;
   } finally {
     clearTimeout(timer);
+    opts.signal?.removeEventListener('abort', abortFromCaller);
   }
 }
 
@@ -249,7 +257,7 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
 
   let wasDown = false;
 
-  return async (text: string): Promise<number[]> => {
+  return async (text: string, signal?: AbortSignal): Promise<number[]> => {
     const deadline = now() + timeoutMs;
     let lastErr: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -261,6 +269,7 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
           kind: opts.kind,
           texts: [text],
           timeoutMs: remaining,
+          signal,
           fetchFn: opts.fetchFn,
         });
         if (wasDown) {
@@ -270,6 +279,9 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
         return res.vectors[0];
       } catch (e) {
         lastErr = e;
+        // A caller budget/route abort is terminal for THIS request. Retrying
+        // would recreate the stale queue entry the signal exists to remove.
+        if (signal?.aborted) throw signal.reason ?? e;
         if (isNonRetryableSidecarError(e)) {
           // Deterministic 4xx: the sidecar is UP and correctly rejecting
           // THIS exact request (bad shape / oversized text / unknown model)
