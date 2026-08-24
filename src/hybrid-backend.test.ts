@@ -887,9 +887,16 @@ describe("HybridBackend.search — diversity re-rank (F-D / D-014)", () => {
       fusionMode: "floored-union",
       minScore: 0.45,
       diversify: { lambda: 0.5 },
+      embedTimeoutMs: 1234,
     });
     expect(seen?.diversify).toBeUndefined();
     // …while every OTHER option still passes through untouched.
+    // EI-21348316803580175: `embedTimeoutMs` is deliberately in this
+    // pass-through set. The cosine leg is the ONLY leg that embeds, so the
+    // budget is meaningless anywhere else and MUST survive this strip to reach
+    // it — a future stripper added here would silently unbound the query embed
+    // again and reinstate the regression with every test still green.
+    expect(seen?.embedTimeoutMs).toBe(1234);
     expect(seen?.minScore).toBe(0.45);
     expect(seen?.limit).toBe(2);
     expect(seen?.scope).toBe("s");
