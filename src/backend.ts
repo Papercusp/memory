@@ -317,6 +317,29 @@ export interface SearchOptionsCommon {
    */
   vector?: number[];
   /**
+   * OPTIONAL, STRICTLY OPT-IN: a wall-clock budget (ms) for the QUERY-EMBED step
+   * only — not for the search as a whole. `undefined` or `<= 0` means unbounded,
+   * which is the prior behaviour and therefore what every existing caller keeps.
+   *
+   * WHY IT EXISTS (EI-21348316803580175). The query embed was unbounded, so it
+   * inherited the sidecar client's own `DEFAULT_SIDECAR_TIMEOUT_MS` (15s) and
+   * simply waited out a saturated embed sidecar. Under sustained fleet load that
+   * took `memory:search` p50 from ~750ms to ~6.4s (20.5s outliers), and since it
+   * rides every `coord:orient`, orient p50 went to 17-21s fleet-wide.
+   *
+   * ⚠ ON TIMEOUT THE EMBED THROWS — it does NOT resolve to `null`. That is
+   * deliberate and load-bearing: a null vector makes `Mem0Backend.search` fall
+   * through to the LEGACY per-scope path, which re-embeds ONCE PER SCOPE. Under
+   * exactly the saturation this budget exists to survive, degrading to null
+   * would turn one blocked embed into N more. The throw is what lets the
+   * caller's embed-failure branch degrade to the embed-free lexical leg instead.
+   *
+   * Mirrors `libs/generic/search`'s `embedTimeoutMs` (a DIFFERENT engine — that
+   * one serves pointer retrieval and degrades to BM25-only), which adopted this
+   * same remedy on a measured 20ms-vs-30s incident.
+   */
+  embedTimeoutMs?: number;
+  /**
    * HYBRID-ONLY, OPT-IN: report what each leg did on this call.
    *
    * A callback rather than a field on the result, because `search` returns
