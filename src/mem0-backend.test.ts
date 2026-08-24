@@ -147,6 +147,86 @@ describe('Mem0Backend.search — batched multi-scope path (EI-12962)', () => {
     expect(calls).toHaveLength(1);
   });
 
+  // EI-21348316803580175 — the opt-in query-embed budget.
+  it('embedTimeoutMs OMITTED leaves the embed unbounded — a slow embed still resolves', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: [], 'harness:x': [] }, calls);
+    const embedQuery = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 25));
+      return [0.5];
+    });
+    const vectorSearch = vi.fn(async () => []);
+    const be = new Mem0Backend({ getClient: async () => client, embedQuery, vectorSearch });
+
+    await expect(be.search('q', { scope: ['userA', 'harness:x'], limit: 3 })).resolves.toEqual([]);
+
+    // No budget ⇒ bare pass-through: the batched path ran and the legacy
+    // per-scope fan-out never did. This is the byte-identical no-op every
+    // existing consumer of this shared lib relies on.
+    expect(embedQuery).toHaveBeenCalledTimes(1);
+    expect(vectorSearch).toHaveBeenCalledTimes(2);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('an embed that BEATS its embedTimeoutMs is unaffected — normal batched path', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: [], 'harness:x': [] }, calls);
+    const embedQuery = vi.fn(async () => [0.5]);
+    const vectorSearch = vi.fn(async () => []);
+    const be = new Mem0Backend({ getClient: async () => client, embedQuery, vectorSearch });
+
+    await be.search('q', { scope: ['userA', 'harness:x'], limit: 3, embedTimeoutMs: 5_000 });
+
+    expect(vectorSearch).toHaveBeenCalledTimes(2);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('an embed that BLOWS its embedTimeoutMs THROWS — it must NOT degrade to the legacy per-scope path, which re-embeds once per scope', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: [{ id: '1', memory: 'a', score: 0.9 }], 'harness:x': [] }, calls);
+    // Never settles within the budget — the saturated-sidecar shape.
+    const embedQuery = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 5_000));
+      return [0.5];
+    });
+    const vectorSearch = vi.fn(async () => []);
+    const be = new Mem0Backend({ getClient: async () => client, embedQuery, vectorSearch });
+
+    await expect(
+      be.search('q', { scope: ['userA', 'harness:x'], limit: 3, embedTimeoutMs: 20 }),
+    ).rejects.toMatchObject({ name: 'EmbedBudgetExceededError', budgetMs: 20 });
+
+    // ⚠ THE POINT OF THIS TEST. Contrast it with the null-embed test above,
+    // which deliberately DOES fall through to `client.search` per scope
+    // (calls === 2). That fallback re-embeds once per scope, so taking it when
+    // the embedder is merely SATURATED would turn one blocked embed into N
+    // more — a pessimization under exactly the load the budget exists for.
+    // A budget miss must therefore throw and leave the legacy path untouched.
+    expect(calls).toHaveLength(0);
+    expect(vectorSearch).not.toHaveBeenCalled();
+  });
+
+  it('the budget error message carries the embed_budget_exceeded token the operator classifies on', async () => {
+    const client = fakeClient({ userA: [], 'harness:x': [] }, []);
+    const embedQuery = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 5_000));
+      return [0.5];
+    });
+    const be = new Mem0Backend({
+      getClient: async () => client,
+      embedQuery,
+      vectorSearch: async () => [],
+    });
+
+    // The operator's embedFailureReason() matches on MESSAGE, and that
+    // classification is what routes this into the embed-free lexical fallback.
+    // An unclassified throw would surface as an opaque handler error instead —
+    // strictly worse than the slow search the budget replaces.
+    await expect(
+      be.search('q', { scope: ['userA', 'harness:x'], embedTimeoutMs: 20 }),
+    ).rejects.toThrow(/embed_budget_exceeded/);
+  });
+
   it('a custom getClient WITHOUT batched seams disables batching — the stub keeps its per-scope contract', async () => {
     const calls: Record<string, unknown>[] = [];
     const client = fakeClient({ userA: [{ id: '1', memory: 'a', score: 0.9 }], 'harness:x': [] }, calls);
