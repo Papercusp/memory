@@ -277,6 +277,61 @@ export interface Mem0BackendDeps {
   ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
 }
 
+/**
+ * Thrown when the query embed blows the caller's opt-in
+ * `SearchOptions.embedTimeoutMs` (EI-21348316803580175).
+ *
+ * The message carries the literal token `embed_budget_exceeded` because the
+ * operator's `embedFailureReason()` classifies embed failures BY MESSAGE. That
+ * classification is what routes this into the existing embed-free lexical
+ * fallback; an unclassified throw would surface as an opaque handler error —
+ * strictly worse than the slow search this budget replaces.
+ */
+export class EmbedBudgetExceededError extends Error {
+  constructor(readonly budgetMs: number) {
+    super(`embed_budget_exceeded: query embed exceeded ${budgetMs}ms budget`);
+    this.name = 'EmbedBudgetExceededError';
+  }
+}
+
+/**
+ * Await `embed()` but give up after `budgetMs`. `undefined`/`<= 0` is a bare
+ * pass-through — byte-identical to awaiting `embed()` directly, which is what
+ * keeps every caller that has not opted in unchanged.
+ *
+ * `MemoryBackend.embedQuery` takes no `AbortSignal`, so an over-budget embed
+ * cannot be cancelled — it is abandoned and its late settle swallowed. That is
+ * not pure waste here: the in-flight embed keeps warming the module's
+ * short-TTL coalescing cache, so the NEXT call for the same text can still hit
+ * it. (`libs/generic/search`'s sibling helper does pass a derived signal; its
+ * `Embedder` contract accepts one and returns a non-nullable vector, which is
+ * why that helper cannot simply be imported here.)
+ */
+async function embedWithinBudget(
+  embed: () => Promise<number[] | null>,
+  budgetMs: number | undefined,
+): Promise<number[] | null> {
+  if (budgetMs === undefined || budgetMs <= 0) return embed();
+  const pending = embed();
+  return await new Promise<number[] | null>((resolve, reject) => {
+    let settled = false;
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
+    const timer = setTimeout(
+      () => finish(() => reject(new EmbedBudgetExceededError(budgetMs))),
+      budgetMs,
+    );
+    pending.then(
+      (v) => finish(() => resolve(v)),
+      (e) => finish(() => reject(e)),
+    );
+  });
+}
+
 export class Mem0Backend implements MemoryBackend {
   readonly name = 'mem0';
 
@@ -422,7 +477,18 @@ export class Mem0Backend implements MemoryBackend {
     // injection.ts for which pools opt in).
     let merged: MemoryEntry[] | null = null;
     if (opts.vector || scopes.length > 1) {
-      const vector = opts.vector ?? (await this.embedQuery(query));
+      // EI-21348316803580175: bound the query embed when the caller opted in.
+      // Unbounded, this await inherited the sidecar's own 15s timeout and waited
+      // out a saturated embed sidecar — the whole regression.
+      //
+      // ⚠ A BUDGET MISS THROWS; it must never become a null vector. `merged`
+      // staying null falls through to the LEGACY per-scope path below, which
+      // re-embeds ONCE PER SCOPE — so under the exact saturation this budget
+      // exists to survive, degrading to null would turn one blocked embed into
+      // N more. Throwing is what lets the caller degrade to the embed-free
+      // lexical leg instead.
+      const vector =
+        opts.vector ?? (await embedWithinBudget(() => this.embedQuery(query), opts.embedTimeoutMs));
       if (vector) {
         const pulls = scopes.map(async (scope) => {
           const rows = await this.vectorSearch(vector, limit, {
