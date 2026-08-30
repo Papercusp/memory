@@ -65,7 +65,12 @@ export {
   type SearchOptionsCommon,
   type UpdatePatch,
 } from './backend';
-export { Mem0Backend, extractAddedIds, type Mem0BackendDeps } from './mem0-backend';
+export {
+  LEXICAL_SCOPE_CONCURRENCY,
+  Mem0Backend,
+  extractAddedIds,
+  type Mem0BackendDeps,
+} from './mem0-backend';
 export { applyScoreFloor, type ScoreFloorOptions } from './score-floor';
 /** The ONE runtime-opaque optional-dependency import — see ./dynamic-import. */
 export { dynamicImport } from './dynamic-import';
@@ -226,7 +231,7 @@ export {
   type SidecarEmbedResponse,
 } from './sidecar-embedder';
 
-export { CanonicalVectorStore } from './canonical-store';
+export { CanonicalVectorStore, LEXICAL_QUERY_CONCURRENCY } from './canonical-store';
 /**
  * The lexical leg's own tokenizer. Exported because anything ASKING a question
  * of that leg needs to know what its query will actually be reduced to — the
