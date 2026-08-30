@@ -222,6 +222,42 @@ function entityFilterEnabled(): boolean {
 const LEXICAL_MAX_TOKENS = 32;
 
 /**
+ * Process-wide admission for the payload-bearing lexical query.  A backend
+ * call already bounds its scope workers, but callers can issue several backend
+ * searches at once (the hybrid leg and multiple request workers do exactly
+ * that).  Without a second, shared ceiling those calls multiply the number of
+ * large JSONB result sets resident in the node process.  Four leaves one slot
+ * in the canonical store's five-connection pool for the semantic/read paths.
+ */
+export const LEXICAL_QUERY_CONCURRENCY = 4;
+
+type LexicalAdmissionWaiter = () => void;
+let lexicalQueriesInFlight = 0;
+const lexicalAdmissionQueue: LexicalAdmissionWaiter[] = [];
+
+async function withLexicalQueryAdmission<T>(run: () => Promise<T>): Promise<T> {
+  await new Promise<void>((resolve) => {
+    if (lexicalQueriesInFlight < LEXICAL_QUERY_CONCURRENCY) {
+      lexicalQueriesInFlight += 1;
+      resolve();
+      return;
+    }
+    lexicalAdmissionQueue.push(() => {
+      // The permit handed to a waiter remains counted while it runs.  This
+      // avoids a transient fifth query between release and the waiter's turn.
+      resolve();
+    });
+  });
+  try {
+    return await run();
+  } finally {
+    const next = lexicalAdmissionQueue.shift();
+    if (next) next();
+    else lexicalQueriesInFlight -= 1;
+  }
+}
+
+/**
  * Tokenize a query for lexical search: lowercase, split on anything outside
  * [a-z0-9_-], drop 1-char tokens, dedupe, cap. Two P-002 parity properties
  * (memory-pg-lexical-own-injection-2026-07-13):
@@ -755,37 +791,62 @@ export class CanonicalVectorStore {
     }
     const rawScore = scoreTerms.join(' + ');
     params.push(topK);
-    const res = await client.query(
-      `SELECT id, payload, valid_at, invalid_at, superseded_by,
-              (${rawScore})::float AS lex_raw
-       FROM (
-         SELECT id, payload, valid_at, invalid_at, superseded_by, created_at,
-                payload->>'name' AS nm,
-                payload->>'description' AS ds,
-                payload->>'data' AS dt
-         FROM ${this.cfg.schema}.memory_canonical
-         WHERE ${conds.join(' AND ')}
-         OFFSET 0
-       ) c
-       WHERE (${matchTerms.join(' OR ')})
-       ORDER BY lex_raw DESC, created_at DESC
-       LIMIT $${idx}`,
-      params,
-    );
-    return res.rows.map(
-      (r: {
-        id: string;
-        payload: Record<string, unknown>;
-        lex_raw: number;
-        valid_at?: unknown;
-        invalid_at?: unknown;
-        superseded_by?: unknown;
-      }) => ({
-        id: r.id,
-        payload: this.storeKind === 'memory' ? foldValidity(r.payload, r, temporal) : r.payload,
-        score: Number(r.lex_raw) / (tokens.length * 3),
-      }),
-    );
+    /**
+     * Payload-retention guard (EI-21855287664853515): rank in a materialized
+     * ID/score CTE first, then join the JSONB payload only for those top-K ids.
+     * The previous shape selected `payload` in the ranking relation, which
+     * made every candidate's potentially TOAST-sized JSONB value part of the
+     * sort/result tuple.  Under a wide harness fan-out those tuples remained
+     * reachable in several concurrent client result arrays.  The CTE carries
+     * only scalar rank/validity fields; the final join is the sole payload
+     * materialization point and is therefore bounded by `topK`.
+     *
+     * `MATERIALIZED` is intentional: it keeps the rank phase an optimization
+     * fence even when a newer PostgreSQL planner would otherwise inline the
+     * CTE and move the payload join back above the LIMIT.  `OFFSET 0` retains
+     * the existing field-projection fence and its measured token-count cost.
+     */
+    const rows = await withLexicalQueryAdmission(async () => {
+      const res = await client.query(
+        `WITH ranked AS MATERIALIZED (
+           SELECT id, valid_at, invalid_at, superseded_by, created_at,
+                  (${rawScore})::float AS lex_raw
+           FROM (
+             SELECT id, valid_at, invalid_at, superseded_by, created_at,
+                    payload->>'name' AS nm,
+                    payload->>'description' AS ds,
+                    payload->>'data' AS dt
+             FROM ${this.cfg.schema}.memory_canonical
+             WHERE ${conds.join(' AND ')}
+             OFFSET 0
+           ) candidate
+           WHERE (${matchTerms.join(' OR ')})
+           ORDER BY lex_raw DESC, created_at DESC
+           LIMIT $${idx}
+         )
+         SELECT ranked.id, c.payload, ranked.valid_at, ranked.invalid_at,
+                ranked.superseded_by, ranked.lex_raw
+         FROM ranked
+         JOIN ${this.cfg.schema}.memory_canonical c ON c.id = ranked.id
+         ORDER BY ranked.lex_raw DESC, ranked.created_at DESC`,
+        params,
+      );
+      return res.rows.map(
+        (r: {
+          id: string;
+          payload: Record<string, unknown>;
+          lex_raw: number;
+          valid_at?: unknown;
+          invalid_at?: unknown;
+          superseded_by?: unknown;
+        }) => ({
+          id: r.id,
+          payload: this.storeKind === 'memory' ? foldValidity(r.payload, r, temporal) : r.payload,
+          score: Number(r.lex_raw) / (tokens.length * 3),
+        }),
+      );
+    });
+    return rows;
   }
 
   async get(id: string): Promise<VectorStoreResult | null> {

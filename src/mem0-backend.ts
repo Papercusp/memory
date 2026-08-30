@@ -69,6 +69,70 @@ const DEFAULT_SEARCH_LIMIT = 8;
 const LIST_TOP_K = 5000;
 
 /**
+ * Maximum number of lexical scope pulls a single backend call may have in
+ * flight.  `memory:search` normally supplies the user's pool plus every
+ * harness pool in the workspace (102 pools were present during the
+ * 2026-08-30 OOM).  Starting one promise per pool made every returned JSONB
+ * payload stay reachable until the whole fan-out completed.  Workers below
+ * merge each scope immediately, so this is also a hard cap on the number of
+ * result arrays retained by one call.
+ *
+ * Keep this at or below the canonical store's four-query admission ceiling;
+ * one spare connection in its five-slot PG pool remains available to the
+ * semantic/read and health paths.
+ */
+export const LEXICAL_SCOPE_CONCURRENCY = 4;
+
+/** Bounded-concurrency worker map. Results are deliberately not collected: a
+ * caller that needs to retain every per-item array defeats the memory bound.
+ */
+async function forEachWithConcurrency<T>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return;
+  let next = 0;
+  const workerCount = Math.max(1, Math.min(Math.floor(limit), items.length));
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+}
+
+// The worker cap above is per invocation. Several request workers (or the two
+// legs of multiple HybridBackend calls) can still invoke this method at once,
+// so keep a second process-wide lease around the payload-bearing seam. The
+// canonical store has the same defense for direct callers; this layer also
+// protects injected/alternate lexical implementations from the old global
+// Promise.all amplification.
+type LexicalScopeWaiter = () => void;
+let lexicalScopePullsInFlight = 0;
+const lexicalScopeWaiters: LexicalScopeWaiter[] = [];
+
+async function withLexicalScopeAdmission<T>(run: () => Promise<T>): Promise<T> {
+  await new Promise<void>((resolve) => {
+    if (lexicalScopePullsInFlight < LEXICAL_SCOPE_CONCURRENCY) {
+      lexicalScopePullsInFlight += 1;
+      resolve();
+      return;
+    }
+    lexicalScopeWaiters.push(resolve);
+  });
+  try {
+    return await run();
+  } finally {
+    const next = lexicalScopeWaiters.shift();
+    if (next) next();
+    else lexicalScopePullsInFlight -= 1;
+  }
+}
+
+/**
  * Search-time memory decay (recency ranking bias) — the OSS-side
  * equivalent of mem0 platform's "Memory Decay", which does NOT exist in
  * mem0ai OSS ≤3.0.3 (the OSS dist has no decay/recency code; it is a
@@ -562,13 +626,41 @@ export class Mem0Backend implements MemoryBackend {
    */
   async searchLexical(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
     const limit = opts.limit ?? DEFAULT_SEARCH_LIMIT;
-    const pulls = scopesOf(opts.scope).map(async (scope) => {
-      const rows = await this.lexicalSearch(query, limit, { user_id: scope, ...temporalFilters(opts) });
-      return rows.map((row) => canonicalRowToEntry(row, scope));
+    const scopes = scopesOf(opts.scope);
+    // Do not collect one result array per scope and flatten it after a
+    // Promise.all.  The default memory:search scope is user + every harness;
+    // retaining all of those arrays was the strongest remaining retaining
+    // producer in the 2026-08-30 OOM investigation.  Each worker maps and
+    // merges its rows immediately, allowing the raw JSONB payload array to be
+    // released before the next scope is admitted.
+    const merged = new Map<string, { entry: MemoryEntry; scopeIndex: number; rowIndex: number }>();
+    await forEachWithConcurrency(scopes, LEXICAL_SCOPE_CONCURRENCY, async (scope, scopeIndex) => {
+      await withLexicalScopeAdmission(async () => {
+        const rows = await this.lexicalSearch(query, limit, { user_id: scope, ...temporalFilters(opts) });
+        for (const [rowIndex, row] of rows.entries()) {
+          const entry = canonicalRowToEntry(row, scope);
+          const prior = merged.get(entry.id);
+          if (!prior || (entry.score ?? 0) > (prior.entry.score ?? 0)) {
+            // `mergeById` historically retained the first scope's insertion
+            // order for score ties. Keep that deterministic order even though
+            // workers now complete out of order.
+            merged.set(entry.id, {
+              entry,
+              scopeIndex: prior?.scopeIndex ?? scopeIndex,
+              rowIndex: prior?.rowIndex ?? rowIndex,
+            });
+          }
+        }
+      });
     });
-    return mergeById((await Promise.all(pulls)).flat()).sort(
-      (a, b) => (b.score ?? 0) - (a.score ?? 0),
-    );
+    return [...merged.values()]
+      .sort(
+        (a, b) =>
+          (b.entry.score ?? 0) - (a.entry.score ?? 0) ||
+          a.scopeIndex - b.scopeIndex ||
+          a.rowIndex - b.rowIndex,
+      )
+      .map(({ entry }) => entry);
   }
 
   async list(opts: ListOptions): Promise<MemoryEntry[]> {

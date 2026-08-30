@@ -15,6 +15,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   CanonicalVectorStore,
+  LEXICAL_QUERY_CONCURRENCY,
   isLowQualityCompoundEntity,
   lexicalTokens,
   splitTemporalControls,
@@ -378,6 +379,13 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     // The optimisation fence that stops the subquery being flattened back (which
     // would re-inline the per-token extraction and silently restore the old cost).
     expect(q.sql).toContain('OFFSET 0');
+    // EI-21855287664853515: rank carries ids/scores only; the JSONB payload is
+    // joined after the top-K LIMIT so broad matches cannot retain every payload
+    // in the ranking tuples.
+    expect(q.sql).toContain('WITH ranked AS MATERIALIZED');
+    expect(q.sql).toContain('JOIN harness_shared.memory_canonical c ON c.id = ranked.id');
+    expect(q.sql).toContain('SELECT ranked.id, c.payload');
+    expect(q.sql).not.toContain('SELECT id, payload, valid_at');
     expect(q.sql).not.toContain('memory_vec'); // never touches an embedding table
     expect(q.params).toContain('scope-a');
     expect(q.params).toContain('%embed%');
@@ -450,6 +458,34 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     await store.lexicalSearch('embed', 2);
     expect(queries[0].sql).toMatch(/LIMIT \$\d+/);
     expect(queries[0].params.at(-1)).toBe(2);
+  });
+
+  it('does not admit more than four payload-bearing lexical queries at once', async () => {
+    let active = 0;
+    let peak = 0;
+    const queries: CapturedQuery[] = [];
+    const fakePool = {
+      query: vi.fn(async (sql: string, params: unknown[] = []) => {
+        queries.push({ sql, params });
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        active -= 1;
+        return { rows: [], rowCount: 0 };
+      }),
+      on: () => {},
+    };
+    const { store } = makeStore('operator_memory_local');
+    (store as unknown as { pool: unknown }).pool = fakePool;
+
+    await Promise.all(
+      Array.from({ length: 10 }, (_, i) =>
+        store.lexicalSearch(`query-${i}`, 1, { user_id: `scope-${i}` }),
+      ),
+    );
+
+    expect(queries).toHaveLength(10);
+    expect(peak).toBeLessThanOrEqual(LEXICAL_QUERY_CONCURRENCY);
   });
 });
 

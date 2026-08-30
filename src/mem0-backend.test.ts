@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { Mem0Backend, extractAddedIds, extractStoredEventCount } from './mem0-backend';
+import {
+  LEXICAL_SCOPE_CONCURRENCY,
+  Mem0Backend,
+  extractAddedIds,
+  extractStoredEventCount,
+} from './mem0-backend';
 import { MemoryUnavailableError } from './backend';
 import type { MemoryClient } from './mem0-client';
 
@@ -874,6 +879,63 @@ describe('Mem0Backend.searchLexical (WI-4214 embed-free fallback)', () => {
     expect(out[1].metadata).toEqual({ kind: 'project', anchors: ['WI-4214'] });
     expect(out[1].metadata).not.toHaveProperty('data');
     expect(out[1].metadata).not.toHaveProperty('user_id');
+  });
+
+  it('bounds scope pulls and merges each result immediately (OOM recurrence guard)', async () => {
+    const scopes = Array.from({ length: LEXICAL_SCOPE_CONCURRENCY * 3 + 1 }, (_, i) => `scope-${i}`);
+    let active = 0;
+    let peak = 0;
+    const started: string[] = [];
+    const be = new Mem0Backend({
+      getClient: async () => {
+        throw new Error('must not build a client on the lexical path');
+      },
+      lexicalSearch: async (_query, _topK, filters) => {
+        const scope = filters.user_id;
+        active += 1;
+        peak = Math.max(peak, active);
+        started.push(scope);
+        // Keep all workers occupied long enough to expose an accidental
+        // Promise.all fan-out, then return a deliberately large-ish payload
+        // that the backend must merge and release per scope.
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        active -= 1;
+        return [{ id: scope, payload: { data: `fact for ${scope}`, user_id: scope }, score: 1 }];
+      },
+    });
+
+    const out = await be.searchLexical('q', { scope: scopes, limit: 1 });
+
+    expect(started).toHaveLength(scopes.length);
+    expect(peak).toBeLessThanOrEqual(LEXICAL_SCOPE_CONCURRENCY);
+    expect(out).toHaveLength(scopes.length);
+    expect(new Set(out.map((entry) => entry.id))).toEqual(new Set(scopes));
+  });
+
+  it('keeps the lexical admission bound across concurrent backend calls', async () => {
+    let active = 0;
+    let peak = 0;
+    const be = new Mem0Backend({
+      getClient: async () => {
+        throw new Error('must not build a client on the lexical path');
+      },
+      lexicalSearch: async (_query, _topK, filters) => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        active -= 1;
+        return [{ id: filters.user_id, payload: { data: filters.user_id, user_id: filters.user_id }, score: 1 }];
+      },
+    });
+
+    await Promise.all(
+      Array.from({ length: 3 }, (_, i) => be.searchLexical(`q-${i}`, { scope: [`a-${i}`, `b-${i}`], limit: 1 })),
+    );
+
+    // The admission is process-wide, not merely per invocation: concurrent
+    // callers cannot multiply the payload-bearing lexical work past the same
+    // four-slot ceiling.
+    expect(peak).toBeLessThanOrEqual(LEXICAL_SCOPE_CONCURRENCY);
   });
 });
 
