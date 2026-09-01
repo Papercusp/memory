@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { coalesceEmbedFn, coalesceEmbedFnWithStats } from './embed-coalesce';
+import { coalesceEmbedFn, coalesceEmbedFnWithStats, normalizeEmbeddingText } from './embed-coalesce';
+
+it('normalizeEmbeddingText canonicalizes Unicode, case, and incidental whitespace', () => {
+  expect(normalizeEmbeddingText('  Héllo\t WORLD  ')).toBe('héllo world');
+  expect(normalizeEmbeddingText('ｅxample')).toBe('example');
+});
 
 /** A controllable embedder: counts calls, resolves on demand. */
 function slowEmbedder(vector: number[] = [1, 2, 3]) {
@@ -47,6 +52,17 @@ describe('coalesceEmbedFn', () => {
     void embed('beta');
     expect(under.calls()).toBe(2);
     under.releaseAll();
+  });
+
+  it('coalesces equivalent casing/whitespace variants on one canonical identity', async () => {
+    let calls = 0;
+    const embed = coalesceEmbedFn(async (text) => {
+      calls += 1;
+      return [text.length];
+    });
+    await expect(embed('  Same\tQuery ')).resolves.toEqual([13]);
+    await expect(embed('same query')).resolves.toEqual([13]);
+    expect(calls).toBe(1);
   });
 
   it('serves a fresh cache hit without re-embedding, and expires it past ttlMs', async () => {

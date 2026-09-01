@@ -29,6 +29,11 @@
 
 import { createHash } from 'node:crypto';
 
+/** Canonical identity for exact-query embedding work. */
+export function normalizeEmbeddingText(text: string): string {
+  return text.normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
 export interface CoalesceEmbedOptions {
   /** How long a computed vector may be served from cache. Default 60s. */
   ttlMs?: number;
@@ -68,7 +73,7 @@ export function coalesceEmbedFnWithStats(
   const stats: CoalesceEmbedStats = { hits: 0, coalesced: 0, misses: 0, size: () => done.size };
 
   const embed = (text: string): Promise<number[]> => {
-    const key = createHash('sha256').update(text).digest('base64');
+    const key = createHash('sha256').update(normalizeEmbeddingText(text)).digest('base64');
 
     const hit = done.get(key);
     if (hit) {

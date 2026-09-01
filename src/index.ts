@@ -230,6 +230,7 @@ export {
   type SidecarEmbedBatchOpts,
   type SidecarEmbedResponse,
 } from './sidecar-embedder';
+export { normalizeEmbeddingText } from './embed-coalesce';
 
 export { CanonicalVectorStore, LEXICAL_QUERY_CONCURRENCY } from './canonical-store';
 /**
