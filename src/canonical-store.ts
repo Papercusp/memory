@@ -304,6 +304,38 @@ function storeKindCond(alias: string, kind: 'memory' | 'entity'): string {
 }
 
 /**
+ * The SAME discriminator, expressed against the `memory_vec_*` side.
+ *
+ * Why both exist: `storeKindCond` reads `payload`, which lives only on the
+ * JOINED `memory_canonical` row, so Postgres cannot apply it until AFTER the
+ * approximate index scan has already picked its candidates — the scan is
+ * therefore forced through the FULL `memory_vec_*_hnsw_idx`, which is ~91%
+ * mem0 entity vectors. Migration 1093 denormalizes `row_kind` onto each vec
+ * row (trigger-maintained mirror of `memory_canonical.row_kind`) precisely so
+ * this predicate can sit on `v.` and make the partial
+ * `memory_vec_*_hnsw_memory_idx` selectable.
+ *
+ * Measured on the live store 2026-09-02 (plan
+ * memory-vector-entity-index-split-2026-09-02, P-004), `LIMIT 12` scoped to
+ * `harness:papercusp` under the production `hnsw.iterative_scan =
+ * relaxed_order`:
+ *
+ *   c. predicate alone → full `_hnsw_idx`, 16,621 index rows, 104,633 buffers
+ *   v. predicate added → partial `_hnsw_memory_idx`, 39 index rows, 807 buffers
+ *
+ * Callers pass BOTH conditions. The `v.` clause is what buys the index; the
+ * `c.` clause is retained as a correctness backstop, and it is free — measured
+ * identical plans and identical buffer counts with and without it. `payload`
+ * on `memory_canonical` stays the source of truth for what a row IS, so if the
+ * denormalized mirror ever drifted, a false `row_kind = 'memory'` would be
+ * caught by the retained `c.` predicate instead of leaking an entity row into
+ * memory recall: drift degrades speed, never correctness.
+ */
+function vecKindCond(alias: string, kind: 'memory' | 'entity'): string {
+  return `${alias}row_kind = '${kind}'`;
+}
+
+/**
  * Temporal-lite validity (memory-temporal-lite-validity-windows-2026-07-11
  * P-002/P-006, migration 578). mem0 forwards our tool-layer read options as
  * FILTER keys, but `as_of` / `include_superseded` are TEMPORAL controls, not
@@ -614,7 +646,14 @@ export class CanonicalVectorStore {
     // clause itself applies to memory rows only — entity rows are mem0's
     // lifecycle, exempt by design.
     const { temporal, rest } = splitTemporalControls(filters);
-    const conds: string[] = [storeKindCond('c.', this.storeKind), `c.state != 'archived'`];
+    // The `v.` discriminator is what lets the planner choose the partial
+    // memory-only HNSW index (migration 1093); the `c.` one is the retained
+    // correctness backstop. See vecKindCond for the measurement.
+    const conds: string[] = [
+      vecKindCond('v.', this.storeKind),
+      storeKindCond('c.', this.storeKind),
+      `c.state != 'archived'`,
+    ];
     const params: unknown[] = [toVectorLiteral(query), topK];
     let idx = 3;
     if (rest) {

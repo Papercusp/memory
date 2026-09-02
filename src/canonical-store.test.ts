@@ -107,7 +107,67 @@ describe('CanonicalVectorStore store-kind segregation', () => {
   it('search with no filters still carries the kind clause', async () => {
     const { store, queries } = makeStore('operator_memory_openai');
     await store.search(VEC, 5);
-    expect(queries[0].sql).toContain("WHERE NOT (c.payload ? 'entityType')");
+    expect(queries[0].sql).toContain("WHERE v.row_kind = 'memory'");
+    expect(queries[0].sql).toContain("NOT (c.payload ? 'entityType')");
+  });
+
+  /**
+   * P-004 (plan memory-vector-entity-index-split-2026-09-02). The discriminator
+   * has to sit on the `memory_vec_*` side for migration 1093's partial
+   * `_hnsw_memory_idx` to be selectable at all: a predicate on the JOINED
+   * canonical row cannot be applied until after the approximate index scan has
+   * already chosen its candidates. Measured on the live store, moving it took a
+   * scoped `LIMIT 12` from 16,621 index rows / 104,633 buffers (full index) to
+   * 39 / 807 (partial index).
+   *
+   * These are SQL-shape assertions because the cost of getting it wrong is
+   * silent: the query keeps returning correct rows either way — it just quietly
+   * orders over ~91% entity vectors again.
+   */
+  it('memory search pushes the discriminator onto the VEC side (partial-index predicate)', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.search(VEC, 5, { user_id: 'scope-a' });
+    expect(queries[0].sql).toContain("v.row_kind = 'memory'");
+  });
+
+  it('entity search pushes its own vec-side discriminator', async () => {
+    const { store, queries } = makeStore('operator_memory_local_entities');
+    await store.search(VEC, 5);
+    expect(queries[0].sql).toContain("v.row_kind = 'entity'");
+  });
+
+  /**
+   * The vec-side clause buys the index; the canonical-side clause is the
+   * correctness backstop, and it is free (measured identical plans and buffer
+   * counts with and without it). `payload` remains the source of truth for what
+   * a row IS, so if the trigger-maintained mirror ever drifted, a false
+   * `row_kind = 'memory'` is caught here instead of leaking an entity row into
+   * memory recall. Dropping either one is a real regression, so pin both.
+   */
+  it('retains the canonical-side predicate as a drift backstop alongside the vec-side one', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.search(VEC, 5, { user_id: 'scope-a' });
+    expect(queries[0].sql).toContain("v.row_kind = 'memory'");
+    expect(queries[0].sql).toContain("NOT (c.payload ? 'entityType')");
+  });
+
+  /**
+   * Guards the other direction: `row_kind` exists on `memory_canonical` too, so
+   * "simplifying" this to `c.row_kind` would typecheck, keep every result
+   * correct, and silently give the partial index back.
+   */
+  it('does not express the vec-side discriminator against the canonical alias', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.search(VEC, 5, { user_id: 'scope-a' });
+    expect(queries[0].sql).not.toContain("c.row_kind = 'memory'");
+  });
+
+  /** list()/count read memory_canonical alone — there is no `v` to qualify. */
+  it('does not leak a vec-side predicate into the non-joining list/count reads', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.list({ user_id: 'scope-a' }, 10);
+    expect(queries).toHaveLength(2);
+    for (const q of queries) expect(q.sql).not.toContain('row_kind');
   });
 
   it('insert stores a well-formed entity payload untouched', async () => {
