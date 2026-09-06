@@ -85,11 +85,14 @@ export const DEFAULT_SIDECAR_TIMEOUT_MS = 15_000;
  * the batch optimization disables itself — it broke exactly where it was meant
  * to pay off.
  *
- * 1s/text is ~4.5× the measured cost: this ceiling exists to catch a SICK
- * sidecar, not to pace a healthy one, and a false abort here costs the entire
- * batch optimization (this bug). Erring long is the cheap direction.
+ * 2s/text is deliberately conservative after WI-2146713's 2026-09-06 live
+ * probe: 16 unique 2,000-character gemma/document texts reached the model
+ * (cache hits 0) and completed in 34.4s. That makes the old 30s n=16 budget a
+ * false-abort path. The ceiling exists to catch a SICK sidecar, not to pace a
+ * healthy one, and a false abort here costs the entire batch optimization.
+ * Erring long is the cheap direction.
  */
-export const SIDECAR_BATCH_PER_TEXT_MS = 1_000;
+export const SIDECAR_BATCH_PER_TEXT_MS = 2_000;
 
 /** Absolute ceiling for a batch budget, so a huge `texts[]` cannot produce an
  *  effectively unbounded request. */

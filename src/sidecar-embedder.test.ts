@@ -23,6 +23,7 @@ import {
   EMBED_SIDECAR_URL_ENV,
   SIDECAR_MAX_TEXT_CHARS,
   DEFAULT_SIDECAR_TIMEOUT_MS,
+  SIDECAR_BATCH_PER_TEXT_MS,
   SIDECAR_BATCH_TIMEOUT_CAP_MS,
   sidecarBatchTimeoutMs,
   SidecarEmbedHttpError,
@@ -203,7 +204,10 @@ describe('sidecarEmbedBatch', () => {
   it('derives the batch budget from size, leaves n=1 alone, and caps it', () => {
     expect(sidecarBatchTimeoutMs(1)).toBe(DEFAULT_SIDECAR_TIMEOUT_MS);
     expect(sidecarBatchTimeoutMs(0)).toBe(DEFAULT_SIDECAR_TIMEOUT_MS);
-    // A server-tier batch needs ~28s at the measured ~0.22s/text; 15s is the bug.
+    // WI-2146713: a unique n=16 live document batch took 34.4s, so the
+    // count-scaled budget must leave that batch above the old 30s deadline.
+    expect(SIDECAR_BATCH_PER_TEXT_MS).toBe(2_000);
+    expect(sidecarBatchTimeoutMs(16)).toBe(45_000);
     expect(sidecarBatchTimeoutMs(128)).toBeGreaterThan(30_000);
     expect(sidecarBatchTimeoutMs(10_000)).toBe(SIDECAR_BATCH_TIMEOUT_CAP_MS);
   });
