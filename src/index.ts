@@ -155,6 +155,22 @@ export {
   LOCAL_EMBEDDER_MODEL,
 } from './local-embedder-worker';
 
+// What device the embedders actually run on. Exported so the sidecar's /healthz
+// can report it: embed latency had no detector, so fourteen filings searched the
+// scheduler for a cause that lived in the execution target.
+export {
+  EMBED_ORT_PACKAGE,
+  EMBED_REQUESTED_EXECUTION,
+  embedExecutionHealth,
+  embedExecutionTarget,
+  embedGpuBundled,
+  ensureEmbedBackendsProbed,
+  type EmbedBackend,
+  type EmbedExecutionHealth,
+  type EmbedExecutionProbe,
+  type EmbedExecutionTarget,
+} from './execution-target';
+
 export {
   buildGemmaEmbedder,
   gemmaPrompt,
