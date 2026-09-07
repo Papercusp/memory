@@ -189,6 +189,13 @@ describe('embed execution target — the detector the 14 latency filings lacked'
         }
         expect(typeof health.gpuBundled).toBe('boolean');
         expect(health.probeError).toBeNull();
+        // The rolled-up boolean must never travel without the names behind it:
+        // a bundled CUDA provider and a bundled WebGPU one both render `true`
+        // and imply completely different next steps. On this host it is webgpu
+        // (cuda reports bundled:false), so a bare `true` read as "CUDA is
+        // available" would be exactly the wrong conclusion.
+        expect(Array.isArray(health.gpuBackendsBundled)).toBe(true);
+        expect(health.gpuBundled).toBe(health.gpuBackendsBundled!.length > 0);
         // The verdict must be derived from the list, not stored independently.
         const derived = health.backends!.some(
           (b) => b.bundled && ['cuda', 'tensorrt', 'webgpu', 'dml', 'coreml', 'rocm'].includes(b.name.toLowerCase()),

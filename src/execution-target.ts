@@ -89,10 +89,23 @@ export type EmbedExecutionHealth = {
   /** What it therefore runs on. */
   active: EmbedExecutionTarget;
   /**
-   * Whether ANY GPU-capable execution provider is bundled in this build.
+   * Whether ANY GPU-capable execution provider is COMPILED INTO this build.
    * `null` means the probe has not resolved — UNKNOWN, not "no".
+   *
+   * ⚠ Bundled is not usable. `listSupportedBackends()` reports what the binding
+   * ships, never whether a session would actually construct on this host: on
+   * this box it answers `webgpu: bundled:true` while `cuda: bundled:false`, and
+   * whether Dawn would find the NVIDIA device is a separate question this probe
+   * does not ask. Treat `true` as "worth investigating", never as "a GPU is
+   * available" — the only way to prove a GPU session is to construct one.
    */
   gpuBundled: boolean | null;
+  /**
+   * WHICH backends made `gpuBundled` true. Present because the rolled-up
+   * boolean cannot distinguish a bundled CUDA provider from a bundled WebGPU
+   * one, and those imply very different next steps.
+   */
+  gpuBackendsBundled: string[] | null;
   /** The raw `listSupportedBackends()` answer; `null` until the probe resolves. */
   backends: EmbedBackend[] | null;
   probe: EmbedExecutionProbe;
@@ -189,10 +202,19 @@ export function ensureEmbedBackendsProbed(): Promise<void> {
   return run;
 }
 
+/**
+ * The GPU-capable backends compiled into this build; `null` while the probe is
+ * pending or failed. Empty array = measured, and none.
+ */
+export function embedGpuBackendsBundled(): string[] | null {
+  if (state.probe !== 'ok' || !state.backends) return null;
+  return state.backends.filter((b) => b.bundled && GPU_BACKENDS.has(b.name.toLowerCase())).map((b) => b.name);
+}
+
 /** `true`/`false` once measured; `null` while the probe is pending or failed. */
 export function embedGpuBundled(): boolean | null {
-  if (state.probe !== 'ok' || !state.backends) return null;
-  return state.backends.some((b) => b.bundled && GPU_BACKENDS.has(b.name.toLowerCase()));
+  const gpu = embedGpuBackendsBundled();
+  return gpu === null ? null : gpu.length > 0;
 }
 
 /**
@@ -203,26 +225,33 @@ export function embedGpuBundled(): boolean | null {
  * how well-evidenced that answer is. Read it before quoting the pair.
  */
 export function embedExecutionTarget(): EmbedExecutionTarget {
-  const gpu = embedGpuBundled();
+  const gpu = embedGpuBackendsBundled();
   const base = 'the embed path requests no device, so transformers.js applies its CPU default';
-  if (gpu === false) {
+  const dtype = EMBED_REQUESTED_EXECUTION.dtype;
+  if (gpu === null) {
     return {
       device: 'cpu',
-      dtype: EMBED_REQUESTED_EXECUTION.dtype,
-      why: `${base}; this onnxruntime build also bundles no GPU execution provider, so no other device is reachable`,
+      dtype,
+      why: `${base}; the bundled-backend probe has not resolved, so whether any GPU provider is compiled in is UNKNOWN`,
     };
   }
-  if (gpu === true) {
+  if (gpu.length === 0) {
     return {
       device: 'cpu',
-      dtype: EMBED_REQUESTED_EXECUTION.dtype,
-      why: `${base} — note a GPU execution provider IS bundled here, so this CPU target is a choice nobody made explicitly, not a hardware limit`,
+      dtype,
+      why: `${base}; this onnxruntime build also compiles in no GPU execution provider, so no other device is reachable from here`,
     };
   }
   return {
     device: 'cpu',
-    dtype: EMBED_REQUESTED_EXECUTION.dtype,
-    why: `${base}; the bundled-backend probe has not resolved, so whether a GPU provider exists is UNKNOWN`,
+    dtype,
+    // Deliberately hedged. A bundled backend is a compile-time fact, not a
+    // working GPU session — claiming the latter from the former would be the
+    // same unverified leap this detector exists to stop people making.
+    why:
+      `${base}. GPU-capable backend(s) ARE compiled in (${gpu.join(', ')}), so the CPU target is by omission, ` +
+      'not a proven hardware limit — but bundled is not usable, and whether one of those would actually ' +
+      'construct a session on this host is unverified',
   };
 }
 
@@ -237,6 +266,7 @@ export function embedExecutionHealth(): EmbedExecutionHealth {
     requested: { ...EMBED_REQUESTED_EXECUTION },
     active: embedExecutionTarget(),
     gpuBundled: embedGpuBundled(),
+    gpuBackendsBundled: embedGpuBackendsBundled(),
     backends: state.backends ? state.backends.map((b) => ({ ...b })) : null,
     probe: state.probe,
     probeError: state.probeError,
