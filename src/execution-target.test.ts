@@ -183,33 +183,58 @@ describe('embed execution target — the detector the 14 latency filings lacked'
       expect(health.probe === 'ok' || health.probe === 'failed').toBe(true);
 
       if (health.probe === 'ok') {
-        expect(Array.isArray(health.backends)).toBe(true);
-        expect(health.backends!.length).toBeGreaterThan(0);
-        // Every backend entry is a well-formed pair, so `bundled` can be trusted.
-        for (const b of health.backends!) {
+        expect(Array.isArray(health.defaultBundledBackends)).toBe(true);
+        expect(health.defaultBundledBackends!.length).toBeGreaterThan(0);
+        for (const b of health.defaultBundledBackends!) {
           expect(typeof b.name).toBe('string');
           expect(typeof b.bundled).toBe('boolean');
         }
-        expect(typeof health.gpuBundled).toBe('boolean');
         expect(health.probeError).toBeNull();
-        // The rolled-up boolean must never travel without the names behind it:
-        // a bundled CUDA provider and a bundled WebGPU one both render `true`
-        // and imply completely different next steps. On this host it is webgpu
-        // (cuda reports bundled:false), so a bare `true` read as "CUDA is
-        // available" would be exactly the wrong conclusion.
-        expect(Array.isArray(health.gpuBackendsBundled)).toBe(true);
-        expect(health.gpuBundled).toBe(health.gpuBackendsBundled!.length > 0);
-        // The verdict must be derived from the list, not stored independently.
-        const derived = health.backends!.some(
-          (b) => b.bundled && ['cuda', 'tensorrt', 'webgpu', 'dml', 'coreml', 'rocm'].includes(b.name.toLowerCase()),
-        );
-        expect(health.gpuBundled).toBe(derived);
+        // Availability is derived from the LIBRARIES ON DISK, never from the
+        // packaging metadata — see the next test for why.
+        if (health.providerLibraries !== null) {
+          expect(health.gpuProviderAvailable).toBe(
+            health.providerLibraries.some((f) =>
+              /^libonnxruntime_providers_(cuda|tensorrt|rocm|migraphx|dml)\./i.test(f),
+            ),
+          );
+        } else {
+          expect(health.gpuProviderAvailable).toBeNull();
+        }
       } else {
         // A failed probe must degrade to UNKNOWN with the reason attached —
-        // never to an empty list that would render as "no GPU bundled".
-        expect(health.gpuBundled).toBeNull();
-        expect(health.backends).toBeNull();
+        // never to an empty list that would render as "no GPU available".
+        expect(health.gpuProviderAvailable).toBeNull();
+        expect(health.providerLibraries).toBeNull();
+        expect(health.defaultBundledBackends).toBeNull();
         expect(health.probeError).toBeTruthy();
+      }
+    });
+
+    it('NEVER derives availability from listSupportedBackends().bundled (the 2026-09-07 correction)', async () => {
+      // MEASURED that day: installing onnxruntime-node@1.24.3 with
+      // ONNXRUNTIME_NODE_INSTALL_CUDA=v12 downloads libonnxruntime_providers_cuda.so
+      // (~315MB) and CUDA sessions then CONSTRUCT successfully — while
+      // listSupportedBackends() STILL reports cuda:{bundled:false}, and the
+      // onnxruntime_binding.node addon is byte-identical (384040 bytes) in both
+      // trees. So `bundled` is publish-time packaging metadata; deriving
+      // availability from it under-reports a working GPU box, which is what the
+      // first version of this module did.
+      await ensureEmbedBackendsProbed();
+      const health = embedExecutionHealth();
+      if (health.probe !== 'ok' || health.providerLibraries === null) return;
+
+      const gpuByPackaging = (health.defaultBundledBackends ?? []).some(
+        (b) => b.bundled && ['cuda', 'tensorrt', 'rocm', 'migraphx', 'dml'].includes(b.name.toLowerCase()),
+      );
+      const gpuByDisk = health.providerLibraries.some((f) =>
+        /^libonnxruntime_providers_(cuda|tensorrt|rocm|migraphx|dml)\./i.test(f),
+      );
+      // The reported value must track DISK. Where the two disagree, that is
+      // exactly the case the old implementation got wrong.
+      expect(health.gpuProviderAvailable).toBe(gpuByDisk);
+      if (gpuByPackaging !== gpuByDisk) {
+        expect(health.gpuProviderAvailable).not.toBe(gpuByPackaging);
       }
     });
 

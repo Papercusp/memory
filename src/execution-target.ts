@@ -121,11 +121,21 @@ export type EmbedExecutionHealth = {
    */
   providerLibraries: string[] | null;
   /**
-   * A GPU-capable provider library is present on disk. `null` = not measured.
+   * A DISCRETE GPU provider library (cuda / tensorrt / rocm / migraphx / dml)
+   * is present on disk. `null` = not measured.
    *
-   * Still not a promise that a session would construct — the library can be
-   * present and fail to load (missing CUDA/cuDNN runtime, ABI mismatch). That
-   * failure is what `@papercusp/rerank`'s `demotionCause` reports.
+   * Two deliberate limits, both of which have already caught a wrong reading:
+   *
+   *  - Presence is NOT a promise that a session would construct. The library can
+   *    be present and still fail to load (missing CUDA/cuDNN runtime, ABI
+   *    mismatch) — that failure is what `@papercusp/rerank`'s `demotionCause`
+   *    reports, and on this host it says exactly that.
+   *  - It does NOT cover **webgpu**, which is compiled INTO `libonnxruntime.so.1`
+   *    rather than shipping as its own `.so`, so no disk scan can see it. A host
+   *    can therefore read `gpuProviderAvailable: false` while `webgpu` is
+   *    genuinely usable. Consult `defaultBundledBackends` for that one — it is
+   *    the case where the packaging metadata is the better signal, which is why
+   *    both fields are reported side by side instead of one being "the answer".
    */
   gpuProviderAvailable: boolean | null;
   /**
