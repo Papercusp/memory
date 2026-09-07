@@ -21,42 +21,62 @@
  * there, while a *saturated* sample returned in 1543ms). The real mechanism was
  * never in the scheduler. It is that a single forward pass on this host costs
  * ~1.5-2.5s median with a tail past 8.5s, because the embedders run on the CPU:
- * no embedder requests a device, so `pipeline()` takes onnxruntime's CPU default,
- * and the shipped onnxruntime build bundles no GPU execution provider anyway.
+ * no embedder requests a device, so `pipeline()` takes onnxruntime's CPU default.
  *
- * Establishing that took reading `/proc/<pid>/maps` of the live sidecar to prove
- * which shared objects were mapped. That is not a thing the 15th filing should
- * have to do. This module makes the same fact a field on `/healthz`.
+ * ## ⚠ `bundled` DOES NOT MEAN AVAILABLE — read this before adding a field
  *
- * ## What it reports, and what it deliberately does not claim
+ * The first version of this module (2026-09-07, same day) reported a
+ * `gpuBundled` boolean derived from `onnxruntime-node`'s
+ * `listSupportedBackends()`, and documented it as "a GPU-capable execution
+ * provider is compiled into this build". **That was wrong, and it was wrong in
+ * the dangerous direction: it under-reports.** Measured the same day:
  *
- * Two things are true at different confidence levels, and conflating them is how
- * a detector becomes a liar:
+ *   - A default `npm install onnxruntime-node@1.24.3` yields
+ *     `[{cpu,bundled:true},{webgpu,bundled:true},{cuda,bundled:false},…]`.
+ *   - Re-installing the SAME version with `ONNXRUNTIME_NODE_INSTALL_CUDA=v12`
+ *     downloads `libonnxruntime_providers_cuda.so` (~315MB) — and
+ *     `listSupportedBackends()` STILL reports `cuda: bundled:false`.
+ *   - Yet in that tree `InferenceSession.create(model, { executionProviders:
+ *     ['cuda'] })` **constructs successfully**, emitting genuine
+ *     `CUDAExecutionProvider` graph-partition logs.
+ *   - The `onnxruntime_binding.node` addon is byte-identical (384040 bytes) in
+ *     both trees. Only the provider `.so` files differ.
+ *
+ * So `bundled` is **publish-time packaging metadata** — "does this provider ship
+ * in the default npm tarball" — and it is NOT a capability probe. A host can run
+ * CUDA perfectly while `bundled:false`. Reporting it as availability would have
+ * told the next reader "no GPU here" on a working GPU box, which is exactly the
+ * class of confidently-wrong detector this module exists to replace.
+ *
+ * What this module reports instead, at three honest confidence levels:
  *
  *   1. **The embed path requests no device.** Static, always knowable, and the
  *      actual root cause. `EMBED_REQUESTED_EXECUTION` states it, and
- *      `execution-target.test.ts` PINS it against the embedder sources — if
- *      someone starts passing `device:`/`dtype:` to `pipeline()`, that test
- *      fails rather than letting this constant quietly become false (the
- *      derived-truth ladder's rung 2).
+ *      `execution-target.test.ts` PINS it against the embedder sources.
+ *   2. **Which provider libraries are present on disk.** The actionable
+ *      availability signal (`providerLibraries` / `gpuProviderAvailable`) —
+ *      this is what actually changed between the two trees above.
+ *   3. **What ships by default.** `defaultBundledBackends`, kept because it
+ *      explains WHY a provider is absent (nobody passed the install flag), but
+ *      explicitly named so it can never again be read as availability.
  *
- *   2. **This onnxruntime build bundles no GPU execution provider.** Runtime
- *      truth, from `onnxruntime-node`'s own `listSupportedBackends()`, which
- *      answers e.g. `[{cpu,bundled:true},{webgpu,bundled:true},
- *      {cuda,bundled:false},{tensorrt,bundled:false}]`. Derived, never
- *      hand-maintained — rung 1.
+ * None of the three proves a GPU session would CONSTRUCT. Only constructing one
+ * proves that, which is precisely what `@papercusp/rerank`'s `demoted` /
+ * `demotionCause` pair reports — and on this host it reports
+ * `demoted: true, cause: "OrtSessionOptionsAppendExecutionProvider_Cuda: Failed
+ * to load shared library"`, the observable that started this correction.
  *
- * The probe is async and the sidecar's `/healthz` handler is sync, so
- * `gpuBundled` is `null` — never a convenient `false` — until
- * `ensureEmbedBackendsProbed()` resolves. An unresolved probe is UNKNOWN, and
- * saying so is the whole point: a detector that reports a confident `false`
- * from a measurement it never took reproduces the failure it was built to end.
+ * An unresolved probe reports `null` everywhere — never a convenient `false`.
+ * UNKNOWN is in-band and asserted by test.
  *
- * This module reports; it does not choose. Moving the embedders onto a GPU is an
- * infrastructure decision (shared `node_modules` under ~100 live agents, and a
- * GPU already ~86% utilized by another workload) and is deliberately NOT taken
- * here. Raising the timeout would only hide the 8.5s tail.
+ * This module reports; it does not choose. Moving the embedders onto a GPU stays
+ * an infrastructure decision (shared `node_modules` under ~100 live agents, and a
+ * GPU already ~88% utilized by another workload).
  */
+
+import { createRequire } from 'node:module';
+import { readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 import { pinModuleState } from '@papercusp/module-singleton';
 import { dynamicImport } from './dynamic-import';
@@ -65,7 +85,12 @@ import { ORT_SESSION_OPTIONS } from './local-embedder-worker';
 /** The ONNX Runtime binding transformers.js uses under Node. */
 export const EMBED_ORT_PACKAGE = 'onnxruntime-node';
 
-/** One entry of `onnxruntime-node`'s `listSupportedBackends()`. */
+/**
+ * One entry of `onnxruntime-node`'s `listSupportedBackends()`.
+ *
+ * ⚠ `bundled` means "ships in the default npm tarball", NOT "usable here" — see
+ * the module header. Never branch on it to decide whether a device is reachable.
+ */
 export type EmbedBackend = { name: string; bundled: boolean };
 
 /** The (device, dtype) pair the embedders actually run on, and the basis for it. */
@@ -77,7 +102,7 @@ export type EmbedExecutionTarget = {
   why: string;
 };
 
-/** Whether the bundled-backend probe has run, and how it went. */
+/** Whether the runtime probe has run, and how it went. */
 export type EmbedExecutionProbe = 'pending' | 'ok' | 'failed';
 
 export type EmbedExecutionHealth = {
@@ -89,25 +114,26 @@ export type EmbedExecutionHealth = {
   /** What it therefore runs on. */
   active: EmbedExecutionTarget;
   /**
-   * Whether ANY GPU-capable execution provider is COMPILED INTO this build.
-   * `null` means the probe has not resolved — UNKNOWN, not "no".
-   *
-   * ⚠ Bundled is not usable. `listSupportedBackends()` reports what the binding
-   * ships, never whether a session would actually construct on this host: on
-   * this box it answers `webgpu: bundled:true` while `cuda: bundled:false`, and
-   * whether Dawn would find the NVIDIA device is a separate question this probe
-   * does not ask. Treat `true` as "worth investigating", never as "a GPU is
-   * available" — the only way to prove a GPU session is to construct one.
+   * Execution-provider shared libraries actually present next to the binding
+   * (bare filenames). THIS is the availability signal — it is what differed
+   * between a default install and a `ONNXRUNTIME_NODE_INSTALL_CUDA=v12` one.
+   * `null` = not measured.
    */
-  gpuBundled: boolean | null;
+  providerLibraries: string[] | null;
   /**
-   * WHICH backends made `gpuBundled` true. Present because the rolled-up
-   * boolean cannot distinguish a bundled CUDA provider from a bundled WebGPU
-   * one, and those imply very different next steps.
+   * A GPU-capable provider library is present on disk. `null` = not measured.
+   *
+   * Still not a promise that a session would construct — the library can be
+   * present and fail to load (missing CUDA/cuDNN runtime, ABI mismatch). That
+   * failure is what `@papercusp/rerank`'s `demotionCause` reports.
    */
-  gpuBackendsBundled: string[] | null;
-  /** The raw `listSupportedBackends()` answer; `null` until the probe resolves. */
-  backends: EmbedBackend[] | null;
+  gpuProviderAvailable: boolean | null;
+  /**
+   * What `listSupportedBackends()` says ships by DEFAULT. Diagnostic only —
+   * deliberately NOT named `bundled`/`available` so it cannot be misread as
+   * capability. See the module header for the measurement that proves the gap.
+   */
+  defaultBundledBackends: EmbedBackend[] | null;
   probe: EmbedExecutionProbe;
   probeError: string | null;
   /**
@@ -118,7 +144,7 @@ export type EmbedExecutionHealth = {
 };
 
 /**
- * The device/dtype the embed path requests. See the header: this is PINNED by
+ * The device/dtype the embed path requests. PINNED by
  * `execution-target.test.ts` against the embedder sources, so it cannot drift
  * into a lie the way a hand-maintained `exists:` boolean does.
  */
@@ -127,12 +153,13 @@ export const EMBED_REQUESTED_EXECUTION: { device: string | null; dtype: string |
   dtype: null,
 };
 
-/** Backends that would put a forward pass anywhere other than the CPU. */
-const GPU_BACKENDS = new Set(['cuda', 'tensorrt', 'webgpu', 'dml', 'coreml', 'rocm']);
+/** Provider-library basenames that indicate a non-CPU execution path. */
+const GPU_PROVIDER_LIB_PATTERN = /^libonnxruntime_providers_(cuda|tensorrt|rocm|migraphx|dml)\./i;
 
 type ExecutionTargetState = {
   probe: EmbedExecutionProbe;
-  backends: EmbedBackend[] | null;
+  defaultBundledBackends: EmbedBackend[] | null;
+  providerLibraries: string[] | null;
   probeError: string | null;
   inFlight: Promise<void> | null;
 };
@@ -141,7 +168,8 @@ const STATE_KEY = '@papercusp/memory.embed-execution-target';
 
 const state = pinModuleState<ExecutionTargetState>(STATE_KEY, () => ({
   probe: 'pending',
-  backends: null,
+  defaultBundledBackends: null,
+  providerLibraries: null,
   probeError: null,
   inFlight: null,
 }));
@@ -154,9 +182,7 @@ type OrtModule = {
 /**
  * Normalize `listSupportedBackends()` output without trusting its shape. A
  * binding that answers something unexpected must degrade to `probe:'failed'`
- * with the reason attached — never to a plausible-looking empty list, which
- * would render as "no GPU backend bundled" and be indistinguishable from a real
- * measurement.
+ * with the reason attached — never to a plausible-looking empty list.
  */
 function normalizeBackends(raw: unknown): EmbedBackend[] {
   if (!Array.isArray(raw)) throw new Error(`listSupportedBackends() returned ${typeof raw}, expected an array`);
@@ -170,12 +196,32 @@ function normalizeBackends(raw: unknown): EmbedBackend[] {
 }
 
 /**
- * Resolve the bundled-backend list once per process and cache it. Idempotent,
- * concurrency-safe, and never throws: a failure is recorded as `probe:'failed'`
- * with `probeError` so `/healthz` can say the measurement did not happen.
- *
- * Call it at sidecar startup so the first `/healthz` after warm-up is already
- * answering from a real measurement.
+ * List the execution-provider shared libraries sitting next to the resolved
+ * binding. Returns null when the location cannot be resolved — a failure to
+ * MEASURE, never an assertion that none exist.
+ */
+function scanProviderLibraries(): string[] | null {
+  try {
+    const req = createRequire(import.meta.url);
+    // onnxruntime-node's entry resolves inside dist/; the binaries live at
+    // <pkg>/bin/napi-v6/<platform>/<arch>/. Walk up from the entry to the
+    // package root rather than hardcoding the dist layout.
+    const entry = req.resolve(EMBED_ORT_PACKAGE);
+    const pkgRoot = dirname(dirname(entry));
+    const binRoot = join(pkgRoot, 'bin', 'napi-v6', process.platform, process.arch);
+    return readdirSync(binRoot)
+      .filter((f) => f.startsWith('libonnxruntime_providers_'))
+      .sort();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the runtime execution-provider facts once per process and cache them.
+ * Idempotent, concurrency-safe, and never throws: a failure is recorded as
+ * `probe:'failed'` with `probeError` so `/healthz` can say the measurement did
+ * not happen.
  */
 export function ensureEmbedBackendsProbed(): Promise<void> {
   if (state.probe !== 'pending') return Promise.resolve();
@@ -183,15 +229,18 @@ export function ensureEmbedBackendsProbed(): Promise<void> {
   const run = (async () => {
     try {
       const mod = await dynamicImport<OrtModule>(EMBED_ORT_PACKAGE);
-      const list = mod?.listSupportedBackends ?? mod?.default?.listSupportedBackends;
+      const holder = mod?.listSupportedBackends ? mod : mod?.default;
+      const list = holder?.listSupportedBackends;
       if (typeof list !== 'function') {
         throw new Error(`${EMBED_ORT_PACKAGE} exposes no listSupportedBackends()`);
       }
-      state.backends = normalizeBackends(list.call(mod?.listSupportedBackends ? mod : mod.default));
+      state.defaultBundledBackends = normalizeBackends(list.call(holder));
+      state.providerLibraries = scanProviderLibraries();
       state.probeError = null;
       state.probe = 'ok';
     } catch (e) {
-      state.backends = null;
+      state.defaultBundledBackends = null;
+      state.providerLibraries = null;
       state.probeError = e instanceof Error ? e.message : String(e);
       state.probe = 'failed';
     }
@@ -202,19 +251,19 @@ export function ensureEmbedBackendsProbed(): Promise<void> {
   return run;
 }
 
-/**
- * The GPU-capable backends compiled into this build; `null` while the probe is
- * pending or failed. Empty array = measured, and none.
- */
-export function embedGpuBackendsBundled(): string[] | null {
-  if (state.probe !== 'ok' || !state.backends) return null;
-  return state.backends.filter((b) => b.bundled && GPU_BACKENDS.has(b.name.toLowerCase())).map((b) => b.name);
+/** Provider libraries present on disk; `null` while unmeasured. */
+export function embedProviderLibraries(): string[] | null {
+  return state.probe === 'ok' && state.providerLibraries ? [...state.providerLibraries] : null;
 }
 
-/** `true`/`false` once measured; `null` while the probe is pending or failed. */
-export function embedGpuBundled(): boolean | null {
-  const gpu = embedGpuBackendsBundled();
-  return gpu === null ? null : gpu.length > 0;
+/**
+ * Whether a GPU-capable provider library is present on disk. `null` = not
+ * measured. Presence is necessary but NOT sufficient for a working GPU session.
+ */
+export function embedGpuProviderAvailable(): boolean | null {
+  const libs = embedProviderLibraries();
+  if (libs === null) return null;
+  return libs.some((f) => GPU_PROVIDER_LIB_PATTERN.test(f));
 }
 
 /**
@@ -225,33 +274,35 @@ export function embedGpuBundled(): boolean | null {
  * how well-evidenced that answer is. Read it before quoting the pair.
  */
 export function embedExecutionTarget(): EmbedExecutionTarget {
-  const gpu = embedGpuBackendsBundled();
+  const gpu = embedGpuProviderAvailable();
   const base = 'the embed path requests no device, so transformers.js applies its CPU default';
   const dtype = EMBED_REQUESTED_EXECUTION.dtype;
   if (gpu === null) {
     return {
       device: 'cpu',
       dtype,
-      why: `${base}; the bundled-backend probe has not resolved, so whether any GPU provider is compiled in is UNKNOWN`,
+      why: `${base}; the provider-library probe has not resolved, so whether a GPU provider is installed is UNKNOWN`,
     };
   }
-  if (gpu.length === 0) {
+  if (!gpu) {
     return {
       device: 'cpu',
       dtype,
-      why: `${base}; this onnxruntime build also compiles in no GPU execution provider, so no other device is reachable from here`,
+      why:
+        `${base}; no GPU execution-provider library is installed beside the onnxruntime binding, so no other ` +
+        'device is reachable without reinstalling onnxruntime-node with a provider (e.g. ONNXRUNTIME_NODE_INSTALL_CUDA)',
     };
   }
   return {
     device: 'cpu',
     dtype,
-    // Deliberately hedged. A bundled backend is a compile-time fact, not a
-    // working GPU session — claiming the latter from the former would be the
-    // same unverified leap this detector exists to stop people making.
+    // Deliberately hedged: a provider library on disk can still fail to LOAD
+    // (missing CUDA/cuDNN runtime, ABI mismatch). Only constructing a session
+    // proves usability — see rerank's demoted/demotionCause pair.
     why:
-      `${base}. GPU-capable backend(s) ARE compiled in (${gpu.join(', ')}), so the CPU target is by omission, ` +
-      'not a proven hardware limit — but bundled is not usable, and whether one of those would actually ' +
-      'construct a session on this host is unverified',
+      `${base}. A GPU execution-provider library IS installed (${embedProviderLibraries()?.join(', ')}), so the CPU ` +
+      'target is by omission rather than a hardware limit — but an installed provider can still fail to load, and ' +
+      'only constructing a session proves otherwise',
   };
 }
 
@@ -265,9 +316,11 @@ export function embedExecutionHealth(): EmbedExecutionHealth {
   return {
     requested: { ...EMBED_REQUESTED_EXECUTION },
     active: embedExecutionTarget(),
-    gpuBundled: embedGpuBundled(),
-    gpuBackendsBundled: embedGpuBackendsBundled(),
-    backends: state.backends ? state.backends.map((b) => ({ ...b })) : null,
+    providerLibraries: embedProviderLibraries(),
+    gpuProviderAvailable: embedGpuProviderAvailable(),
+    defaultBundledBackends: state.defaultBundledBackends
+      ? state.defaultBundledBackends.map((b) => ({ ...b }))
+      : null,
     probe: state.probe,
     probeError: state.probeError,
     sessionOptions: {
@@ -280,7 +333,8 @@ export function embedExecutionHealth(): EmbedExecutionHealth {
 /** Test-only: drop the cached probe so a test can drive it from a clean state. */
 export function _resetEmbedExecutionProbe(): void {
   state.probe = 'pending';
-  state.backends = null;
+  state.defaultBundledBackends = null;
+  state.providerLibraries = null;
   state.probeError = null;
   state.inFlight = null;
 }

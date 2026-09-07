@@ -38,7 +38,8 @@ import {
   _resetEmbedExecutionProbe,
   embedExecutionHealth,
   embedExecutionTarget,
-  embedGpuBundled,
+  embedGpuProviderAvailable,
+  embedProviderLibraries,
   ensureEmbedBackendsProbed,
 } from './execution-target';
 
@@ -151,15 +152,17 @@ describe('embed execution target — the detector the 14 latency filings lacked'
   });
 
   describe('an unmeasured probe is UNKNOWN, never a confident answer', () => {
-    it('reports gpuBundled null and probe "pending" before the probe runs', () => {
+    it('reports availability null and probe "pending" before the probe runs', () => {
       const health = embedExecutionHealth();
       expect(health.probe).toBe('pending');
       // The load-bearing assertion: null, NOT false. A false here would read as
       // "measured: no GPU provider" and is the failure mode this module exists
       // to end.
-      expect(health.gpuBundled).toBeNull();
-      expect(health.backends).toBeNull();
-      expect(embedGpuBundled()).toBeNull();
+      expect(health.gpuProviderAvailable).toBeNull();
+      expect(health.providerLibraries).toBeNull();
+      expect(health.defaultBundledBackends).toBeNull();
+      expect(embedGpuProviderAvailable()).toBeNull();
+      expect(embedProviderLibraries()).toBeNull();
     });
 
     it('says so in `why` rather than implying the question was settled', () => {
