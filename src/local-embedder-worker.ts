@@ -18,6 +18,7 @@
  * be loaded — keeps behavior backward-compatible.
  */
 
+import { pinModuleState } from '@papercusp/module-singleton';
 import { Worker } from 'node:worker_threads';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -31,39 +32,50 @@ interface PendingRequest {
   reject: (err: Error) => void;
 }
 
-let _worker: Worker | null = null;
-let _workerReady: Promise<void> | null = null;
-let _nextId = 0;
-const _pending = new Map<number, PendingRequest>();
-/**
- * Set ONLY for genuine, permanent unavailability — the worker could not be
- * CONSTRUCTED at all (no `worker_threads`, missing script, spawn threw). A
- * runtime crash deliberately does NOT set this: it clears the worker handle so
- * the next call respawns one.
- *
- * That asymmetry is the point (EI-16184's lesson, re-learned here as
- * EI-20012631851693581): treating a transient crash as permanent condemns every
- * later call in the process to the inline, main-thread-blocking path — i.e. one
- * hiccup silently undoes this whole module for the rest of the process's life.
- * EI-16184 removed that stickiness from the per-CLOSURE booleans; an equivalent
- * one had survived at module scope, here.
- *
- * ⚠ If you add a new assignment site, it must be a CONSTRUCTION failure. There
- * is a guard test for exactly this (`a transient runtime crash does not latch`).
- */
-let _workerDisabled = false;
-/** Guards the process-level `beforeExit` hook below so it is registered at
- *  most once for the life of the process, no matter how many times
- *  `ensureWorker()` (re)spawns a worker. */
-let _beforeExitHookInstalled = false;
-/** The actual listener function, kept so a test can remove exactly it. */
-let _beforeExitListener: (() => Promise<void>) | null = null;
+interface WorkerState {
+  worker: Worker | null;
+  workerReady: Promise<void> | null;
+  nextId: number;
+  pending: Map<number, PendingRequest>;
+  /**
+   * Set ONLY for genuine, permanent unavailability — the worker could not be
+   * CONSTRUCTED at all (no `worker_threads`, missing script, spawn threw). A
+   * runtime crash deliberately does NOT set this: it clears the worker handle so
+   * the next call respawns one.
+   *
+   * That asymmetry is the point (EI-16184's lesson, re-learned here as
+   * EI-20012631851693581): treating a transient crash as permanent condemns every
+   * later call in the process to the inline, main-thread-blocking path — i.e. one
+   * hiccup silently undoes this whole module for the rest of the process's life.
+   * EI-16184 removed that stickiness from the per-CLOSURE booleans; an equivalent
+   * one had survived at module scope, here.
+   *
+   * ⚠ If you add a new assignment site, it must be a CONSTRUCTION failure. There
+   * is a guard test for exactly this (`a transient runtime crash does not latch`).
+   */
+  workerDisabled: boolean;
+  /** Guards the process-level `beforeExit` hook below so it is registered at
+   *  most once for the life of the process, no matter how many times
+   *  `ensureWorker()` (re)spawns a worker. */
+  beforeExitHookInstalled: boolean;
+  /** The actual listener function, kept so a test can remove exactly it. */
+  beforeExitListener: (() => Promise<void>) | null;
 
-/**
- * Whether the worker is currently holding the event loop open. Mirrors the last
- * `ref()`/`unref()` we issued, because `Worker` exposes no way to read it back.
- */
-let _refd = false;
+  /**
+   * Whether the worker is currently holding the event loop open. Mirrors the last
+   * `ref()`/`unref()` we issued, because `Worker` exposes no way to read it back.
+   */
+  refd: boolean;
+  lastFallbackWarnAt: number;
+}
+
+// tsx can evaluate this module through both CJS and ESM in one process.
+// Shutdown and health reads must see the worker started through either loader.
+const state = pinModuleState<WorkerState>('@papercusp/memory.local-embedder-worker', () => ({
+  worker: null, workerReady: null, nextId: 0, pending: new Map(),
+  workerDisabled: false, beforeExitHookInstalled: false, beforeExitListener: null,
+  refd: false, lastFallbackWarnAt: 0,
+}));
 
 /**
  * Hold the loop open for EXACTLY as long as a request is in flight, and not one
@@ -77,7 +89,7 @@ let _refd = false;
  * awaits its vector, neither the unref'd worker nor the awaited Promise counts
  * as loop work, so a host with nothing else ref'd is considered IDLE
  * **mid-request**. `beforeExit` then fires, the hook terminates the worker, and
- * because `_resetWorker` used to CLEAR `_pending` rather than reject it, the
+ * because `_resetWorker` used to CLEAR `state.pending` rather than reject it, the
  * caller's promise never settled at all — the process just exited 0 having
  * produced neither a vector nor an error.
  *
@@ -94,16 +106,16 @@ let _refd = false;
  * `pendingCount: 1`; the byte-identical script with a `setInterval` holding the
  * loop ref'd returned a 384-dim vector in 683ms.
  *
- * Ref'ing only while `_pending` is non-empty satisfies both: a script that
+ * Ref'ing only while `state.pending` is non-empty satisfies both: a script that
  * awaits an embedding stays alive until its vector arrives, then exits on its
  * own.
  */
 function syncWorkerRef(): void {
-  const want = _pending.size > 0;
-  if (!_worker || want === _refd) return;
-  if (want) _worker.ref();
-  else _worker.unref();
-  _refd = want;
+  const want = state.pending.size > 0;
+  if (!state.worker || want === state.refd) return;
+  if (want) state.worker.ref();
+  else state.worker.unref();
+  state.refd = want;
 }
 
 const WORKER_SCRIPT_NAME = 'local-embedder-worker.script.mjs';
@@ -237,23 +249,23 @@ function workerPath(): string {
 }
 
 function ensureWorker(): Promise<void> {
-  if (_workerDisabled) return Promise.reject(new Error('worker disabled'));
-  if (_workerReady) return _workerReady;
+  if (state.workerDisabled) return Promise.reject(new Error('worker disabled'));
+  if (state.workerReady) return state.workerReady;
 
-  _workerReady = new Promise<void>((resolveReady, rejectReady) => {
+  state.workerReady = new Promise<void>((resolveReady, rejectReady) => {
     try {
-      _worker = new Worker(workerPath(), {
+      state.worker = new Worker(workerPath(), {
         // execArgv passthrough is fine — the script is plain JS,
         // no ts-node loader needed.
       });
     } catch (err) {
-      _workerDisabled = true;
+      state.workerDisabled = true;
       rejectReady(err as Error);
       return;
     }
 
     let initialized = false;
-    _worker.on('message', (msg: { kind: string; id?: number; vector?: number[]; error?: string }) => {
+    state.worker.on('message', (msg: { kind: string; id?: number; vector?: number[]; error?: string }) => {
       if (msg.kind === 'ready') {
         initialized = true;
         // EI-19464316359123796: a persistent, REF'd worker thread keeps the
@@ -278,9 +290,9 @@ function ensureWorker(): Promise<void> {
         return;
       }
       if (typeof msg.id !== 'number') return;
-      const p = _pending.get(msg.id);
+      const p = state.pending.get(msg.id);
       if (!p) return;
-      _pending.delete(msg.id);
+      state.pending.delete(msg.id);
       // Release the loop as soon as the LAST request lands, so a one-off script
       // still exits on its own (WI-37683 — the other half of syncWorkerRef).
       syncWorkerRef();
@@ -290,11 +302,11 @@ function ensureWorker(): Promise<void> {
         p.reject(new Error(msg.error ?? 'worker error'));
       }
     });
-    _worker.on('error', (err) => {
+    state.worker.on('error', (err) => {
       // Reject every pending request — the worker crashed.
-      for (const [, p] of _pending) p.reject(err);
-      _pending.clear();
-      // EI-20012631851693581: deliberately NOT `_workerDisabled`. A runtime
+      for (const [, p] of state.pending) p.reject(err);
+      state.pending.clear();
+      // EI-20012631851693581: deliberately NOT `state.workerDisabled`. A runtime
       // crash is TRANSIENT; clearing the handle is what makes the next call
       // respawn. Latching here condemned every later embed in the process to
       // the inline, main-thread-blocking path (~6s vs ~36ms per embed,
@@ -306,12 +318,12 @@ function ensureWorker(): Promise<void> {
       // Measured before the fix: injecting one 'error' event left
       // getWorkerState() at `disabled: true` and the next embed rejected
       // `worker disabled` permanently.
-      _worker = null;
-      _workerReady = null;
-      _refd = false;
+      state.worker = null;
+      state.workerReady = null;
+      state.refd = false;
       if (!initialized) rejectReady(err);
     });
-    _worker.on('exit', (code) => {
+    state.worker.on('exit', (code) => {
       if (code !== 0 && !initialized) {
         rejectReady(new Error(`worker exited with code ${code} before ready`));
       }
@@ -319,18 +331,18 @@ function ensureWorker(): Promise<void> {
       // them. Dropping them silently is what turned the old unref bug into a
       // process that exited 0 with neither a vector nor an error — the caller's
       // promise simply never settled, so there was nothing to notice.
-      if (_pending.size > 0) {
-        const err = new Error(`embedder worker exited with code ${code} while ${_pending.size} request(s) were in flight`);
-        for (const [, p] of _pending) p.reject(err);
-        _pending.clear();
+      if (state.pending.size > 0) {
+        const err = new Error(`embedder worker exited with code ${code} while ${state.pending.size} request(s) were in flight`);
+        for (const [, p] of state.pending) p.reject(err);
+        state.pending.clear();
       }
-      _worker = null;
-      _workerReady = null;
-      _refd = false;
+      state.worker = null;
+      state.workerReady = null;
+      state.refd = false;
     });
   });
 
-  return _workerReady;
+  return state.workerReady;
 }
 
 /** Per-embed options for the worker. Omitted fields keep the BGE-small
@@ -374,16 +386,16 @@ export interface EmbedViaWorkerOpts {
  */
 export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}): Promise<number[]> {
   await ensureWorker();
-  if (!_worker) throw new Error('worker not initialized');
+  if (!state.worker) throw new Error('worker not initialized');
 
-  const id = _nextId++;
+  const id = state.nextId++;
   return new Promise<number[]>((resolveEmbed, rejectEmbed) => {
-    _pending.set(id, { resolve: resolveEmbed, reject: rejectEmbed });
+    state.pending.set(id, { resolve: resolveEmbed, reject: rejectEmbed });
     // Ref BEFORE posting: between the post and the reply the caller is awaiting
     // a Promise, which is not loop work — an unref'd worker would leave the loop
     // looking idle and let `beforeExit` terminate this very request (WI-37683).
     syncWorkerRef();
-    _worker!.postMessage({
+    state.worker!.postMessage({
       kind: 'embed',
       id,
       text,
@@ -400,23 +412,23 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
  *  directly); {@link shutdownLocalEmbedder} is the same function under a
  *  discoverable public name — see its doc for why both exist. */
 export async function _resetWorker(): Promise<void> {
-  if (_worker) {
-    try { await _worker.terminate(); } catch { /* noop */ }
+  if (state.worker) {
+    try { await state.worker.terminate(); } catch { /* noop */ }
   }
-  _worker = null;
-  _workerReady = null;
-  _workerDisabled = false;
+  state.worker = null;
+  state.workerReady = null;
+  state.workerDisabled = false;
   // WI-37683: reject, never silently drop. `terminate()` normally fires the
   // `exit` handler above (which rejects), but that is not guaranteed to have
-  // run by the time we get here, and a `_pending.clear()` on its own is exactly
+  // run by the time we get here, and a `state.pending.clear()` on its own is exactly
   // how a stranded caller ends up awaiting a promise that settles never.
-  if (_pending.size > 0) {
-    const err = new Error(`embedder worker was shut down while ${_pending.size} request(s) were in flight`);
-    for (const [, p] of _pending) p.reject(err);
+  if (state.pending.size > 0) {
+    const err = new Error(`embedder worker was shut down while ${state.pending.size} request(s) were in flight`);
+    for (const [, p] of state.pending) p.reject(err);
   }
-  _pending.clear();
-  _refd = false;
-  _nextId = 0;
+  state.pending.clear();
+  state.refd = false;
+  state.nextId = 0;
 }
 
 /**
@@ -461,8 +473,8 @@ export const shutdownLocalEmbedder = _resetWorker;
  * the exported function covers "the script forces itself to end".
  */
 function installBeforeExitHook(): void {
-  if (_beforeExitHookInstalled) return;
-  _beforeExitHookInstalled = true;
+  if (state.beforeExitHookInstalled) return;
+  state.beforeExitHookInstalled = true;
   // `beforeExit` listeners cannot be declared `async`, but returning the
   // promise (rather than `void`-ing it) is still correct and matters for two
   // reasons: (1) it is what lets `Worker#terminate()`'s own pending work keep
@@ -481,11 +493,11 @@ function installBeforeExitHook(): void {
   // by design. It stays because the failure it prevents (terminating a worker
   // mid-request) was SILENT for the whole life of this module, and because a
   // future ref bug would otherwise re-open it (WI-37683).
-  _beforeExitListener = async () => {
-    if (_pending.size > 0) return;
+  state.beforeExitListener = async () => {
+    if (state.pending.size > 0) return;
     await _resetWorker();
   };
-  process.on('beforeExit', _beforeExitListener);
+  process.on('beforeExit', state.beforeExitListener);
 }
 
 /** Test-only: remove the installed `beforeExit` hook (if any) and clear the
@@ -493,9 +505,9 @@ function installBeforeExitHook(): void {
  *  baseline instead of inheriting whatever an earlier test in the same file
  *  already installed. Mirrors `_resetFallbackWarnForTest` above. */
 export function _resetBeforeExitHookForTest(): void {
-  if (_beforeExitListener) process.off('beforeExit', _beforeExitListener);
-  _beforeExitListener = null;
-  _beforeExitHookInstalled = false;
+  if (state.beforeExitListener) process.off('beforeExit', state.beforeExitListener);
+  state.beforeExitListener = null;
+  state.beforeExitHookInstalled = false;
 }
 
 /** Telemetry for /settings/user/memory diagnostics. */
@@ -513,10 +525,10 @@ export function getWorkerState(): {
   keepAlive: boolean;
 } {
   return {
-    alive: _worker !== null,
-    disabled: _workerDisabled,
-    pendingCount: _pending.size,
-    keepAlive: _refd,
+    alive: state.worker !== null,
+    disabled: state.workerDisabled,
+    pendingCount: state.pending.size,
+    keepAlive: state.refd,
   };
 }
 
@@ -536,12 +548,11 @@ export function getWorkerState(): {
  * inline), so a SUSTAINED failure could otherwise warn on every single call;
  * rate-limit it to one line per cooldown window instead.
  */
-let _lastFallbackWarnAt = 0;
 const FALLBACK_WARN_COOLDOWN_MS = 30_000;
 export function warnEmbedFallback(model: string, err: unknown): void {
   const now = Date.now();
-  if (now - _lastFallbackWarnAt < FALLBACK_WARN_COOLDOWN_MS) return;
-  _lastFallbackWarnAt = now;
+  if (now - state.lastFallbackWarnAt < FALLBACK_WARN_COOLDOWN_MS) return;
+  state.lastFallbackWarnAt = now;
   if (process.env.NODE_ENV !== 'test') {
     console.warn(
       `[embed] ${model} worker path failed — falling back to inline (main-thread, blocks the event loop) for this call: ` +
@@ -552,7 +563,7 @@ export function warnEmbedFallback(model: string, err: unknown): void {
 
 /** Test-only: reset the fallback-warn cooldown so tests can assert on it independently. */
 export function _resetFallbackWarnForTest(): void {
-  _lastFallbackWarnAt = 0;
+  state.lastFallbackWarnAt = 0;
 }
 
 export const LOCAL_EMBEDDER_MODEL = 'Xenova/bge-small-en-v1.5';

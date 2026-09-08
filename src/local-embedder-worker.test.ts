@@ -33,6 +33,33 @@ afterEach(async () => {
 });
 
 describe('local-embedder-worker (protocol contract)', () => {
+  it('shares worker ownership and shutdown across distinct module records', async () => {
+    const { Worker } = await import('node:worker_threads');
+    const first = await import('./local-embedder-worker');
+    let second: typeof first | undefined;
+    // Exercise a real worker without loading a model. Its request stays pending
+    // until the other module record shuts down the same worker.
+    const post = vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(() => {});
+    const pending = first.embedViaWorker('cross-loader shutdown').catch((error: unknown) => error);
+    try {
+      await vi.waitFor(() => expect(first.getWorkerState().pendingCount).toBe(1));
+      vi.resetModules();
+      second = await import('./local-embedder-worker');
+      expect(second.embedViaWorker).not.toBe(first.embedViaWorker);
+      expect(second.getWorkerState()).toEqual(first.getWorkerState());
+      await second.shutdownLocalEmbedder();
+      expect(await pending).toBeInstanceOf(Error);
+      expect(first.getWorkerState()).toMatchObject({ alive: false, pendingCount: 0 });
+    } finally {
+      post.mockRestore();
+      await first.shutdownLocalEmbedder();
+      await second?.shutdownLocalEmbedder();
+      await pending;
+      first._resetBeforeExitHookForTest();
+      second?._resetBeforeExitHookForTest();
+    }
+  });
+
   it('exports the expected API surface', async () => {
     const mod = await import('./local-embedder-worker');
     expect(typeof mod.embedViaWorker).toBe('function');
