@@ -570,6 +570,7 @@ export const LOCAL_EMBEDDER_MODEL = 'Xenova/bge-small-en-v1.5';
 const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
 
 type TransformersModule = {
+  env?: { allowRemoteModels: boolean; allowLocalModels: boolean };
   pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<Pipeline>;
 };
 type Pipeline = (text: string, opts: unknown) => Promise<{ data: Float32Array }>;
@@ -638,6 +639,31 @@ export const ORT_SESSION_OPTIONS: {
 };
 
 /**
+ * P-314 customer-runtime boundary. A verified vm-release carries the complete,
+ * digest-pinned model pack and must never turn a missing file into an implicit
+ * vendor request on an embedding call. Dogfood/development remain unchanged.
+ */
+export function applyTransformersRuntimePolicy<T>(
+  transformers: T & { env?: { allowRemoteModels: boolean; allowLocalModels: boolean } },
+  env: NodeJS.ProcessEnv = process.env,
+): T {
+  if (
+    env.PAPERCUSP_DISTRIBUTION_PROFILE !== 'vm-release' &&
+    env.PAPERCUSP_TRANSFORMERS_LOCAL_ONLY !== '1'
+  ) {
+    return transformers;
+  }
+  if (!transformers.env) {
+    throw new Error(
+      '[vm-release] Transformers.js exposes no env policy; refusing a runtime that cannot disable remote model fetch',
+    );
+  }
+  transformers.env.allowLocalModels = true;
+  transformers.env.allowRemoteModels = false;
+  return transformers;
+}
+
+/**
  * Build a local (free, offline) BGE-small embedder.
  *
  * Prefers the worker-thread isolated path (`embedViaWorker`) so ONNX
@@ -665,7 +691,9 @@ export async function buildLocalEmbedder(): Promise<(text: string) => Promise<nu
 
     // Inline (main-thread) fallback path.
     if (!pipelinePromise) {
-      const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
+      const transformers = applyTransformersRuntimePolicy(
+        await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE),
+      );
       pipelinePromise = transformers.pipeline('feature-extraction', LOCAL_EMBEDDER_MODEL, {
         session_options: ORT_SESSION_OPTIONS,
       });

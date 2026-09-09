@@ -109,6 +109,7 @@ describe('buildHarrierEmbedder — non-sticky worker fallback (EI-16184)', () =>
     const getWorkerState = vi.fn(() => ({ alive: true, disabled: false, pendingCount: 0 }));
     const warnEmbedFallback = vi.fn();
     vi.doMock('./local-embedder-worker', () => ({
+      applyTransformersRuntimePolicy: (value: unknown) => value,
       embedViaWorker,
       getWorkerState,
       warnEmbedFallback,
@@ -132,6 +133,7 @@ describe('buildHarrierEmbedder — non-sticky worker fallback (EI-16184)', () =>
     const getWorkerState = vi.fn(() => ({ alive: false, disabled: true, pendingCount: 0 }));
     const warnEmbedFallback = vi.fn();
     vi.doMock('./local-embedder-worker', () => ({
+      applyTransformersRuntimePolicy: (value: unknown) => value,
       embedViaWorker,
       getWorkerState,
       warnEmbedFallback,

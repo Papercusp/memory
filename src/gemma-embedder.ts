@@ -64,7 +64,13 @@
  * (migration 534), selected by `ResolvedEmbedder.mode === 'gemma'`.
  */
 
-import { embedViaWorker, getWorkerState, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
+import {
+  applyTransformersRuntimePolicy,
+  embedViaWorker,
+  getWorkerState,
+  ORT_SESSION_OPTIONS,
+  warnEmbedFallback,
+} from './local-embedder-worker';
 import { EMBEDDER_DIM_SPECS } from './embedder-dims';
 import { dynamicImport } from './dynamic-import';
 
@@ -117,6 +123,7 @@ export function mrlTruncate(vec: number[], dims: number = GEMMA_TARGET_DIMS): nu
 }
 
 type TransformersModule = {
+  env?: { allowRemoteModels: boolean; allowLocalModels: boolean };
   pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<Pipeline>;
 };
 type Pipeline = (text: string, opts: unknown) => Promise<{ data: Float32Array }>;
@@ -167,7 +174,9 @@ export function buildGemmaEmbedder(opts: {
 
     // Inline (main-thread) fallback.
     if (!pipelinePromise) {
-      const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
+      const transformers = applyTransformersRuntimePolicy(
+        await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE),
+      );
       // Same thread-cap rationale as the worker path (WI-3792 spin-pool storm).
       pipelinePromise = transformers.pipeline('feature-extraction', GEMMA_MODEL, {
         session_options: ORT_SESSION_OPTIONS,

@@ -33,7 +33,13 @@
  * (the embedding-space-vs-dimension scar) — adoption means a full re-embed.
  */
 
-import { embedViaWorker, getWorkerState, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
+import {
+  applyTransformersRuntimePolicy,
+  embedViaWorker,
+  getWorkerState,
+  ORT_SESSION_OPTIONS,
+  warnEmbedFallback,
+} from './local-embedder-worker';
 import { mrlTruncate } from './gemma-embedder';
 import { EMBEDDER_DIM_SPECS } from './embedder-dims';
 import { dynamicImport } from './dynamic-import';
@@ -83,6 +89,7 @@ type RawPipeline = {
   model: (inputs: Record<string, unknown>) => Promise<Record<string, Tensor>>;
 };
 type TransformersModule = {
+  env?: { allowRemoteModels: boolean; allowLocalModels: boolean };
   pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<RawPipeline>;
 };
 
@@ -130,7 +137,9 @@ export function buildHarrierEmbedder(opts: {
 
     // Inline (main-thread) fallback — same direct model call as the worker.
     if (!pipelinePromise) {
-      const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
+      const transformers = applyTransformersRuntimePolicy(
+        await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE),
+      );
       pipelinePromise = transformers.pipeline('feature-extraction', HARRIER_MODEL, {
         session_options: ORT_SESSION_OPTIONS,
       });

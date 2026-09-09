@@ -94,9 +94,16 @@ async function getPipeline(model) {
   if (!p) {
     // Dynamic import keeps the worker spawn cheap when @huggingface/transformers
     // isn't installed — the package only loads on first embed.
-    p = import('@huggingface/transformers').then((t) =>
-      t.pipeline('feature-extraction', key, { session_options: ORT_SESSION_OPTIONS }),
-    );
+    p = import('@huggingface/transformers').then((t) => {
+      if (
+        process.env.PAPERCUSP_DISTRIBUTION_PROFILE === 'vm-release' ||
+        process.env.PAPERCUSP_TRANSFORMERS_LOCAL_ONLY === '1'
+      ) {
+        t.env.allowLocalModels = true;
+        t.env.allowRemoteModels = false;
+      }
+      return t.pipeline('feature-extraction', key, { session_options: ORT_SESSION_OPTIONS });
+    });
     pipelinesByModel.set(key, p);
   }
   return p;

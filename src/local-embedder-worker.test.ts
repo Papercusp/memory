@@ -33,6 +33,29 @@ afterEach(async () => {
 });
 
 describe('local-embedder-worker (protocol contract)', () => {
+  it('enforces local-only Transformers.js loading only for vm-release', async () => {
+    const { applyTransformersRuntimePolicy } = await import('./local-embedder-worker');
+    const dogfood = {
+      env: { allowLocalModels: false, allowRemoteModels: true },
+      pipeline: async () => async () => ({ data: new Float32Array() }),
+    };
+    applyTransformersRuntimePolicy(dogfood, { PAPERCUSP_DISTRIBUTION_PROFILE: 'dogfood' });
+    expect(dogfood.env).toEqual({ allowLocalModels: false, allowRemoteModels: true });
+
+    const customer = {
+      env: { allowLocalModels: false, allowRemoteModels: true },
+      pipeline: async () => async () => ({ data: new Float32Array() }),
+    };
+    applyTransformersRuntimePolicy(customer, { PAPERCUSP_DISTRIBUTION_PROFILE: 'vm-release' });
+    expect(customer.env).toEqual({ allowLocalModels: true, allowRemoteModels: false });
+    expect(() =>
+      applyTransformersRuntimePolicy(
+        { pipeline: customer.pipeline },
+        { PAPERCUSP_TRANSFORMERS_LOCAL_ONLY: '1' },
+      ),
+    ).toThrow(/cannot disable remote model fetch/);
+  });
+
   it('shares worker ownership and shutdown across distinct module records', async () => {
     const { Worker } = await import('node:worker_threads');
     const first = await import('./local-embedder-worker');
