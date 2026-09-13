@@ -24,16 +24,118 @@
  */
 
 import { memoryHost, memorySchema } from './config';
+import {
+  pgvectorMetricSpec,
+  type EmbedderProfileSpec,
+  type EmbeddingDistanceMetric,
+  type EmbeddingProfileId,
+  type PgvectorIndexOperatorClass,
+} from './embedder-dims';
 
 export type ResolvedVecMode = 'openai' | 'local' | 'gemma' | 'harrier';
+
+export interface MemoryVectorStorageProfile {
+  /** Exact embedding spaces this physical binding accepts. Independently
+   * declared: never derive this from EMBEDDER_DIM_SPECS. */
+  readonly acceptedProfileIds: readonly EmbeddingProfileId[];
+  readonly table: 'memory_vec_openai' | 'memory_vec_local' | 'memory_vec_gemma' | 'memory_vec_harrier';
+  readonly dimensions: number;
+  readonly distanceMetric: EmbeddingDistanceMetric;
+  readonly indexOperatorClass: PgvectorIndexOperatorClass;
+  readonly indexName: string;
+}
+
+/** Actual memory-storage declarations. These are literals on purpose: the
+ * emitting profiles are desired state, while these values describe tables and
+ * indexes created by migrations. Tests join both registries and fail on skew. */
+export const MEMORY_VECTOR_STORAGE_PROFILES = Object.freeze({
+    openai: Object.freeze({
+      acceptedProfileIds: ['openai-text-embedding-3-small-768@v1'] as const,
+      table: 'memory_vec_openai',
+      dimensions: 768,
+      distanceMetric: 'cosine',
+      indexOperatorClass: 'vector_cosine_ops',
+      indexName: 'memory_vec_openai_hnsw_idx',
+    }),
+    local: Object.freeze({
+      acceptedProfileIds: ['local-bge-small-en-v1.5@v1'] as const,
+      table: 'memory_vec_local',
+      dimensions: 384,
+      distanceMetric: 'cosine',
+      indexOperatorClass: 'vector_cosine_ops',
+      indexName: 'memory_vec_local_hnsw_idx',
+    }),
+    gemma: Object.freeze({
+      acceptedProfileIds: ['gemma-embeddinggemma-300m-768@v1'] as const,
+      table: 'memory_vec_gemma',
+      dimensions: 768,
+      distanceMetric: 'cosine',
+      indexOperatorClass: 'vector_cosine_ops',
+      indexName: 'memory_vec_gemma_hnsw_idx',
+    }),
+    harrier: Object.freeze({
+      acceptedProfileIds: ['harrier-oss-v1-0.6b-1024@v1'] as const,
+      table: 'memory_vec_harrier',
+      dimensions: 1024,
+      distanceMetric: 'cosine',
+      indexOperatorClass: 'vector_cosine_ops',
+      indexName: 'memory_vec_harrier_hnsw_idx',
+    }),
+  } satisfies Record<ResolvedVecMode, MemoryVectorStorageProfile>);
+
+/** Exact identity compatibility and physical suitability are separate checks.
+ * Returning every mismatch makes a failed migration actionable in one run. */
+export function validateMemoryStorageCompatibility(
+  profile: Pick<EmbedderProfileSpec, 'profileId' | 'targetDims' | 'distanceMetric'>,
+  storage: MemoryVectorStorageProfile,
+): string[] {
+  const problems: string[] = [];
+  if (!storage.acceptedProfileIds.includes(profile.profileId)) {
+    problems.push(
+      `storage ${storage.table} does not accept profile ${profile.profileId}; ` +
+        `accepted=${storage.acceptedProfileIds.join(',') || '(none)'}`,
+    );
+  }
+  if (storage.dimensions !== profile.targetDims) {
+    problems.push(
+      `storage ${storage.table} has ${storage.dimensions} dimensions; profile ${profile.profileId} emits ${profile.targetDims}`,
+    );
+  }
+  if (storage.distanceMetric !== profile.distanceMetric) {
+    problems.push(
+      `storage ${storage.table} uses ${storage.distanceMetric}; profile ${profile.profileId} requires ${profile.distanceMetric}`,
+    );
+  }
+  const profileMetric = pgvectorMetricSpec(profile.distanceMetric);
+  if (!profileMetric) {
+    problems.push(`profile ${profile.profileId} has unsupported metric ${String(profile.distanceMetric)}`);
+  }
+  const storageMetric = pgvectorMetricSpec(storage.distanceMetric);
+  if (!storageMetric) {
+    problems.push(`storage ${storage.table} has unsupported metric ${String(storage.distanceMetric)}`);
+  } else if (storage.indexOperatorClass !== storageMetric.indexOperatorClass) {
+    problems.push(
+      `storage ${storage.table} index ${storage.indexName} uses ${storage.indexOperatorClass}; ` +
+        `${storage.distanceMetric} requires ${storageMetric.indexOperatorClass}`,
+    );
+  }
+  return problems;
+}
+
+export function memoryStorageAcceptsProfile(
+  profile: Pick<EmbedderProfileSpec, 'profileId' | 'targetDims' | 'distanceMetric'>,
+  storage: MemoryVectorStorageProfile,
+): boolean {
+  return validateMemoryStorageCompatibility(profile, storage).length === 0;
+}
 
 /** Mode → its (unqualified) vec table. Fixed lookup — never interpolate
  *  caller input into a SQL identifier; the schema is prefixed at use. */
 export const VEC_TABLE: Record<ResolvedVecMode, string> = {
-  openai: 'memory_vec_openai',
-  local: 'memory_vec_local',
-  gemma: 'memory_vec_gemma',
-  harrier: 'memory_vec_harrier',
+  openai: MEMORY_VECTOR_STORAGE_PROFILES.openai.table,
+  local: MEMORY_VECTOR_STORAGE_PROFILES.local.table,
+  gemma: MEMORY_VECTOR_STORAGE_PROFILES.gemma.table,
+  harrier: MEMORY_VECTOR_STORAGE_PROFILES.harrier.table,
 };
 
 /**
@@ -64,10 +166,10 @@ export const VEC_TABLE: Record<ResolvedVecMode, string> = {
  * and semantic recall for that mode quietly degrades to nothing.
  */
 export const MODE_DIMS: Record<ResolvedVecMode, number> = {
-  openai: 768,
-  local: 384,
-  gemma: 768,
-  harrier: 1024,
+  openai: MEMORY_VECTOR_STORAGE_PROFILES.openai.dimensions,
+  local: MEMORY_VECTOR_STORAGE_PROFILES.local.dimensions,
+  gemma: MEMORY_VECTOR_STORAGE_PROFILES.gemma.dimensions,
+  harrier: MEMORY_VECTOR_STORAGE_PROFILES.harrier.dimensions,
 };
 
 /** The parameterized vec-upsert statement for one mode ($1 = memory_id,
