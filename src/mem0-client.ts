@@ -51,6 +51,8 @@ import { memoryHost, memorySchema } from './config';
 import { coalesceEmbedFn } from './embed-coalesce';
 import { FallbackExtractionLlm, type ExtractionLlm } from './extraction-llm';
 import { dynamicImport } from './dynamic-import';
+import type { EmbedderProfileSpec } from './embedder-dims';
+import { resolveMemoryVectorBinding } from './vec-write';
 
 const LLM_MODEL = 'claude-haiku-4-5';
 // The collectionName is passed to mem0 for its internal bookkeeping
@@ -66,6 +68,8 @@ let _llmFactoryPatched = false;
 // embedder (below) reads this live module var instead of config.embed.
 // Set in tryLoad() before each (re)build.
 let _currentEmbedFn: ((text: string) => Promise<number[]>) | null = null;
+let _currentEmbeddingProfile: EmbedderProfileSpec | null = null;
+const embeddedQueryProfiles = new WeakMap<number[], EmbedderProfileSpec>();
 /**
  * Register CanonicalVectorStore as a `'canonical'` provider on mem0's
  * VectorStoreFactory. mem0's OSS factory uses a hard-coded switch with
@@ -173,7 +177,9 @@ export async function vectorSearchCanonical(
   await getMemoryClient(); // reuse the cached client so a canonical store exists
   const store = [..._liveCanonicalStores][0];
   if (!store) throw new Error('mem0_unavailable');
-  return store.search(vector, topK, filters);
+  const queryProfile = embeddedQueryProfiles.get(vector);
+  if (!queryProfile) return [];
+  return store.searchWithProfile(vector, queryProfile, topK, filters);
 }
 
 /**
@@ -185,9 +191,11 @@ export async function vectorSearchCanonical(
  */
 export async function embedForCurrentClient(text: string): Promise<number[] | null> {
   const client = await getMemoryClient().catch(() => null);
-  if (!client || !_currentEmbedFn) return null;
+  if (!client || !_currentEmbedFn || !_currentEmbeddingProfile) return null;
   try {
-    return await _currentEmbedFn(text);
+    const vector = await _currentEmbedFn(text);
+    embeddedQueryProfiles.set(vector, _currentEmbeddingProfile);
+    return vector;
   } catch {
     return null;
   }
@@ -511,6 +519,9 @@ async function buildClient(): Promise<MemoryClient | null> {
     // re-tracked). Fire-and-forget: the set is snapshot+cleared synchronously.
     void disposeLiveCanonicalStores();
   }
+  // Exact profile state describes a LIVE cached client, never a prior build
+  // attempt. A failed/disabled rebuild must not leave stale provenance readable.
+  _currentEmbeddingProfile = null;
   if (_clientPermanentFailure) return null;
 
   // Resolve the embedder via the host (openai/local/disabled cascade).
@@ -523,6 +534,12 @@ async function buildClient(): Promise<MemoryClient | null> {
     }
     return null;
   }
+  const resolvedBinding = resolveMemoryVectorBinding(resolved);
+  if (!resolvedBinding.binding) {
+    warnOnce(`embedder profile is incompatible with memory storage: ${resolvedBinding.problems.join('; ')}`);
+    return null;
+  }
+  const storageProfile = resolvedBinding.binding.storage;
   // WI-5094: coalesce + short-TTL-memoize same-text embeds. The pre-turn
   // memory injection issues three scope pulls with the SAME query text per
   // turn; on an in-process embedder that was 3 serialized embeds (~2.6-4.5s
@@ -576,14 +593,7 @@ async function buildClient(): Promise<MemoryClient | null> {
   // never mix. 'gemma' = EmbeddingGemma-300m @ native 768 (table added by
   // migration 534 at 384, widened to 768 by migration 727 / D-005);
   // 'harrier' = harrier-oss-0.6b @ native-1024 (migration 547).
-  const vecTable =
-    resolved.mode === 'openai'
-      ? 'memory_vec_openai'
-      : resolved.mode === 'gemma'
-        ? 'memory_vec_gemma'
-        : resolved.mode === 'harrier'
-          ? 'memory_vec_harrier'
-          : 'memory_vec_local';
+  const vecTable = storageProfile.table;
 
   // Vector-store selection. Prefer the canonical store (migration 081)
   // when pgvector is present; fall back to mem0's in-process `memory`
@@ -618,6 +628,8 @@ async function buildClient(): Promise<MemoryClient | null> {
           collectionName,
           vecTable,
           embeddingModelDims: resolved.dims,
+          embeddingProfile: resolved.profile,
+          storageProfile,
           // mem0 `_autoInitialize` reads `vectorStore.config.dimension` to skip its
           // live-embed detection probe (see embedderConfig note) — EI-4027.
           dimension: resolved.dims,
@@ -728,6 +740,7 @@ async function buildClient(): Promise<MemoryClient | null> {
     }
     patchVectorStoreFactory(mem0);
     _currentEmbedFn = coalescedEmbed; // feed the patched 'custom' embedder (mem0 strips config.embed)
+    _currentEmbeddingProfile = resolved.profile;
     patchEmbedderFactory(mem0);
     if (sessionLlm) {
       // Session rung live: route the 'custom' LLM provider to the host's
@@ -807,6 +820,11 @@ export function getResolvedMode(): ResolvedMode | null {
   return _clientMode;
 }
 
+/** Exact profile currently bound to the cached client, if any. */
+export function getResolvedProfile(): EmbedderProfileSpec | null {
+  return _currentEmbeddingProfile;
+}
+
 /**
  * Force the cached client to be rebuilt on next access. Called by the
  * feedback path after high-impact mutations (forget_all) so the
@@ -815,6 +833,8 @@ export function getResolvedMode(): ResolvedMode | null {
  */
 export function invalidateMemoryClient(): void {
   _client = null;
+  _currentEmbedFn = null;
+  _currentEmbeddingProfile = null;
   _clientBuiltAt = 0;
   // Release the discarded store's PG client so invalidation doesn't leak a
   // connection (e.g. on credential change / mode switch).
@@ -830,6 +850,8 @@ export function invalidateMemoryClient(): void {
  */
 export async function disposeMemoryClient(): Promise<void> {
   _client = null;
+  _currentEmbedFn = null;
+  _currentEmbeddingProfile = null;
   _clientBuiltAt = 0;
   await disposeLiveCanonicalStores();
 }

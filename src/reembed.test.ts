@@ -135,6 +135,8 @@ describe('reembedMemories — happy path (GAP 5)', () => {
     expect(res).toMatchObject({ totalSource: 3, reembedded: 3, skipped: 0, errors: 0 });
     expect(res.fromCollection).toBe('harness_shared.memory_vec_openai');
     expect(res.toCollection).toBe('harness_shared.memory_vec_local');
+    expect(res.fromProfileId).toBe('openai-text-embedding-3-small-768@v1');
+    expect(res.toProfileId).toBe('local-bge-small-en-v1.5@v1');
     expect(typeof res.durationMs).toBe('number');
 
     // SELECT joins the FROM vec table; INSERTs hit the TO vec table.

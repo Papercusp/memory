@@ -22,6 +22,13 @@ import {
   foldValidity,
   type CanonicalStoreConfig,
 } from './canonical-store';
+import {
+  EMBEDDER_DIM_SPECS,
+  pgvectorMetricSpec,
+  type EmbedderProfileSpec,
+  type EmbeddingDistanceMetric,
+} from './embedder-dims';
+import { MEMORY_VECTOR_STORAGE_PROFILES, type MemoryVectorStorageProfile } from './vec-write';
 
 type CapturedQuery = { sql: string; params: unknown[] };
 
@@ -58,14 +65,16 @@ function makeStore(collectionName: string): {
     schema: 'harness_shared',
     collectionName,
     vecTable: 'memory_vec_local',
-    embeddingModelDims: 3,
+    embeddingModelDims: EMBEDDER_DIM_SPECS.local.targetDims,
+    embeddingProfile: EMBEDDER_DIM_SPECS.local,
+    storageProfile: MEMORY_VECTOR_STORAGE_PROFILES.local,
   };
   const store = new CanonicalVectorStore(cfg);
   (store as unknown as { pool: unknown }).pool = fakePool;
   return { store, queries, allQueries };
 }
 
-const VEC = [0.1, 0.2, 0.3];
+const VEC = new Array(EMBEDDER_DIM_SPECS.local.targetDims).fill(0.1);
 
 describe('CanonicalVectorStore store-kind segregation', () => {
   it('memory-kind search excludes entity rows', async () => {
@@ -297,14 +306,14 @@ describe('CanonicalVectorStore archived-state exclusion (P-016)', () => {
 });
 
 describe('CanonicalVectorStore insert guards (GAP 9)', () => {
-  it('rejects a wrong-DIMENSION vector and emits NO query (cfg dims=3)', async () => {
+  it('rejects a wrong-DIMENSION vector and emits NO query', async () => {
     const { store, queries } = makeStore('operator_memory_local');
-    // embeddingModelDims is 3 (see makeStore); a 5-dim vector is corrupt and must
+    // A 5-dim vector is corrupt and must
     // be refused BEFORE any INSERT runs — a wrong-width row would poison the
     // pgvector column for the whole model table.
     await expect(
       store.insert([[0.1, 0.2, 0.3, 0.4, 0.5]], ['id-1'], [{ user_id: 'u' }]),
-    ).rejects.toThrow(/dim 5 !== expected 3/);
+    ).rejects.toThrow(/dim 5 !== expected 384/);
     // The throw is the WHOLE effect: no canonical upsert, no vec insert.
     expect(queries).toHaveLength(0);
   });
@@ -353,7 +362,7 @@ describe('CanonicalVectorStore update', () => {
     const { store, queries } = makeStore('operator_memory_local');
     await expect(
       store.update('id-1', [0.1, 0.2, 0.3, 0.4], { data: 'replacement text' }),
-    ).rejects.toThrow(/dim 4 !== expected 3/);
+    ).rejects.toThrow(/dim 4 !== expected 384/);
     expect(queries).toHaveLength(0);
   });
 
@@ -364,6 +373,99 @@ describe('CanonicalVectorStore update', () => {
       validity: { status: 'superseded' },
     });
     expect(JSON.parse(String(queries[0].params[1]))).toEqual({ data: 'replacement text' });
+  });
+});
+
+describe('CanonicalVectorStore exact profile and metric binding (P-002)', () => {
+  it('returns no semantic ranking for an equal-width foreign query profile', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    const foreign: EmbedderProfileSpec = {
+      ...EMBEDDER_DIM_SPECS.local,
+      profileId: 'foreign-bge-small-space@v1',
+    };
+    await expect(store.searchWithProfile(VEC, foreign, 5, { user_id: 'scope-a' })).resolves.toEqual([]);
+    expect(queries).toHaveLength(0);
+  });
+
+  it('returns no semantic ranking for a wrong-width query before touching PostgreSQL', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await expect(
+      store.searchWithProfile([0.1, 0.2, 0.3], EMBEDDER_DIM_SPECS.local, 5, { user_id: 'scope-a' }),
+    ).resolves.toEqual([]);
+    expect(queries).toHaveLength(0);
+  });
+
+  it.each([
+    ['cosine', '<=>', 0.25, 0.75],
+    ['l2', '<->', 3, 0.25],
+    ['inner-product', '<#>', -2, 2],
+    ['l1', '<+>', 3, 0.25],
+  ] as const)(
+    'compiles %s through the closed operator map and converts its distance into the right score',
+    async (distanceMetric, operator, distance, expectedScore) => {
+      const profile: EmbedderProfileSpec = {
+        ...EMBEDDER_DIM_SPECS.local,
+        profileId: `test-${distanceMetric}@v1`,
+        distanceMetric: distanceMetric as EmbeddingDistanceMetric,
+      };
+      const metric = pgvectorMetricSpec(distanceMetric)!;
+      const storage: MemoryVectorStorageProfile = {
+        ...MEMORY_VECTOR_STORAGE_PROFILES.local,
+        acceptedProfileIds: [profile.profileId],
+        distanceMetric,
+        indexOperatorClass: metric.indexOperatorClass,
+      };
+      const store = new CanonicalVectorStore({
+        host: 'localhost',
+        port: 5432,
+        user: 'u',
+        password: 'p',
+        dbname: 'db',
+        schema: 'harness_shared',
+        collectionName: 'operator_memory_local',
+        vecTable: storage.table,
+        embeddingModelDims: profile.targetDims,
+        embeddingProfile: profile,
+        storageProfile: storage,
+      });
+      const statements: string[] = [];
+      (store as unknown as { pool: unknown }).pool = {
+        connect: vi.fn(async () => ({
+          query: vi.fn(async (sql: string) => {
+            statements.push(sql);
+            return /SELECT c\.id/.test(sql)
+              ? { rows: [{ id: 'm1', payload: { data: 'x' }, distance }], rowCount: 1 }
+              : { rows: [], rowCount: 0 };
+          }),
+          release: () => {},
+        })),
+        on: () => {},
+      };
+
+      const result = await store.searchWithProfile(VEC, profile, 1, { user_id: 'scope-a' });
+      const searchSql = statements.find((sql) => /SELECT c\.id/.test(sql))!;
+      expect(searchSql).toContain(`v.vector ${operator} $1::vector`);
+      expect(searchSql).toContain(`ORDER BY v.vector ${operator} $1::vector`);
+      expect(result).toEqual([{ id: 'm1', payload: { data: 'x' }, score: expectedScore }]);
+    },
+  );
+
+  it('rejects a store whose selected physical binding does not accept its exact profile', () => {
+    expect(
+      () =>
+        new CanonicalVectorStore({
+          host: 'localhost',
+          port: 5432,
+          user: 'u',
+          password: 'p',
+          dbname: 'db',
+          schema: 'harness_shared',
+          vecTable: MEMORY_VECTOR_STORAGE_PROFILES.gemma.table,
+          embeddingModelDims: EMBEDDER_DIM_SPECS.openai.targetDims,
+          embeddingProfile: EMBEDDER_DIM_SPECS.openai,
+          storageProfile: MEMORY_VECTOR_STORAGE_PROFILES.gemma,
+        }),
+    ).toThrow(/does not accept profile/);
   });
 });
 

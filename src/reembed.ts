@@ -36,13 +36,20 @@
  */
 
 import { memoryHost, memorySchema } from './config';
+import { EMBEDDER_DIM_SPECS, type EmbeddingProfileId } from './embedder-dims';
 // ⚠ SINGLE SOURCE — do NOT re-declare these here. This file used to keep private
 // copies of ResolvedVecMode / VEC_TABLE / MODE_DIMS, and the 384 -> 768 widening
 // (migration 727) updated vec-write.ts's copy while this one silently went stale.
 // Because the width guard below SKIPS rather than throws, that made every
 // re-embed a no-op that still reported success (WI-7107). One declaration means
 // the next width change cannot half-land.
-import { MODE_DIMS, VEC_TABLE, type ResolvedVecMode } from './vec-write';
+import {
+  MEMORY_VECTOR_STORAGE_PROFILES,
+  MODE_DIMS,
+  VEC_TABLE,
+  validateMemoryStorageCompatibility,
+  type ResolvedVecMode,
+} from './vec-write';
 
 interface PgFields {
   host: string;
@@ -62,6 +69,8 @@ interface ReembedProgress {
 export interface ReembedResult extends ReembedProgress {
   fromCollection: string;
   toCollection: string;
+  fromProfileId: EmbeddingProfileId;
+  toProfileId: EmbeddingProfileId;
   durationMs: number;
 }
 
@@ -94,6 +103,15 @@ export async function reembedMemories(
     throw new Error('reembed_noop_same_mode');
   }
   const started = Date.now();
+  const fromProfile = EMBEDDER_DIM_SPECS[fromMode];
+  const toProfile = EMBEDDER_DIM_SPECS[toMode];
+  const profileProblems = [
+    ...validateMemoryStorageCompatibility(fromProfile, MEMORY_VECTOR_STORAGE_PROFILES[fromMode]),
+    ...validateMemoryStorageCompatibility(toProfile, MEMORY_VECTOR_STORAGE_PROFILES[toMode]),
+  ];
+  if (profileProblems.length > 0) {
+    throw new Error(`reembed_profile_storage_mismatch: ${profileProblems.join('; ')}`);
+  }
   const schema = memorySchema();
   const fromTable = `${schema}.${VEC_TABLE[fromMode]}`;
   const toTable = `${schema}.${VEC_TABLE[toMode]}`;
@@ -167,6 +185,8 @@ export async function reembedMemories(
     return {
       fromCollection: fromTable,
       toCollection: toTable,
+      fromProfileId: fromProfile.profileId,
+      toProfileId: toProfile.profileId,
       ...progress,
       durationMs: Date.now() - started,
     };

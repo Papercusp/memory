@@ -42,6 +42,15 @@
  */
 
 import { Pool as PgPool, type PoolClient, type QueryResult } from 'pg';
+import {
+  pgvectorMetricSpec,
+  pgvectorScoreFromDistance,
+  type EmbedderProfileSpec,
+} from './embedder-dims';
+import {
+  validateMemoryStorageCompatibility,
+  type MemoryVectorStorageProfile,
+} from './vec-write';
 
 interface VectorStoreResult {
   id: string;
@@ -73,6 +82,10 @@ export interface CanonicalStoreConfig {
   vecTable: 'memory_vec_openai' | 'memory_vec_local' | 'memory_vec_gemma' | 'memory_vec_harrier';
   /** Sanity check — refuses to insert vectors with the wrong length. */
   embeddingModelDims: number;
+  /** Exact emitting/query profile bound to this store instance. */
+  embeddingProfile: EmbedderProfileSpec;
+  /** Independently declared physical table/index contract. */
+  storageProfile: MemoryVectorStorageProfile;
 }
 
 function safeKey(k: string): string {
@@ -446,6 +459,18 @@ export class CanonicalVectorStore {
   private pool: PgPool | null = null;
 
   constructor(config: CanonicalStoreConfig) {
+    const problems = validateMemoryStorageCompatibility(config.embeddingProfile, config.storageProfile);
+    if (config.vecTable !== config.storageProfile.table) {
+      problems.push(`configured vecTable ${config.vecTable} disagrees with storage ${config.storageProfile.table}`);
+    }
+    if (config.embeddingModelDims !== config.embeddingProfile.targetDims) {
+      problems.push(
+        `configured width ${config.embeddingModelDims} disagrees with profile ${config.embeddingProfile.profileId} width ${config.embeddingProfile.targetDims}`,
+      );
+    }
+    if (problems.length > 0) {
+      throw new Error(`CanonicalVectorStore profile/storage mismatch: ${problems.join('; ')}`);
+    }
     this.cfg = config;
     this.storeKind = config.collectionName?.endsWith('_entities') ? 'entity' : 'memory';
   }
@@ -639,6 +664,7 @@ export class CanonicalVectorStore {
     topK = 5,
     filters?: SearchFilters,
   ): Promise<VectorStoreResult[]> {
+    if (query.length !== this.cfg.embeddingProfile.targetDims) return [];
     const client = await this.getClient();
     const vecTable = `${this.cfg.schema}.${this.cfg.vecTable}`;
     // Temporal controls are split out for BOTH kinds (left in the filter map
@@ -670,13 +696,15 @@ export class CanonicalVectorStore {
       if (vCond) conds.push(vCond);
     }
     const where = conds.length > 0 ? `WHERE ${conds.join(' AND ')}` : '';
+    const metric = pgvectorMetricSpec(this.cfg.embeddingProfile.distanceMetric);
+    if (!metric) return [];
     const sql = `
       SELECT c.id, c.payload, c.valid_at, c.invalid_at, c.superseded_by,
-             1 - (v.vector <=> $1::vector) AS score
+             v.vector ${metric.distanceOperator} $1::vector AS distance
       FROM ${vecTable} v
       JOIN ${this.cfg.schema}.memory_canonical c ON c.id = v.memory_id
       ${where}
-      ORDER BY v.vector <=> $1::vector
+      ORDER BY v.vector ${metric.distanceOperator} $1::vector
       LIMIT $2
     `;
     const res = await this.runVectorSearch(client, sql, params);
@@ -687,13 +715,26 @@ export class CanonicalVectorStore {
         valid_at?: unknown;
         invalid_at?: unknown;
         superseded_by?: unknown;
-        score: string | number;
+        distance: string | number;
       }) => ({
         id: r.id,
         payload: this.storeKind === 'memory' ? foldValidity(r.payload, r, temporal) : r.payload,
-        score: Number(r.score),
+        score: pgvectorScoreFromDistance(this.cfg.embeddingProfile.distanceMetric, Number(r.distance)),
       }),
     );
+  }
+
+  /** Search a precomputed query only when its exact profile matches the store.
+   * Equal width or equal metric is deliberately insufficient. The empty result
+   * is the semantic fail-closed signal used by callers that retain a lexical leg. */
+  async searchWithProfile(
+    query: number[],
+    queryProfile: EmbedderProfileSpec,
+    topK = 5,
+    filters?: SearchFilters,
+  ): Promise<VectorStoreResult[]> {
+    if (queryProfile.profileId !== this.cfg.embeddingProfile.profileId) return [];
+    return this.search(query, topK, filters);
   }
 
   // mem0 calls this for BM25 hybrid scoring. Returning null tells mem0

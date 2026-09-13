@@ -18,6 +18,7 @@
  * implementations may honor the optional caller lifetime; pure/in-process
  * implementations remain valid when they ignore it. */
 import { pinModuleState } from '@papercusp/module-singleton';
+import type { EmbedderMode, EmbedderProfileSpec } from './embedder-dims';
 
 export type EmbedFn = (text: string, signal?: AbortSignal) => Promise<number[]>;
 
@@ -28,7 +29,14 @@ export type EmbedFn = (text: string, signal?: AbortSignal) => Promise<number[]>;
  * per-model vec table; `dims` sizes the canonical column).
  */
 export type ResolvedEmbedder =
-  | { mode: 'openai' | 'local' | 'gemma' | 'harrier'; dims: number; embed: EmbedFn }
+  | {
+      mode: EmbedderMode;
+      /** Backward-compatible width projection. It MUST equal profile.targetDims. */
+      dims: number;
+      /** Exact immutable embedding-space contract carried end to end. */
+      profile: EmbedderProfileSpec;
+      embed: EmbedFn;
+    }
   | { mode: 'disabled'; reason?: string };
 
 /** LLM credentials for mem0's fact-extraction step. */
