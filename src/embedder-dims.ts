@@ -87,6 +87,107 @@ export interface EmbedderDimSpec {
   untrainedCut?: UntrainedCutAck;
 }
 
+/** Stable identity for one complete embedding space contract. A change to any
+ * space-defining field below mints a new `@vN` id; equal dimensions never make
+ * two profiles compatible. */
+export type EmbeddingProfileId = `${string}@v${number}`;
+
+/** Stable identity for a document/query input transformation. Chunking stays
+ * outside this identity unless it changes the exact text sent to the encoder. */
+export type EmbeddingRecipeId = `${string}@v${number}`;
+
+export type EmbeddingDistanceMetric = 'cosine' | 'l2' | 'inner-product' | 'l1';
+export type EmbeddingPooling = 'mean' | 'last-token' | 'model-graph' | 'provider-managed';
+export type EmbeddingOutputDtype = 'float32';
+export type EmbeddingRevisionPolicy = 'profile-versioned-provider-model-id' | 'immutable-artifact';
+export type EmbeddingNormalization = Readonly<{
+  kind: 'l2' | 'none';
+  timing: 'provider' | 'pipeline' | 'after-truncation' | 'model-graph';
+}>;
+
+/** The complete, immutable identity of a production embedding space.
+ *
+ * `revisionPolicy` is explicit because the current providers expose different
+ * guarantees. `profile-versioned-provider-model-id` means an observed provider
+ * model change MUST mint a new profile id; it may never silently inherit this
+ * profile's storage. `immutable-artifact` is reserved for a content-pinned
+ * artifact revision. */
+export interface EmbedderProfileSpec extends EmbedderDimSpec {
+  readonly profileId: EmbeddingProfileId;
+  readonly modelRevision: string;
+  readonly revisionPolicy: EmbeddingRevisionPolicy;
+  readonly distanceMetric: EmbeddingDistanceMetric;
+  readonly normalization: EmbeddingNormalization;
+  readonly pooling: EmbeddingPooling;
+  readonly outputDtype: EmbeddingOutputDtype;
+  readonly documentRecipe: EmbeddingRecipeId;
+  readonly queryRecipe: EmbeddingRecipeId;
+}
+
+export type PgvectorDistanceOperator = '<=>' | '<->' | '<#>' | '<+>';
+export type PgvectorIndexOperatorClass =
+  | 'vector_cosine_ops'
+  | 'vector_l2_ops'
+  | 'vector_ip_ops'
+  | 'vector_l1_ops';
+export type PgvectorScoreConversion =
+  | 'one-minus-distance'
+  | 'reciprocal-one-plus-distance'
+  | 'negate-distance';
+
+export interface PgvectorMetricSpec {
+  readonly distanceOperator: PgvectorDistanceOperator;
+  readonly indexOperatorClass: PgvectorIndexOperatorClass;
+  readonly scoreConversion: PgvectorScoreConversion;
+}
+
+/** Closed, injection-safe mapping from profile metric to pgvector SQL
+ * vocabulary. Callers select a member of this table; no operator or operator
+ * class is accepted from configuration or interpolated caller input. */
+export const PGVECTOR_METRIC_SPECS: Readonly<Record<EmbeddingDistanceMetric, PgvectorMetricSpec>> =
+  Object.freeze({
+    cosine: Object.freeze({
+      distanceOperator: '<=>',
+      indexOperatorClass: 'vector_cosine_ops',
+      scoreConversion: 'one-minus-distance',
+    }),
+    l2: Object.freeze({
+      distanceOperator: '<->',
+      indexOperatorClass: 'vector_l2_ops',
+      scoreConversion: 'reciprocal-one-plus-distance',
+    }),
+    'inner-product': Object.freeze({
+      distanceOperator: '<#>',
+      indexOperatorClass: 'vector_ip_ops',
+      scoreConversion: 'negate-distance',
+    }),
+    l1: Object.freeze({
+      distanceOperator: '<+>',
+      indexOperatorClass: 'vector_l1_ops',
+      scoreConversion: 'reciprocal-one-plus-distance',
+    }),
+  });
+
+/** Runtime-safe metric lookup for values read from storage/configuration. */
+export function pgvectorMetricSpec(metric: string): PgvectorMetricSpec | undefined {
+  return (PGVECTOR_METRIC_SPECS as Readonly<Record<string, PgvectorMetricSpec | undefined>>)[metric];
+}
+
+/** Convert pgvector's ascending distance value into the score convention used
+ * by callers. The conversion is selected only through the closed metric map. */
+export function pgvectorScoreFromDistance(metric: string, distance: number): number | undefined {
+  const spec = pgvectorMetricSpec(metric);
+  if (!spec || !Number.isFinite(distance)) return undefined;
+  switch (spec.scoreConversion) {
+    case 'one-minus-distance':
+      return 1 - distance;
+    case 'reciprocal-one-plus-distance':
+      return 1 / (1 + Math.max(0, distance));
+    case 'negate-distance':
+      return -distance;
+  }
+}
+
 /**
  * Is `dims` a width this model was actually trained to emit?
  *
@@ -154,6 +255,87 @@ export function validateEmbedderDimSpec(mode: string, spec: EmbedderDimSpec): st
   return problems;
 }
 
+const VERSIONED_ID = /^[a-z0-9][a-z0-9._-]*@v[1-9]\d*$/;
+
+/** Structural validation for the complete production profile, including the
+ * existing dimension/MRL contract. Returns every problem in one pass. */
+export function validateEmbedderProfile(mode: string, spec: EmbedderProfileSpec): string[] {
+  const candidate = spec as Partial<EmbedderProfileSpec>;
+  const problems: string[] = [];
+  const at = `${mode} (${typeof candidate.model === 'string' ? candidate.model : 'unknown-model'})`;
+  const baseShapeValid =
+    typeof candidate.model === 'string' && candidate.model.trim().length > 0 &&
+    typeof candidate.nativeDims === 'number' && Number.isFinite(candidate.nativeDims) &&
+    typeof candidate.targetDims === 'number' && Number.isFinite(candidate.targetDims) &&
+    typeof candidate.mrl === 'string' && ['none', 'discrete', 'continuous'].includes(candidate.mrl) &&
+    Array.isArray(candidate.trainedDims) && candidate.trainedDims.every(Number.isFinite);
+  if (typeof candidate.model !== 'string' || !candidate.model.trim()) {
+    problems.push(`${at}: model must not be empty`);
+  }
+  if (typeof candidate.nativeDims !== 'number' || !Number.isFinite(candidate.nativeDims)) {
+    problems.push(`${at}: nativeDims must be a finite number`);
+  }
+  if (typeof candidate.targetDims !== 'number' || !Number.isFinite(candidate.targetDims)) {
+    problems.push(`${at}: targetDims must be a finite number`);
+  }
+  if (typeof candidate.mrl !== 'string' || !['none', 'discrete', 'continuous'].includes(candidate.mrl)) {
+    problems.push(`${at}: mrl is not a supported closed value`);
+  }
+  if (!Array.isArray(candidate.trainedDims) || !candidate.trainedDims.every(Number.isFinite)) {
+    problems.push(`${at}: trainedDims must be an array of finite numbers`);
+  }
+  if (baseShapeValid) problems.push(...validateEmbedderDimSpec(mode, spec));
+  if (typeof candidate.profileId !== 'string' || !VERSIONED_ID.test(candidate.profileId)) {
+    problems.push(`${at}: profileId '${spec.profileId}' must be a lowercase, versioned <name>@vN identity`);
+  }
+  if (typeof candidate.modelRevision !== 'string' || !candidate.modelRevision.trim()) {
+    problems.push(`${at}: modelRevision must not be empty`);
+  }
+  if (!['profile-versioned-provider-model-id', 'immutable-artifact'].includes(String(candidate.revisionPolicy))) {
+    problems.push(`${at}: unsupported revisionPolicy '${String(candidate.revisionPolicy)}'`);
+  }
+  if (typeof candidate.distanceMetric !== 'string' || !pgvectorMetricSpec(candidate.distanceMetric)) {
+    problems.push(`${at}: unsupported distanceMetric '${String(candidate.distanceMetric)}'`);
+  }
+  if (!candidate.normalization || !['l2', 'none'].includes(String(candidate.normalization.kind))) {
+    problems.push(`${at}: normalization.kind must be 'l2' or 'none'`);
+  }
+  if (
+    !candidate.normalization ||
+    !['provider', 'pipeline', 'after-truncation', 'model-graph'].includes(String(candidate.normalization.timing))
+  ) {
+    problems.push(`${at}: normalization.timing is not a supported closed value`);
+  }
+  if (!['mean', 'last-token', 'model-graph', 'provider-managed'].includes(String(candidate.pooling))) {
+    problems.push(`${at}: pooling is not a supported closed value`);
+  }
+  if (candidate.outputDtype !== 'float32') problems.push(`${at}: outputDtype must be 'float32'`);
+  for (const [field, value] of [
+    ['documentRecipe', candidate.documentRecipe],
+    ['queryRecipe', candidate.queryRecipe],
+  ] as const) {
+    if (typeof value !== 'string' || !VERSIONED_ID.test(value)) {
+      problems.push(`${at}: ${field} '${value}' must be a lowercase, versioned <name>@vN identity`);
+    }
+  }
+  return problems;
+}
+
+/** Validate the production registry as a whole. The type catches missing mode
+ * keys; this catches duplicate space identities and malformed runtime data. */
+export function validateEmbedderProfileRegistry(
+  registry: Readonly<Record<string, EmbedderProfileSpec>>,
+): string[] {
+  const problems = Object.entries(registry).flatMap(([mode, spec]) => validateEmbedderProfile(mode, spec));
+  const owners = new Map<string, string>();
+  for (const [mode, spec] of Object.entries(registry)) {
+    const prior = owners.get(spec.profileId);
+    if (prior) problems.push(`${mode}: profileId '${spec.profileId}' duplicates ${prior}`);
+    else owners.set(spec.profileId, mode);
+  }
+  return problems;
+}
+
 /**
  * Every embedder mode's declared dimensions.
  *
@@ -162,17 +344,26 @@ export function validateEmbedderDimSpec(mode: string, spec: EmbedderDimSpec): st
  * declared spec is unsound. Both halves matter: the type catches the omission,
  * the test catches the bad declaration.
  */
-export const EMBEDDER_DIM_SPECS: Record<EmbedderMode, EmbedderDimSpec> = {
+export const EMBEDDER_DIM_SPECS: Readonly<Record<EmbedderMode, EmbedderProfileSpec>> = Object.freeze({
   /**
    * BGE-small is natively 384 — no truncation happens at all, which is why
    * this mode never had the bug.
    */
   local: {
+    profileId: 'local-bge-small-en-v1.5@v1',
     model: 'Xenova/bge-small-en-v1.5',
+    modelRevision: 'Xenova/bge-small-en-v1.5',
+    revisionPolicy: 'profile-versioned-provider-model-id',
     nativeDims: 384,
     mrl: 'none',
     trainedDims: [384],
     targetDims: 384,
+    distanceMetric: 'cosine',
+    normalization: { kind: 'l2', timing: 'pipeline' },
+    pooling: 'mean',
+    outputDtype: 'float32',
+    documentRecipe: 'bge-small-mean-document@v1',
+    queryRecipe: 'bge-small-mean-query@v1',
   },
 
   /**
@@ -191,11 +382,20 @@ export const EMBEDDER_DIM_SPECS: Record<EmbedderMode, EmbedderDimSpec> = {
    * contract from silently becoming gemma-specific.
    */
   openai: {
+    profileId: 'openai-text-embedding-3-small-768@v1',
     model: 'text-embedding-3-small',
+    modelRevision: 'text-embedding-3-small',
+    revisionPolicy: 'profile-versioned-provider-model-id',
     nativeDims: 1536,
     mrl: 'continuous',
     trainedDims: [1536],
     targetDims: 768,
+    distanceMetric: 'cosine',
+    normalization: { kind: 'l2', timing: 'provider' },
+    pooling: 'provider-managed',
+    outputDtype: 'float32',
+    documentRecipe: 'openai-text-embedding-3-small-document@v1',
+    queryRecipe: 'openai-text-embedding-3-small-query@v1',
   },
 
   /**
@@ -224,11 +424,20 @@ export const EMBEDDER_DIM_SPECS: Record<EmbedderMode, EmbedderDimSpec> = {
    * That cost is why the width chosen here is the model's terminal one.
    */
   gemma: {
+    profileId: 'gemma-embeddinggemma-300m-768@v1',
     model: 'onnx-community/embeddinggemma-300m-ONNX',
+    modelRevision: 'onnx-community/embeddinggemma-300m-ONNX',
+    revisionPolicy: 'profile-versioned-provider-model-id',
     nativeDims: 768,
     mrl: 'discrete',
     trainedDims: [768, 512, 256, 128],
     targetDims: 768,
+    distanceMetric: 'cosine',
+    normalization: { kind: 'l2', timing: 'after-truncation' },
+    pooling: 'mean',
+    outputDtype: 'float32',
+    documentRecipe: 'embeddinggemma-search-document@v1',
+    queryRecipe: 'embeddinggemma-search-query@v1',
   },
 
   /**
@@ -239,13 +448,22 @@ export const EMBEDDER_DIM_SPECS: Record<EmbedderMode, EmbedderDimSpec> = {
    * must win before any prose-surface use.
    */
   harrier: {
+    profileId: 'harrier-oss-v1-0.6b-1024@v1',
     model: 'microsoft/harrier-oss-v1-0.6b',
+    modelRevision: 'onnx-community/harrier-oss-v1-0.6b-ONNX',
+    revisionPolicy: 'profile-versioned-provider-model-id',
     nativeDims: 1024,
     mrl: 'none',
     trainedDims: [1024],
     targetDims: 1024,
+    distanceMetric: 'cosine',
+    normalization: { kind: 'l2', timing: 'model-graph' },
+    pooling: 'model-graph',
+    outputDtype: 'float32',
+    documentRecipe: 'harrier-raw-document@v1',
+    queryRecipe: 'harrier-web-search-query@v1',
   },
-};
+});
 
 /**
  * BAKE-OFF CANDIDATES — models being MEASURED as replacements, not yet wired

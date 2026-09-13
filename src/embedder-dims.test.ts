@@ -24,10 +24,16 @@ import { describe, expect, it } from 'vitest';
 import {
   EMBEDDER_DIM_SPECS,
   CANDIDATE_DIM_SPECS,
+  PGVECTOR_METRIC_SPECS,
   dimSpecFor,
   isTrainedDim,
   validateEmbedderDimSpec,
+  validateEmbedderProfile,
+  validateEmbedderProfileRegistry,
+  pgvectorMetricSpec,
+  pgvectorScoreFromDistance,
   type EmbedderDimSpec,
+  type EmbedderProfileSpec,
   type EmbedderMode,
 } from './embedder-dims';
 import { GEMMA_TARGET_DIMS } from './gemma-embedder';
@@ -47,6 +53,19 @@ const OK: EmbedderDimSpec = {
   targetDims: 512,
 };
 
+const OK_PROFILE: EmbedderProfileSpec = {
+  ...OK,
+  profileId: 'test-model@v1',
+  modelRevision: 'sha256:abc123',
+  revisionPolicy: 'immutable-artifact',
+  distanceMetric: 'cosine',
+  normalization: { kind: 'l2', timing: 'after-truncation' },
+  pooling: 'mean',
+  outputDtype: 'float32',
+  documentRecipe: 'test-document@v1',
+  queryRecipe: 'test-query@v1',
+};
+
 describe('every declared embedder spec is sound', () => {
   it('covers every embedder mode — a new model must declare its dims', () => {
     // The Record<EmbedderMode, …> type makes an omission a compile error; this
@@ -56,6 +75,17 @@ describe('every declared embedder spec is sound', () => {
 
   it.each(MODES)('%s declares a valid dim spec', (mode) => {
     expect(validateEmbedderDimSpec(mode, EMBEDDER_DIM_SPECS[mode])).toEqual([]);
+  });
+
+  it('declares a complete, uniquely versioned production profile for every mode', () => {
+    expect(validateEmbedderProfileRegistry(EMBEDDER_DIM_SPECS)).toEqual([]);
+    for (const mode of MODES) {
+      const profile = EMBEDDER_DIM_SPECS[mode];
+      expect(profile.profileId).toMatch(/@v[1-9]\d*$/);
+      expect(profile.modelRevision).not.toHaveLength(0);
+      expect(profile.documentRecipe).toMatch(/@v[1-9]\d*$/);
+      expect(profile.queryRecipe).toMatch(/@v[1-9]\d*$/);
+    }
   });
 
   it.each(CANDIDATES)('bake-off candidate %s declares a valid dim spec', (key) => {
@@ -70,6 +100,108 @@ describe('every declared embedder spec is sound', () => {
     // A candidate silently becoming a mode would skip the resolver/table/
     // migration work a real mode needs. The separation is the point.
     for (const key of CANDIDATES) expect(Object.keys(EMBEDDER_DIM_SPECS)).not.toContain(key);
+  });
+});
+
+describe('complete embedding-profile identity', () => {
+  it.each([
+    'profileId',
+    'model',
+    'modelRevision',
+    'revisionPolicy',
+    'nativeDims',
+    'mrl',
+    'trainedDims',
+    'targetDims',
+    'distanceMetric',
+    'normalization',
+    'pooling',
+    'outputDtype',
+    'documentRecipe',
+    'queryRecipe',
+  ] as const)('rejects a runtime profile missing %s without throwing', (field) => {
+    const candidate = { ...OK_PROFILE } as Record<string, unknown>;
+    delete candidate[field];
+    expect(() => validateEmbedderProfile('missing-field', candidate as unknown as EmbedderProfileSpec)).not.toThrow();
+    expect(validateEmbedderProfile('missing-field', candidate as unknown as EmbedderProfileSpec)).not.toEqual([]);
+  });
+
+  it.each(['kind', 'timing'] as const)('rejects normalization missing %s without throwing', (field) => {
+    const normalization = { ...OK_PROFILE.normalization } as Record<string, unknown>;
+    delete normalization[field];
+    const candidate = { ...OK_PROFILE, normalization } as unknown as EmbedderProfileSpec;
+    expect(() => validateEmbedderProfile('missing-normalization-field', candidate)).not.toThrow();
+    expect(validateEmbedderProfile('missing-normalization-field', candidate)).not.toEqual([]);
+  });
+
+  it('rejects unversioned ids and incomplete space-defining fields', () => {
+    const problems = validateEmbedderProfile('bad', {
+      ...OK_PROFILE,
+      profileId: 'test-model' as EmbedderProfileSpec['profileId'],
+      modelRevision: ' ',
+      queryRecipe: 'query-latest' as EmbedderProfileSpec['queryRecipe'],
+    });
+    expect(problems).toEqual([
+      expect.stringContaining('profileId'),
+      expect.stringContaining('modelRevision'),
+      expect.stringContaining('queryRecipe'),
+    ]);
+  });
+
+  it('rejects duplicate profile ids even when dimensions match', () => {
+    expect(
+      validateEmbedderProfileRegistry({
+        first: OK_PROFILE,
+        second: { ...OK_PROFILE, model: 'different/model' },
+      }),
+    ).toEqual([expect.stringContaining('duplicates first')]);
+  });
+
+  it('treats recipe identity as part of the profile, including asymmetric query input', () => {
+    expect(EMBEDDER_DIM_SPECS.gemma.documentRecipe).not.toBe(EMBEDDER_DIM_SPECS.gemma.queryRecipe);
+    expect(EMBEDDER_DIM_SPECS.harrier.documentRecipe).not.toBe(EMBEDDER_DIM_SPECS.harrier.queryRecipe);
+    expect(EMBEDDER_DIM_SPECS.gemma.normalization.timing).toBe('after-truncation');
+    expect(EMBEDDER_DIM_SPECS.harrier.pooling).toBe('model-graph');
+  });
+});
+
+describe('closed pgvector metric mapping', () => {
+  it('maps every supported metric to its operator, score conversion, and matching index class', () => {
+    expect(PGVECTOR_METRIC_SPECS).toEqual({
+      cosine: {
+        distanceOperator: '<=>',
+        indexOperatorClass: 'vector_cosine_ops',
+        scoreConversion: 'one-minus-distance',
+      },
+      l2: {
+        distanceOperator: '<->',
+        indexOperatorClass: 'vector_l2_ops',
+        scoreConversion: 'reciprocal-one-plus-distance',
+      },
+      'inner-product': {
+        distanceOperator: '<#>',
+        indexOperatorClass: 'vector_ip_ops',
+        scoreConversion: 'negate-distance',
+      },
+      l1: {
+        distanceOperator: '<+>',
+        indexOperatorClass: 'vector_l1_ops',
+        scoreConversion: 'reciprocal-one-plus-distance',
+      },
+    });
+  });
+
+  it('fails closed for an unknown metric instead of accepting SQL-shaped input', () => {
+    expect(pgvectorMetricSpec('cosine')).toBe(PGVECTOR_METRIC_SPECS.cosine);
+    expect(pgvectorMetricSpec('<=>; DROP TABLE memories')).toBeUndefined();
+    expect(pgvectorScoreFromDistance('unknown', 0.25)).toBeUndefined();
+  });
+
+  it('converts each ascending pgvector distance into a monotonic caller score', () => {
+    expect(pgvectorScoreFromDistance('cosine', 0.25)).toBe(0.75);
+    expect(pgvectorScoreFromDistance('l2', 3)).toBe(0.25);
+    expect(pgvectorScoreFromDistance('l1', 1)).toBe(0.5);
+    expect(pgvectorScoreFromDistance('inner-product', -0.8)).toBe(0.8);
   });
 });
 
