@@ -23,7 +23,7 @@
  * canonical text untouched.
  */
 
-import { memoryHost, memorySchema } from './config';
+import { memoryHost, memorySchema, type ResolvedEmbedder } from './config';
 import {
   pgvectorMetricSpec,
   type EmbedderProfileSpec,
@@ -172,6 +172,32 @@ export const MODE_DIMS: Record<ResolvedVecMode, number> = {
   harrier: MEMORY_VECTOR_STORAGE_PROFILES.harrier.dimensions,
 };
 
+export interface ResolvedMemoryVectorBinding {
+  readonly mode: ResolvedVecMode;
+  readonly profile: EmbedderProfileSpec;
+  readonly storage: MemoryVectorStorageProfile;
+}
+
+/** Resolve one enabled embedder onto the independently declared physical
+ * storage binding. Returning problems instead of guessing is the runtime half
+ * of D-001: desired profile and actual storage remain separate facts. */
+export function resolveMemoryVectorBinding(
+  resolved: Exclude<ResolvedEmbedder, { mode: 'disabled' }>,
+): { binding?: ResolvedMemoryVectorBinding; problems: string[] } {
+  const mode = resolved.mode as ResolvedVecMode;
+  const storage = MEMORY_VECTOR_STORAGE_PROFILES[mode];
+  if (!storage) return { problems: [`no memory vector storage is declared for mode ${resolved.mode}`] };
+  const problems = validateMemoryStorageCompatibility(resolved.profile, storage);
+  if (resolved.dims !== resolved.profile.targetDims) {
+    problems.push(
+      `resolved width ${resolved.dims} disagrees with profile ${resolved.profile.profileId} width ${resolved.profile.targetDims}`,
+    );
+  }
+  return problems.length === 0
+    ? { binding: { mode, profile: resolved.profile, storage }, problems }
+    : { problems };
+}
+
 /** The parameterized vec-upsert statement for one mode ($1 = memory_id,
  *  $2 = vector literal). `ON CONFLICT (memory_id)` overwrites in place. */
 export function vecUpsertSql(schema: string, mode: ResolvedVecMode): string {
@@ -197,15 +223,21 @@ export function toVectorLiteral(vec: number[]): string {
  */
 export async function activeVecTable(): Promise<{
   mode: ResolvedVecMode;
+  profileId: EmbeddingProfileId;
   schema: string;
   table: string;
 } | null> {
   try {
     const resolved = await memoryHost().resolveEmbedder();
     if (resolved.mode === 'disabled') return null;
-    const mode = resolved.mode as ResolvedVecMode;
-    if (!VEC_TABLE[mode]) return null;
-    return { mode, schema: memorySchema(), table: VEC_TABLE[mode] };
+    const { binding } = resolveMemoryVectorBinding(resolved);
+    if (!binding) return null;
+    return {
+      mode: binding.mode,
+      profileId: binding.profile.profileId,
+      schema: memorySchema(),
+      table: binding.storage.table,
+    };
   } catch {
     return null;
   }
@@ -231,10 +263,10 @@ export async function embedAndUpsertVector(memoryId: string, text: string): Prom
   try {
     const resolved = await memoryHost().resolveEmbedder();
     if (resolved.mode === 'disabled') return false;
-    const mode = resolved.mode as ResolvedVecMode;
-    if (!VEC_TABLE[mode]) return false;
+    const { binding } = resolveMemoryVectorBinding(resolved);
+    if (!binding) return false;
     const vec = await resolved.embed(text);
-    if (!Array.isArray(vec) || vec.length !== MODE_DIMS[mode]) return false;
+    if (!Array.isArray(vec) || vec.length !== binding.storage.dimensions) return false;
 
     const schema = memorySchema();
     // `require('pg')` throws in this ESM package (see mem0-client/reembed) —
@@ -246,7 +278,7 @@ export async function embedAndUpsertVector(memoryId: string, text: string): Prom
     const client = new Client(await pgClientFields());
     await client.connect();
     try {
-      const r = await client.query(vecUpsertSql(schema, mode), [memoryId, toVectorLiteral(vec)]);
+      const r = await client.query(vecUpsertSql(schema, binding.mode), [memoryId, toVectorLiteral(vec)]);
       return (r.rowCount ?? 0) > 0;
     } finally {
       try {

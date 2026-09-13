@@ -17,6 +17,7 @@ import {
   MEMORY_VECTOR_STORAGE_PROFILES,
   memoryStorageAcceptsProfile,
   validateMemoryStorageCompatibility,
+  resolveMemoryVectorBinding,
   type MemoryVectorStorageProfile,
 } from './vec-write';
 import { EMBEDDER_DIM_SPECS } from './embedder-dims';
@@ -121,7 +122,12 @@ describe('embedAndUpsertVector — best-effort guards (never throw)', () => {
 
   it('returns false when the embedding is the wrong width (guarded before PG)', async () => {
     // vec length 3 !== 768 (gemma) → rejected before any pg connection opens.
-    configureMemory(hostWith({ mode: 'gemma', dims: 768, embed: async () => [0.1, 0.2, 0.3] }));
+    configureMemory(hostWith({
+      mode: 'gemma',
+      dims: 768,
+      profile: EMBEDDER_DIM_SPECS.gemma,
+      embed: async () => [0.1, 0.2, 0.3],
+    }));
     expect(await embedAndUpsertVector('m1', 'text')).toBe(false);
   });
 
@@ -130,11 +136,31 @@ describe('embedAndUpsertVector — best-effort guards (never throw)', () => {
       hostWith({
         mode: 'gemma',
         dims: 768,
+        profile: EMBEDDER_DIM_SPECS.gemma,
         embed: async () => {
           throw new Error('embedder down');
         },
       }),
     );
     expect(await embedAndUpsertVector('m1', 'text')).toBe(false);
+  });
+
+  it('fails closed when resolved mode/width and exact profile disagree', () => {
+    const foreignProfile = {
+      ...EMBEDDER_DIM_SPECS.openai,
+      profileId: 'foreign-openai-space@v1' as const,
+    };
+    expect(resolveMemoryVectorBinding({
+      mode: 'openai',
+      dims: foreignProfile.targetDims,
+      profile: foreignProfile,
+      embed: async () => [],
+    }).binding).toBeUndefined();
+    expect(resolveMemoryVectorBinding({
+      mode: 'openai',
+      dims: 384,
+      profile: EMBEDDER_DIM_SPECS.openai,
+      embed: async () => [],
+    }).problems).toEqual([expect.stringContaining('resolved width')]);
   });
 });

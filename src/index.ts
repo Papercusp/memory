@@ -27,8 +27,11 @@ export {
 export {
   getMemoryClient,
   getResolvedMode,
+  getResolvedProfile,
   invalidateMemoryClient,
   disposeMemoryClient,
+  embedForCurrentClient,
+  vectorSearchCanonical,
 } from './mem0-client';
 
 // Injectable fact-extraction LLM seam (mem0-extraction-via-claude-session
@@ -146,7 +149,9 @@ export {
   MEMORY_VECTOR_STORAGE_PROFILES,
   memoryStorageAcceptsProfile,
   validateMemoryStorageCompatibility,
+  resolveMemoryVectorBinding,
   type MemoryVectorStorageProfile,
+  type ResolvedMemoryVectorBinding,
   type ResolvedVecMode,
 } from './vec-write';
 
