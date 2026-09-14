@@ -132,7 +132,11 @@ export {
 } from './mem0-connection';
 
 export {
+  memoryProfileCoverageSql,
+  normalizeMemoryProfileCoverage,
   reembedMemories,
+  type MemoryProfileCoverage,
+  type ReembedOptions,
   type ReembedResult,
 } from './reembed';
 
