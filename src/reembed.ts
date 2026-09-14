@@ -66,17 +66,65 @@ interface ReembedProgress {
   errors: number;
 }
 
+/** Coverage of the target profile over the canonical rows that are visible in
+ * the source profile. `target` is deliberately bounded by `eligible`, so
+ * target-only rows cannot hide a source row that would disappear at cutover. */
+export interface MemoryProfileCoverage {
+  eligible: number;
+  source: number;
+  target: number;
+  missing: number;
+}
+
 export interface ReembedResult extends ReembedProgress {
   fromCollection: string;
   toCollection: string;
   fromProfileId: EmbeddingProfileId;
   toProfileId: EmbeddingProfileId;
+  coverage: MemoryProfileCoverage;
   durationMs: number;
+}
+
+export interface ReembedOptions {
+  progress?: (p: ReembedProgress) => void;
+  /** Optional exact identities keep the legacy mode-only API compatible while
+   * allowing migration/cutover callers to fail closed on stale profile names. */
+  fromProfileId?: EmbeddingProfileId;
+  toProfileId?: EmbeddingProfileId;
 }
 
 async function loadPgFields(): Promise<PgFields> {
   const { pgFields } = await import('./mem0-connection');
   return pgFields();
+}
+
+/** Closed-mode coverage query shared by the long-running builder and the
+ * operator's final lock-bounded cutover transaction. The source join defines
+ * eligibility: a target-only row never compensates for a source-visible row
+ * that the target profile cannot serve. */
+export function memoryProfileCoverageSql(
+  schema: string,
+  fromMode: ResolvedVecMode,
+  toMode: ResolvedVecMode,
+): string {
+  const fromTable = `${schema}.${VEC_TABLE[fromMode]}`;
+  const toTable = `${schema}.${VEC_TABLE[toMode]}`;
+  return `SELECT COUNT(*)::int AS eligible,
+                 COUNT(source.memory_id)::int AS source,
+                 COUNT(target.memory_id)::int AS target,
+                 COUNT(*) FILTER (WHERE target.memory_id IS NULL)::int AS missing
+            FROM ${schema}.memory_canonical canonical
+            JOIN ${fromTable} source ON source.memory_id = canonical.id
+       LEFT JOIN ${toTable} target ON target.memory_id = canonical.id`;
+}
+
+export function normalizeMemoryProfileCoverage(row: Record<string, unknown> | undefined): MemoryProfileCoverage {
+  return {
+    eligible: Number(row?.eligible ?? 0),
+    source: Number(row?.source ?? 0),
+    target: Number(row?.target ?? 0),
+    missing: Number(row?.missing ?? 0),
+  };
 }
 
 /**
@@ -97,7 +145,7 @@ async function loadPgFields(): Promise<PgFields> {
 export async function reembedMemories(
   fromMode: ResolvedVecMode,
   toMode: ResolvedVecMode,
-  opts: { progress?: (p: ReembedProgress) => void } = {},
+  opts: ReembedOptions = {},
 ): Promise<ReembedResult> {
   if (fromMode === toMode) {
     throw new Error('reembed_noop_same_mode');
@@ -105,6 +153,16 @@ export async function reembedMemories(
   const started = Date.now();
   const fromProfile = EMBEDDER_DIM_SPECS[fromMode];
   const toProfile = EMBEDDER_DIM_SPECS[toMode];
+  if (opts.fromProfileId !== undefined && opts.fromProfileId !== fromProfile.profileId) {
+    throw new Error(
+      `reembed_source_profile_mismatch: mode ${fromMode} resolves ${fromProfile.profileId}, got ${opts.fromProfileId}`,
+    );
+  }
+  if (opts.toProfileId !== undefined && opts.toProfileId !== toProfile.profileId) {
+    throw new Error(
+      `reembed_target_profile_mismatch: mode ${toMode} resolves ${toProfile.profileId}, got ${opts.toProfileId}`,
+    );
+  }
   const profileProblems = [
     ...validateMemoryStorageCompatibility(fromProfile, MEMORY_VECTOR_STORAGE_PROFILES[fromMode]),
     ...validateMemoryStorageCompatibility(toProfile, MEMORY_VECTOR_STORAGE_PROFILES[toMode]),
@@ -182,12 +240,17 @@ export async function reembedMemories(
       }
     }
 
+    const coverageRows = await client.query<Record<string, unknown>>(
+      memoryProfileCoverageSql(schema, fromMode, toMode),
+    );
+
     return {
       fromCollection: fromTable,
       toCollection: toTable,
       fromProfileId: fromProfile.profileId,
       toProfileId: toProfile.profileId,
       ...progress,
+      coverage: normalizeMemoryProfileCoverage(coverageRows.rows[0]),
       durationMs: Date.now() - started,
     };
   } finally {

@@ -47,6 +47,7 @@ type CapturedQuery = { sql: string; params: unknown[] };
 // (and may be told to throw to exercise the per-row catch).
 interface FakeScript {
   selectRows: Array<{ id: string; payload: Record<string, unknown> }>;
+  coverage?: { eligible: number; source: number; target: number; missing: number };
   // memory_ids for which the INSERT should throw (simulates a PG write failure)
   failInsertForIds?: Set<string>;
 }
@@ -66,6 +67,15 @@ class FakeClient {
   }
   async query(sql: string, params: unknown[] = []) {
     captured.push({ sql, params });
+    if (/COUNT\(\*\)::int AS eligible/i.test(sql)) {
+      const coverage = script.coverage ?? {
+        eligible: script.selectRows.length,
+        source: script.selectRows.length,
+        target: script.selectRows.length,
+        missing: 0,
+      };
+      return { rows: [coverage], rowCount: 1 };
+    }
     if (/^\s*SELECT/i.test(sql)) {
       return { rows: script.selectRows, rowCount: script.selectRows.length };
     }
@@ -137,6 +147,7 @@ describe('reembedMemories — happy path (GAP 5)', () => {
     expect(res.toCollection).toBe('harness_shared.memory_vec_local');
     expect(res.fromProfileId).toBe('openai-text-embedding-3-small-768@v1');
     expect(res.toProfileId).toBe('local-bge-small-en-v1.5@v1');
+    expect(res.coverage).toEqual({ eligible: 3, source: 3, target: 3, missing: 0 });
     expect(typeof res.durationMs).toBe('number');
 
     // SELECT joins the FROM vec table; INSERTs hit the TO vec table.
@@ -157,6 +168,41 @@ describe('reembedMemories — happy path (GAP 5)', () => {
 
     // The connection is always closed.
     expect(endCalls).toBe(1);
+  });
+
+  it('accepts exact source/target profile identities and reports incomplete target coverage', async () => {
+    script.selectRows = [fact('m1', 'alpha')];
+    script.coverage = { eligible: 3, source: 3, target: 2, missing: 1 };
+    configure(async () => async () => goodVec());
+
+    const res = await reembedMemories('openai', 'local', {
+      fromProfileId: 'openai-text-embedding-3-small-768@v1',
+      toProfileId: 'local-bge-small-en-v1.5@v1',
+    });
+
+    expect(res.coverage).toEqual({ eligible: 3, source: 3, target: 2, missing: 1 });
+    const coverageQuery = captured.find((q) => /AS eligible/i.test(q.sql));
+    expect(coverageQuery?.sql).toContain('JOIN harness_shared.memory_vec_openai source');
+    expect(coverageQuery?.sql).toContain('LEFT JOIN harness_shared.memory_vec_local target');
+    expect(coverageQuery?.sql).toContain('WHERE target.memory_id IS NULL');
+  });
+
+  it('fails closed on an exact profile mismatch before opening PostgreSQL', async () => {
+    configure(async () => async () => goodVec());
+
+    await expect(
+      reembedMemories('openai', 'local', {
+        fromProfileId: 'foreign-openai-space@v1',
+        toProfileId: 'local-bge-small-en-v1.5@v1',
+      }),
+    ).rejects.toThrow('reembed_source_profile_mismatch');
+    await expect(
+      reembedMemories('openai', 'local', {
+        fromProfileId: 'openai-text-embedding-3-small-768@v1',
+        toProfileId: 'foreign-local-space@v1',
+      }),
+    ).rejects.toThrow('reembed_target_profile_mismatch');
+    expect(connectCalls).toBe(0);
   });
 
   it('reads the body from payload.memory when payload.data is absent', async () => {
