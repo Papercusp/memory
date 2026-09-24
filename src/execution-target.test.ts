@@ -10,11 +10,12 @@
  *
  * So the guard has to protect the DETECTOR's honesty, in both directions:
  *
- *   1. `EMBED_REQUESTED_EXECUTION` claims the embed path pins no device/dtype.
- *      That is a claim ABOUT CODE, and the derived-truth ladder says such a claim
- *      must be pinned or it drifts. The source scan below fails the moment an
- *      embedder starts passing `device:`/`dtype:` to `pipeline()` without this
- *      constant being updated with it.
+ *   1. `embedRequestedExecution()` claims every embed path constructs through
+ *      the device selector (embed-device.ts) and pins no dtype. That is a claim
+ *      ABOUT CODE, and the derived-truth ladder says such a claim must be pinned
+ *      or it drifts. The source scan below fails the moment an embedder builds a
+ *      pipeline around the selector, or anything passes `dtype:`. (Until
+ *      2026-09-24 this pinned the opposite — that NO device was requested.)
  *
  *   2. An unmeasured probe must never render as a confident `false`. A detector
  *      that reports "no GPU bundled" from a measurement it never took recreates
@@ -33,8 +34,9 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { _resetEmbedDeviceState, applyWorkerDeviceReport } from './embed-device';
 import {
-  EMBED_REQUESTED_EXECUTION,
+  embedRequestedExecution,
   _resetEmbedExecutionProbe,
   embedExecutionHealth,
   embedExecutionTarget,
@@ -60,6 +62,11 @@ const EMBEDDER_SOURCES = [
 ] as const;
 
 const PIPELINE_CALL = "pipeline('feature-extraction'";
+
+/** The device selector — the one .ts place allowed to call pipeline() directly. */
+const SELECTOR_SOURCE = 'embed-device.ts';
+/** The worker thread's script — the hot path. */
+const WORKER_SCRIPT = 'local-embedder-worker.script.mjs';
 
 /**
  * Extract the options-object text of each `pipeline('feature-extraction', …, { … })`
@@ -98,56 +105,65 @@ describe('embed execution target — the detector the 14 latency filings lacked'
     _resetEmbedExecutionProbe();
   });
 
-  describe('EMBED_REQUESTED_EXECUTION is pinned to the embedder sources', () => {
-    const scanned = EMBEDDER_SOURCES.map((file) => ({
+  describe('every embed path constructs through the device selector (pinned to the sources)', () => {
+    // Since 2026-09-24 the embedders DO request a device (embed-device.ts, plan
+    // memory-reduction-2026-09-24 D-003). What must hold now: no embedder builds
+    // a pipeline around the selector (it would silently skip the GPU choice AND
+    // the CPU fallback), and nothing passes a dtype (only the device may move,
+    // or new vectors drift from the stored corpus).
+    const tsSources = EMBEDDER_SOURCES.map((file) => ({ file, source: readFileSync(join(SRC, file), 'utf8') }));
+    // The files that DO call pipeline('feature-extraction', …) directly: the
+    // selector itself and the worker script (the hot path — which the pre-2026-09-24
+    // version of this scan never covered at all).
+    const pipelineOwners = [SELECTOR_SOURCE, WORKER_SCRIPT].map((file) => ({
       file,
       blocks: pipelineOptionBlocks(readFileSync(join(SRC, file), 'utf8')),
     }));
 
-    it('the scan actually found a pipeline call in every embedder (positive control)', () => {
-      // If this fails, every "no device requested" assertion below is vacuous —
-      // the instrument matched nothing, which reads identically to a clean bill.
-      for (const { file, blocks } of scanned) {
-        expect(blocks.length, `${file} — no pipeline('feature-extraction', …) options block found`).toBeGreaterThan(0);
+    it('every embedder constructs through constructEmbedPipeline (positive control for coverage)', () => {
+      for (const { file, source } of tsSources) {
+        expect(source, `${file} — no constructEmbedPipeline( call found`).toContain('constructEmbedPipeline(');
       }
     });
 
-    it('the scan can see inside those blocks (positive control)', () => {
-      // `session_options` is passed by every one of these call sites. If the
-      // brace-matcher regressed to returning empty or wrong slices, this catches
-      // it before the device/dtype assertions can report a false absence.
-      for (const { file, blocks } of scanned) {
+    it('no embedder calls pipeline(\'feature-extraction\') around the selector', () => {
+      const offenders = tsSources.filter(({ source }) => source.includes(PIPELINE_CALL)).map(({ file }) => file);
+      expect(
+        offenders,
+        `${offenders.join(', ')} build a pipeline directly — route it through constructEmbedPipeline so the ` +
+          'device choice, the CPU fallback and /healthz all see it.',
+      ).toEqual([]);
+    });
+
+    it('the scan found and can see inside the selector + worker pipeline calls (positive control)', () => {
+      // If this fails, every device/dtype assertion below is vacuous — the
+      // instrument matched nothing, which reads identically to a clean bill.
+      for (const { file, blocks } of pipelineOwners) {
+        expect(blocks.length, `${file} — no pipeline('feature-extraction', …) options block found`).toBeGreaterThan(0);
         for (const block of blocks) {
-          expect(block, `${file} — extracted block does not contain the known session_options key`).toContain(
-            'session_options',
-          );
+          expect(block, `${file} — extracted block lacks the known session_options key`).toContain('session_options');
         }
       }
     });
 
-    it('no embedder pins a device, matching EMBED_REQUESTED_EXECUTION.device === null', () => {
-      const offenders = scanned
-        .filter(({ blocks }) => blocks.some((b) => /(^|[^\w])device\s*:/.test(b)))
-        .map(({ file }) => file);
-      expect(
-        offenders,
-        `${offenders.join(', ')} now pass a device to pipeline(). That is a real change to how embeds ` +
-          'execute — update EMBED_REQUESTED_EXECUTION.device (and embedExecutionTarget) to report it, ' +
-          'rather than leaving /healthz claiming no device is requested.',
-      ).toEqual([]);
-      expect(EMBED_REQUESTED_EXECUTION.device).toBeNull();
+    it('the selector and the worker pass a device on every pipeline call', () => {
+      for (const { file, blocks } of pipelineOwners) {
+        for (const block of blocks) {
+          expect(/(^|[^\w])device\s*:/.test(block), `${file} — a pipeline call passes no device: ${block}`).toBe(true);
+        }
+      }
     });
 
-    it('no embedder pins a dtype, matching EMBED_REQUESTED_EXECUTION.dtype === null', () => {
-      const offenders = scanned
+    it('nothing pins a dtype, matching embedRequestedExecution().dtype === null', () => {
+      const offenders = pipelineOwners
         .filter(({ blocks }) => blocks.some((b) => /(^|[^\w])dtype\s*:/.test(b)))
         .map(({ file }) => file);
       expect(
         offenders,
-        `${offenders.join(', ')} now pass a dtype to pipeline(). Update EMBED_REQUESTED_EXECUTION.dtype ` +
-          'so /healthz reports the weight format actually in use.',
+        `${offenders.join(', ')} now pass a dtype to pipeline(). Stored vectors come from the default ` +
+          'weights; a different weight format drifts every new vector from the corpus.',
       ).toEqual([]);
-      expect(EMBED_REQUESTED_EXECUTION.dtype).toBeNull();
+      expect(embedRequestedExecution().dtype).toBeNull();
     });
   });
 
@@ -165,14 +181,23 @@ describe('embed execution target — the detector the 14 latency filings lacked'
       expect(embedProviderLibraries()).toBeNull();
     });
 
-    it('says so in `why` rather than implying the question was settled', () => {
-      expect(embedExecutionTarget().why).toContain('UNKNOWN');
+    it('before any pipeline constructs, reports the requested device as UNVERIFIED', () => {
+      // A GPU choice can still fall back at construction, so the device the
+      // next pipeline will try must not read as a measurement.
+      _resetEmbedDeviceState();
+      const target = embedExecutionTarget();
+      expect(target.verified).toBe(false);
+      expect(target.device).toBe(embedRequestedExecution().device);
+      expect(target.why).toContain('unverified');
     });
 
-    it('still reports the CPU target, because that part needs no probe', () => {
-      // The root cause — nothing requests a device — is static and always
-      // knowable, so the detector is useful even with the probe unresolved.
-      expect(embedExecutionTarget().device).toBe('cpu');
+    it('after a pipeline constructs, reports what actually ran as verified', () => {
+      _resetEmbedDeviceState();
+      applyWorkerDeviceReport({ kind: 'device', model: 'm', device: 'cpu', demotion: null });
+      const target = embedExecutionTarget();
+      expect(target).toMatchObject({ device: 'cpu', verified: true });
+      expect(embedExecutionHealth().pipelines).toEqual({ m: 'cpu' });
+      _resetEmbedDeviceState();
     });
   });
 
