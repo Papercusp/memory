@@ -31,15 +31,18 @@ import {
   currentEmbedDeviceDecision,
   decideEmbedDevice,
   embedDeviceDemotion,
+  embedDeviceSetting,
   embedPipelineDevices,
   nvidiaDriverPresent,
+  parseEmbedDevicePreference,
   resolveEmbedDevicePreference,
+  setEmbedDeviceSetting,
   type EmbedDeviceSelection,
 } from './embed-device';
 
 const SRC = dirname(fileURLToPath(import.meta.url));
 const CUDA_LIBS = ['libonnxruntime_providers_cuda.so', 'libonnxruntime_providers_shared.so'];
-const AUTO: EmbedDeviceSelection = { preference: 'auto', source: 'default', invalidValue: null };
+const AUTO: EmbedDeviceSelection = { preference: 'auto', source: 'default', invalidValue: null, setting: null };
 
 describe('resolveEmbedDevicePreference — PAPERCUSP_EMBED_DEVICE', () => {
   it('defaults to auto when unset', () => {
@@ -59,7 +62,115 @@ describe('resolveEmbedDevicePreference — PAPERCUSP_EMBED_DEVICE', () => {
       preference: 'auto',
       source: 'env-invalid',
       invalidValue: 'cdua',
+      setting: null,
     });
+  });
+});
+
+describe('the Settings choice vs PAPERCUSP_EMBED_DEVICE (plan D-008)', () => {
+  beforeEach(() => _resetEmbedDeviceState());
+  afterEach(() => _resetEmbedDeviceState());
+
+  it('the setting applies when the env is unset', () => {
+    expect(resolveEmbedDevicePreference({}, 'cpu')).toEqual({
+      preference: 'cpu',
+      source: 'setting',
+      invalidValue: null,
+      setting: 'cpu',
+    });
+  });
+
+  it('env=auto defers to the setting — an explicit auto is not a host override', () => {
+    const s = resolveEmbedDevicePreference({ [EMBED_DEVICE_ENV]: 'auto' }, 'cuda');
+    expect(s.preference).toBe('cuda');
+    expect(s.source).toBe('setting');
+  });
+
+  it('a CONCRETE env device outranks the setting, which stays visible', () => {
+    // How one host (a headless verify instance) is pinned without touching the shared row.
+    expect(resolveEmbedDevicePreference({ [EMBED_DEVICE_ENV]: 'cpu' }, 'cuda')).toEqual({
+      preference: 'cpu',
+      source: 'env',
+      invalidValue: null,
+      setting: 'cuda',
+    });
+    expect(resolveEmbedDevicePreference({ [EMBED_DEVICE_ENV]: 'gpu' }, 'cpu').preference).toBe('cuda');
+  });
+
+  it('an unrecognised env value is ignored in favour of the setting, but still reported', () => {
+    expect(resolveEmbedDevicePreference({ [EMBED_DEVICE_ENV]: 'cdua' }, 'cpu')).toEqual({
+      preference: 'cpu',
+      source: 'setting',
+      invalidValue: 'cdua',
+      setting: 'cpu',
+    });
+  });
+
+  it('parseEmbedDevicePreference: gpu is the user word for cuda; junk is null, never a throw', () => {
+    expect(parseEmbedDevicePreference('GPU')).toBe('cuda');
+    expect(parseEmbedDevicePreference(' cpu ')).toBe('cpu');
+    expect(parseEmbedDevicePreference('auto')).toBe('auto');
+    expect(parseEmbedDevicePreference('tpu')).toBeNull();
+    expect(parseEmbedDevicePreference(undefined)).toBeNull();
+    expect(parseEmbedDevicePreference(3)).toBeNull();
+  });
+
+  it('setEmbedDeviceSetting reports a change only when the EFFECTIVE preference moves', () => {
+    expect(setEmbedDeviceSetting('cpu', {}).changed).toBe(true);
+    expect(embedDeviceSetting()).toBe('cpu');
+    expect(setEmbedDeviceSetting('cpu', {}).changed).toBe(false);
+    // Env pins cpu: moving the setting cpu → gpu changes nothing effective.
+    expect(setEmbedDeviceSetting('cuda', { [EMBED_DEVICE_ENV]: 'cpu' }).changed).toBe(false);
+    expect(embedDeviceSetting()).toBe('cuda');
+    expect(setEmbedDeviceSetting(null, {}).changed).toBe(true); // cuda → auto
+  });
+
+  it('a change clears the demotion and the per-model record (the user asked for a retry)', () => {
+    applyWorkerDeviceReport({
+      kind: 'device',
+      model: 'm',
+      device: 'cpu',
+      demotion: { from: 'cuda', stage: 'construct', cause: 'no cudnn' },
+    });
+    expect(embedDeviceDemotion()).not.toBeNull();
+    setEmbedDeviceSetting('cpu', {});
+    expect(embedDeviceDemotion()).toBeNull();
+    expect(embedPipelineDevices()).toEqual({});
+  });
+
+  it('a no-op set keeps the demotion (nothing about the host changed)', () => {
+    applyWorkerDeviceReport({
+      kind: 'device',
+      model: 'm',
+      device: 'cpu',
+      demotion: { from: 'cuda', stage: 'construct', cause: 'no cudnn' },
+    });
+    setEmbedDeviceSetting('auto', {}); // auto → auto
+    expect(embedDeviceDemotion()).not.toBeNull();
+  });
+
+  it('the why names the layer that decided', () => {
+    const fromSetting = decideEmbedDevice({
+      selection: resolveEmbedDevicePreference({}, 'cpu'),
+      providerLibraries: CUDA_LIBS,
+      nvidiaDriver: true,
+      demotion: null,
+    });
+    expect(fromSetting).toEqual({ device: 'cpu', why: 'the Settings choice (CPU) forces the CPU' });
+    const fromEnv = decideEmbedDevice({
+      selection: resolveEmbedDevicePreference({ [EMBED_DEVICE_ENV]: 'cpu' }, 'cuda'),
+      providerLibraries: CUDA_LIBS,
+      nvidiaDriver: true,
+      demotion: null,
+    });
+    expect(fromEnv.why).toMatch(/PAPERCUSP_EMBED_DEVICE=cpu \(a host override, which outranks the Settings choice\)/);
+  });
+
+  it('currentEmbedDeviceDecision reads the held setting', () => {
+    setEmbedDeviceSetting('cpu', {});
+    const d = currentEmbedDeviceDecision({});
+    expect(d.device).toBe('cpu');
+    expect(d.selection.source).toBe('setting');
   });
 });
 
@@ -96,13 +207,13 @@ describe('decideEmbedDevice — auto only picks a GPU the host could use', () =>
   });
 
   it('forced cpu wins over everything', () => {
-    const d = decide({ selection: { preference: 'cpu', source: 'env', invalidValue: null } });
+    const d = decide({ selection: { preference: 'cpu', source: 'env', invalidValue: null, setting: null } });
     expect(d.device).toBe('cpu');
   });
 
   it('forced gpu is honoured even without a provider on disk (construction is the proof)', () => {
     const d = decide({
-      selection: { preference: 'cuda', source: 'env', invalidValue: null },
+      selection: { preference: 'cuda', source: 'env', invalidValue: null, setting: null },
       providerLibraries: [],
       nvidiaDriver: false,
     });
@@ -111,7 +222,7 @@ describe('decideEmbedDevice — auto only picks a GPU the host could use', () =>
 
   it('a recorded demotion forces cpu for the rest of the process, and names the cause', () => {
     const d = decide({
-      selection: { preference: 'cuda', source: 'env', invalidValue: null },
+      selection: { preference: 'cuda', source: 'env', invalidValue: null, setting: null },
       demotion: { from: 'cuda', to: 'cpu', model: 'm', stage: 'construct', cause: 'libcudnn.so.9 missing', at: 'x' },
     });
     expect(d.device).toBe('cpu');

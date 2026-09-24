@@ -307,6 +307,44 @@ describe('local-embedder-worker (WI-37683: holds the loop while a request is in 
       .toEqual({ pending: false, keepAlive: false });
   }, 30_000);
 
+  it('recycleEmbedWorker drains the in-flight request, holds new ones, then restarts (plan D-008 live device change)', async () => {
+    const mod = await import('./local-embedder-worker');
+    await mod.embedViaWorker('warm').catch(() => { /* protocol may throw */ });
+
+    const outcome = (p: Promise<number[]>) => p.then(() => 'answered', (e: Error) => `rejected: ${e.message}`);
+    const inflight = outcome(mod.embedViaWorker('in-flight'));
+    for (let i = 0; i < 50 && mod.getWorkerState().pendingCount === 0; i++) await Promise.resolve();
+    expect(mod.getWorkerState().pendingCount).toBe(1);
+
+    const recycle = mod.recycleEmbedWorker();
+    expect(mod.getWorkerState().recycling).toBe(true);
+    // Concurrent recycles share one drain.
+    expect(mod.recycleEmbedWorker()).toBe(recycle);
+
+    // A request arriving mid-recycle must wait, not land on the old worker.
+    const late = outcome(mod.embedViaWorker('late'));
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+    expect(mod.getWorkerState().pendingCount).toBe(1);
+
+    await recycle;
+    // The in-flight request was ANSWERED by the old worker (a vector, or the
+    // worker's own embed error) — never the teardown rejection `_resetWorker`
+    // gives a request it cuts off. That rejection is the control: an
+    // implementation that terminates without draining produces exactly it.
+    expect(await inflight).not.toMatch(/shut down while|exited with code/);
+    expect(mod.getWorkerState().recycling).toBe(false);
+
+    expect(await late).not.toMatch(/shut down while|exited with code/);
+    expect(mod.getWorkerState().alive).toBe(true);
+  }, 60_000);
+
+  it('recycleEmbedWorker with no worker running is a no-op (the next spawn reads the new device)', async () => {
+    const mod = await import('./local-embedder-worker');
+    await mod._resetWorker();
+    await mod.recycleEmbedWorker();
+    expect(mod.getWorkerState()).toMatchObject({ alive: false, recycling: false });
+  });
+
   it('does not tear the worker down from beforeExit while a request is pending', async () => {
     const mod = await import('./local-embedder-worker');
     await mod.embedViaWorker('warm').catch(() => { /* */ });

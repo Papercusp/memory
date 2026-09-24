@@ -584,12 +584,15 @@ export function getWorkerState(): {
    * rather than inferred.
    */
   keepAlive: boolean;
+  /** A device-change recycle is draining the worker; new embeds are waiting on it. */
+  recycling: boolean;
 } {
   return {
     alive: state.worker !== null,
     disabled: state.workerDisabled,
     pendingCount: state.pending.size,
     keepAlive: state.refd,
+    recycling: state.recycling !== null,
   };
 }
 
