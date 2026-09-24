@@ -54,6 +54,7 @@ import { embedViaWorker, getWorkerState, ORT_SESSION_OPTIONS, warnEmbedFallback 
 import { mrlTruncate } from './gemma-embedder';
 import { CANDIDATE_DIM_SPECS } from './embedder-dims';
 import { dynamicImport } from './dynamic-import';
+import { constructEmbedPipeline } from './embed-device';
 
 /** The two R2 multilingual sizes under evaluation. */
 export type GraniteVariant = '97m' | '311m';
@@ -124,9 +125,7 @@ export function buildGraniteEmbedder(opts: {
     // Inline (main-thread) fallback — same thread-cap rationale as the worker.
     if (!pipelinePromise) {
       const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
-      pipelinePromise = transformers.pipeline('feature-extraction', model, {
-        session_options: ORT_SESSION_OPTIONS,
-      });
+      pipelinePromise = constructEmbedPipeline(transformers, model, ORT_SESSION_OPTIONS);
     }
     const pipe = await pipelinePromise;
     const result = await pipe(text, { pooling: 'cls', normalize: false });

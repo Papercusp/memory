@@ -42,6 +42,7 @@ import { embedViaWorker, getWorkerState, ORT_SESSION_OPTIONS, warnEmbedFallback 
 import { mrlTruncate } from './gemma-embedder';
 import { CANDIDATE_DIM_SPECS } from './embedder-dims';
 import { dynamicImport } from './dynamic-import';
+import { constructEmbedPipeline } from './embed-device';
 
 /** Transformers.js/ONNX build of Qwen/Qwen3-Embedding-0.6B. */
 export const QWEN3_MODEL = 'onnx-community/Qwen3-Embedding-0.6B-ONNX';
@@ -104,9 +105,7 @@ export function buildQwen3Embedder(opts: {
     // Inline (main-thread) fallback — same thread-cap rationale as the worker.
     if (!pipelinePromise) {
       const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
-      pipelinePromise = transformers.pipeline('feature-extraction', QWEN3_MODEL, {
-        session_options: ORT_SESSION_OPTIONS,
-      });
+      pipelinePromise = constructEmbedPipeline(transformers, QWEN3_MODEL, ORT_SESSION_OPTIONS);
     }
     const pipe = await pipelinePromise;
     const result = await pipe(prompted, { pooling: 'last_token', normalize: false });

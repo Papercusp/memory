@@ -173,7 +173,7 @@ export {
 // scheduler for a cause that lived in the execution target.
 export {
   EMBED_ORT_PACKAGE,
-  EMBED_REQUESTED_EXECUTION,
+  embedRequestedExecution,
   embedExecutionHealth,
   embedExecutionTarget,
   embedGpuProviderAvailable,
@@ -183,7 +183,25 @@ export {
   type EmbedExecutionHealth,
   type EmbedExecutionProbe,
   type EmbedExecutionTarget,
+  type EmbedRequestedExecution,
 } from './execution-target';
+
+// Which device the embedders run on (PAPERCUSP_EMBED_DEVICE auto|gpu|cpu), with
+// a verified-by-construction GPU choice and a recorded CPU fallback.
+export {
+  EMBED_DEVICE_ENV,
+  constructEmbedPipeline,
+  currentEmbedDeviceDecision,
+  decideEmbedDevice,
+  embedDeviceDemotion,
+  embedPipelineDevices,
+  resolveEmbedDevicePreference,
+  type EmbedDevice,
+  type EmbedDeviceDecision,
+  type EmbedDeviceDemotion,
+  type EmbedDevicePreference,
+  type EmbedDeviceSelection,
+} from './embed-device';
 
 export {
   buildGemmaEmbedder,

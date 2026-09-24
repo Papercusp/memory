@@ -48,42 +48,45 @@
  * told the next reader "no GPU here" on a working GPU box, which is exactly the
  * class of confidently-wrong detector this module exists to replace.
  *
- * What this module reports instead, at three honest confidence levels:
+ * What this module reports instead:
  *
- *   1. **The embed path requests no device.** Static, always knowable, and the
- *      actual root cause. `EMBED_REQUESTED_EXECUTION` states it, and
- *      `execution-target.test.ts` PINS it against the embedder sources.
- *   2. **Which provider libraries are present on disk.** The actionable
- *      availability signal (`providerLibraries` / `gpuProviderAvailable`) —
- *      this is what actually changed between the two trees above.
- *   3. **What ships by default.** `defaultBundledBackends`, kept because it
+ *   1. **What the embed path requests.** Until 2026-09-24 that was NO device —
+ *      the root cause above. Since then `embed-device.ts` chooses one
+ *      (`PAPERCUSP_EMBED_DEVICE` auto|gpu|cpu, plan memory-reduction-2026-09-24
+ *      D-003) and every embedder constructs through it; `execution-target.test.ts`
+ *      PINS that against the embedder sources, the worker script included.
+ *   2. **What actually constructed.** `active` / `pipelines` / `demotion` come
+ *      from real session construction (a GPU that will not build falls back to
+ *      the CPU with its cause recorded). Before any pipeline exists, `active`
+ *      carries `verified: false` — the device the next one will TRY.
+ *   3. **Which provider libraries are present on disk.** The availability
+ *      signal (`providerLibraries` / `gpuProviderAvailable`).
+ *   4. **What ships by default.** `defaultBundledBackends`, kept because it
  *      explains WHY a provider is absent (nobody passed the install flag), but
  *      explicitly named so it can never again be read as availability.
- *
- * None of the three proves a GPU session would CONSTRUCT. Only constructing one
- * proves that, which is precisely what `@papercusp/rerank`'s `demoted` /
- * `demotionCause` pair reports — and on this host it reports
- * `demoted: true, cause: "OrtSessionOptionsAppendExecutionProvider_Cuda: Failed
- * to load shared library"`, the observable that started this correction.
  *
  * An unresolved probe reports `null` everywhere — never a convenient `false`.
  * UNKNOWN is in-band and asserted by test.
  *
- * This module reports; it does not choose. Moving the embedders onto a GPU stays
- * an infrastructure decision (shared `node_modules` under ~100 live agents, and a
- * GPU already ~88% utilized by another workload).
+ * This module reports; `embed-device.ts` chooses.
  */
-
-import { createRequire } from 'node:module';
-import { readdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
 
 import { pinModuleState } from '@papercusp/module-singleton';
 import { dynamicImport } from './dynamic-import';
+import {
+  EMBED_ORT_PACKAGE,
+  currentEmbedDeviceDecision,
+  embedDeviceDemotion,
+  embedPipelineDevices,
+  nvidiaDriverPresent,
+  scanEmbedProviderLibraries,
+  type EmbedDevice,
+  type EmbedDeviceDemotion,
+  type EmbedDeviceSelection,
+} from './embed-device';
 import { ORT_SESSION_OPTIONS } from './local-embedder-worker';
 
-/** The ONNX Runtime binding transformers.js uses under Node. */
-export const EMBED_ORT_PACKAGE = 'onnxruntime-node';
+export { EMBED_ORT_PACKAGE };
 
 /**
  * One entry of `onnxruntime-node`'s `listSupportedBackends()`.
@@ -95,10 +98,28 @@ export type EmbedBackend = { name: string; bundled: boolean };
 
 /** The (device, dtype) pair the embedders actually run on, and the basis for it. */
 export type EmbedExecutionTarget = {
+  /** `cpu` | `cuda`, or `mixed` when models constructed on different devices. */
   device: string;
   /** `null` = no dtype is pinned, so the transformers.js default applies. */
   dtype: string | null;
+  /**
+   * `true` once a pipeline has actually CONSTRUCTED on `device` in this
+   * process. `false` = no pipeline exists yet, so `device` is only what the next
+   * one will try (a GPU choice can still fall back to the CPU at construction).
+   */
+  verified: boolean;
   /** What evidence supports `device` — read this before quoting the field. */
+  why: string;
+};
+
+/** What the embed path asks for, and why. */
+export type EmbedRequestedExecution = {
+  device: EmbedDevice;
+  /** Always `null`: only the device may move (the vector-space invariant in embed-device.ts). */
+  dtype: null;
+  preference: EmbedDeviceSelection['preference'];
+  source: EmbedDeviceSelection['source'];
+  invalidValue: string | null;
   why: string;
 };
 
@@ -106,13 +127,16 @@ export type EmbedExecutionTarget = {
 export type EmbedExecutionProbe = 'pending' | 'ok' | 'failed';
 
 export type EmbedExecutionHealth = {
-  /**
-   * What the embed path ASKS FOR. Both `null` is the finding, not a placeholder:
-   * no embedder passes `device` or `dtype` to `pipeline()`, only `session_options`.
-   */
-  requested: { device: string | null; dtype: string | null };
-  /** What it therefore runs on. */
+  /** What the embed path ASKS FOR (PAPERCUSP_EMBED_DEVICE + host checks + any demotion). */
+  requested: EmbedRequestedExecution;
+  /** What it actually runs on — see `verified`. */
   active: EmbedExecutionTarget;
+  /** model id → the device its pipeline constructed on, in this process. */
+  pipelines: Record<string, EmbedDevice>;
+  /** The GPU→CPU fallback, if one happened in this process; `null` = none. */
+  demotion: EmbedDeviceDemotion | null;
+  /** NVIDIA kernel driver loaded? `null` = no cheap probe on this platform. */
+  nvidiaDriverPresent: boolean | null;
   /**
    * Execution-provider shared libraries actually present next to the binding
    * (bare filenames). THIS is the availability signal — it is what differed
@@ -154,14 +178,22 @@ export type EmbedExecutionHealth = {
 };
 
 /**
- * The device/dtype the embed path requests. PINNED by
- * `execution-target.test.ts` against the embedder sources, so it cannot drift
- * into a lie the way a hand-maintained `exists:` boolean does.
+ * The device/dtype the embed path requests right now. Every embedder constructs
+ * through `constructEmbedPipeline` (or, in the worker, the device handed over
+ * from `currentEmbedDeviceDecision`) — PINNED by `execution-target.test.ts`
+ * against the embedder sources, so this cannot drift into a lie.
  */
-export const EMBED_REQUESTED_EXECUTION: { device: string | null; dtype: string | null } = {
-  device: null,
-  dtype: null,
-};
+export function embedRequestedExecution(): EmbedRequestedExecution {
+  const d = currentEmbedDeviceDecision();
+  return {
+    device: d.device,
+    dtype: null,
+    preference: d.selection.preference,
+    source: d.selection.source,
+    invalidValue: d.selection.invalidValue,
+    why: d.why,
+  };
+}
 
 /** Provider-library basenames that indicate a non-CPU execution path. */
 const GPU_PROVIDER_LIB_PATTERN = /^libonnxruntime_providers_(cuda|tensorrt|rocm|migraphx|dml)\./i;
@@ -206,28 +238,6 @@ function normalizeBackends(raw: unknown): EmbedBackend[] {
 }
 
 /**
- * List the execution-provider shared libraries sitting next to the resolved
- * binding. Returns null when the location cannot be resolved — a failure to
- * MEASURE, never an assertion that none exist.
- */
-function scanProviderLibraries(): string[] | null {
-  try {
-    const req = createRequire(import.meta.url);
-    // onnxruntime-node's entry resolves inside dist/; the binaries live at
-    // <pkg>/bin/napi-v6/<platform>/<arch>/. Walk up from the entry to the
-    // package root rather than hardcoding the dist layout.
-    const entry = req.resolve(EMBED_ORT_PACKAGE);
-    const pkgRoot = dirname(dirname(entry));
-    const binRoot = join(pkgRoot, 'bin', 'napi-v6', process.platform, process.arch);
-    return readdirSync(binRoot)
-      .filter((f) => f.startsWith('libonnxruntime_providers_'))
-      .sort();
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Resolve the runtime execution-provider facts once per process and cache them.
  * Idempotent, concurrency-safe, and never throws: a failure is recorded as
  * `probe:'failed'` with `probeError` so `/healthz` can say the measurement did
@@ -245,7 +255,7 @@ export function ensureEmbedBackendsProbed(): Promise<void> {
         throw new Error(`${EMBED_ORT_PACKAGE} exposes no listSupportedBackends()`);
       }
       state.defaultBundledBackends = normalizeBackends(list.call(holder));
-      state.providerLibraries = scanProviderLibraries();
+      state.providerLibraries = scanEmbedProviderLibraries();
       state.probeError = null;
       state.probe = 'ok';
     } catch (e) {
@@ -279,41 +289,33 @@ export function embedGpuProviderAvailable(): boolean | null {
 /**
  * The (device, dtype) pair the embedders are running on.
  *
- * `device` is `cpu` in every branch — because nothing requests otherwise, and
- * transformers.js defaults to CPU under Node — so what varies is `why`, i.e.
- * how well-evidenced that answer is. Read it before quoting the pair.
+ * Answered from real session construction when any pipeline exists in this
+ * process (`verified: true`); before that it is the device the next pipeline
+ * will TRY (`verified: false`). Read `why` before quoting the pair.
  */
 export function embedExecutionTarget(): EmbedExecutionTarget {
-  const gpu = embedGpuProviderAvailable();
-  const base = 'the embed path requests no device, so transformers.js applies its CPU default';
-  const dtype = EMBED_REQUESTED_EXECUTION.dtype;
-  if (gpu === null) {
+  const requested = embedRequestedExecution();
+  const pipelines = embedPipelineDevices();
+  const models = Object.keys(pipelines).sort();
+  const dtype = requested.dtype;
+  if (models.length === 0) {
     return {
-      device: 'cpu',
+      device: requested.device,
       dtype,
-      why: `${base}; the provider-library probe has not resolved, so whether a GPU provider is installed is UNKNOWN`,
-    };
-  }
-  if (!gpu) {
-    return {
-      device: 'cpu',
-      dtype,
+      verified: false,
       why:
-        `${base}; no GPU execution-provider library is installed beside the onnxruntime binding, so no other ` +
-        'device is reachable without reinstalling onnxruntime-node with a provider (e.g. ONNXRUNTIME_NODE_INSTALL_CUDA)',
+        `${requested.why}. No embed pipeline has been constructed in this process yet, so this is the device ` +
+        'the next one will try — unverified until it constructs',
     };
   }
-  return {
-    device: 'cpu',
-    dtype,
-    // Deliberately hedged: a provider library on disk can still fail to LOAD
-    // (missing CUDA/cuDNN runtime, ABI mismatch). Only constructing a session
-    // proves usability — see rerank's demoted/demotionCause pair.
-    why:
-      `${base}. A GPU execution-provider library IS installed (${embedProviderLibraries()?.join(', ')}), so the CPU ` +
-      'target is by omission rather than a hardware limit — but an installed provider can still fail to load, and ' +
-      'only constructing a session proves otherwise',
-  };
+  const devices = [...new Set(models.map((m) => pipelines[m]))];
+  const byModel = models.map((m) => `${m}=${pipelines[m]}`).join(', ');
+  const demotion = embedDeviceDemotion();
+  const device = devices.length === 1 ? devices[0] : 'mixed';
+  const why = demotion
+    ? `constructed: ${byModel}. DEMOTED from ${demotion.from} for ${demotion.model} (${demotion.stage}): ${demotion.cause}`
+    : `constructed: ${byModel}. ${requested.why}`;
+  return { device, dtype, verified: true, why };
 }
 
 /**
@@ -324,8 +326,11 @@ export function embedExecutionTarget(): EmbedExecutionTarget {
  */
 export function embedExecutionHealth(): EmbedExecutionHealth {
   return {
-    requested: { ...EMBED_REQUESTED_EXECUTION },
+    requested: embedRequestedExecution(),
     active: embedExecutionTarget(),
+    pipelines: embedPipelineDevices(),
+    demotion: embedDeviceDemotion(),
+    nvidiaDriverPresent: nvidiaDriverPresent(),
     providerLibraries: embedProviderLibraries(),
     gpuProviderAvailable: embedGpuProviderAvailable(),
     defaultBundledBackends: state.defaultBundledBackends

@@ -73,6 +73,7 @@ import {
 } from './local-embedder-worker';
 import { EMBEDDER_DIM_SPECS } from './embedder-dims';
 import { dynamicImport } from './dynamic-import';
+import { constructEmbedPipeline } from './embed-device';
 
 /** Transformers.js/ONNX build of EmbeddingGemma-300m. */
 export const GEMMA_MODEL = 'onnx-community/embeddinggemma-300m-ONNX';
@@ -178,9 +179,7 @@ export function buildGemmaEmbedder(opts: {
         await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE),
       );
       // Same thread-cap rationale as the worker path (WI-3792 spin-pool storm).
-      pipelinePromise = transformers.pipeline('feature-extraction', GEMMA_MODEL, {
-        session_options: ORT_SESSION_OPTIONS,
-      });
+      pipelinePromise = constructEmbedPipeline(transformers, GEMMA_MODEL, ORT_SESSION_OPTIONS);
     }
     const pipe = await pipelinePromise;
     const result = await pipe(prompted, { pooling: 'mean', normalize: false });

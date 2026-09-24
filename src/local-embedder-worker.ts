@@ -26,6 +26,7 @@ import { availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname, isAbsolute, join } from 'node:path';
 import { dynamicImport } from './dynamic-import';
+import { applyWorkerDeviceReport, constructEmbedPipeline, currentEmbedDeviceDecision } from './embed-device';
 
 interface PendingRequest {
   resolve: (v: number[]) => void;
@@ -257,6 +258,12 @@ function ensureWorker(): Promise<void> {
       state.worker = new Worker(workerPath(), {
         // execArgv passthrough is fine — the script is plain JS,
         // no ts-node loader needed.
+        //
+        // The DEVICE is decided here, not in the worker (which is copied into
+        // bundles as one file and cannot import embed-device.ts). A respawn
+        // after a crash re-reads the decision, so it inherits any demotion the
+        // previous worker reported instead of re-trying a GPU that failed.
+        workerData: { device: currentEmbedDeviceDecision().device },
       });
     } catch (err) {
       state.workerDisabled = true;
@@ -287,6 +294,12 @@ function ensureWorker(): Promise<void> {
         syncWorkerRef();
         installBeforeExitHook();
         resolveReady();
+        return;
+      }
+      // What a pipeline ACTUALLY constructed on (and any GPU→CPU fallback), so
+      // /healthz reports the device in use rather than the one requested.
+      if (msg.kind === 'device') {
+        applyWorkerDeviceReport(msg);
         return;
       }
       if (typeof msg.id !== 'number') return;
@@ -694,9 +707,7 @@ export async function buildLocalEmbedder(): Promise<(text: string) => Promise<nu
       const transformers = applyTransformersRuntimePolicy(
         await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE),
       );
-      pipelinePromise = transformers.pipeline('feature-extraction', LOCAL_EMBEDDER_MODEL, {
-        session_options: ORT_SESSION_OPTIONS,
-      });
+      pipelinePromise = constructEmbedPipeline(transformers, LOCAL_EMBEDDER_MODEL, ORT_SESSION_OPTIONS);
     }
     const pipe = await pipelinePromise;
     const result = await pipe(text, { pooling: 'mean', normalize: true });

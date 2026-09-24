@@ -43,6 +43,7 @@ import {
 import { mrlTruncate } from './gemma-embedder';
 import { EMBEDDER_DIM_SPECS } from './embedder-dims';
 import { dynamicImport } from './dynamic-import';
+import { constructEmbedPipeline } from './embed-device';
 
 /** Transformers.js/ONNX build of microsoft/harrier-oss-v1-0.6b. */
 export const HARRIER_MODEL = 'onnx-community/harrier-oss-v1-0.6b-ONNX';
@@ -140,9 +141,7 @@ export function buildHarrierEmbedder(opts: {
       const transformers = applyTransformersRuntimePolicy(
         await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE),
       );
-      pipelinePromise = transformers.pipeline('feature-extraction', HARRIER_MODEL, {
-        session_options: ORT_SESSION_OPTIONS,
-      });
+      pipelinePromise = constructEmbedPipeline(transformers, HARRIER_MODEL, ORT_SESSION_OPTIONS);
     }
     const pipe = await pipelinePromise;
     const enc = pipe.tokenizer(prompted, { padding: true, truncation: true });

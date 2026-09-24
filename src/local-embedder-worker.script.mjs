@@ -16,7 +16,7 @@
  * Next.js's TypeScript transform.
  */
 
-import { parentPort } from 'node:worker_threads';
+import { parentPort, workerData } from 'node:worker_threads';
 import { availableParallelism } from 'node:os';
 
 const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
@@ -40,29 +40,14 @@ function hostParallelism() {
 // stutter (WI-3792, 2026-07-10 — the EmbeddingGemma-default rollout day).
 // Embeds are single-request, latency-tolerant background work: cap the pool.
 //
-// GPU (CUDA) IS DELIBERATELY OUT OF SCOPE — this is CPU-only ON PURPOSE, not
-// an oversight (EI-19363236885307403, 2026-08-02). `onnxruntime-node` ships
-// libonnxruntime_providers_cuda.so, which makes CUDA LOOK available even on
-// this host's idle RTX 3090 — but loading it fails at pipeline-construction
-// time (not at import, not in `nvidia-smi`) on `libcudnn.so.9: cannot open
-// shared object file`: cuDNN 9 is not installed, and Ubuntu's `nvidia-cudnn`
-// apt package only offers cuDNN **8**, so apt cannot close the gap at all.
-// A real cuDNN 9 IS available with no apt/driver involvement at all — the
-// `nvidia-cudnn-cu12` PyPI wheel ships libcudnn.so.9 as plain userspace .so
-// files (no dkms, no kernel module, no risk to the host's live display
-// session) — but wiring that in for real needs: (1) installing + pointing
-// LD_LIBRARY_PATH at it for every process context that spawns this worker
-// (main host, every sidecar, cluster workers — not just this file), (2) a
-// `device:'cuda'` opt-in here with a try/catch fallback to the CPU path
-// above so a host without cuDNN 9 still works, and (3) a thread/session
-// guard for the CUDA provider analogous to the CPU one above so a shared,
-// multi-process host doesn't repeat the WI-3792 failure mode against GPU
-// memory/contexts instead of CPU threads. That is real infra work across a
-// shared production host, not a one-line flag flip — it was deliberately
-// NOT done inside this fix. If the perf need (see EI-19363236885307403 —
-// ~24h single-worker for a one-time 395k-vector re-embed, ~30min/day
-// steady-state CPU) becomes pressing, start from the pip-wheel path above,
-// not from apt.
+// GPU: these CPU thread caps still apply on a CUDA session (ORT runs the
+// operators CUDA does not take on the CPU pool). The GPU was out of scope here
+// until 2026-09-24 (EI-19363236885307403: cuDNN 9 was missing, so the CUDA
+// provider could not load). It is now selected by the main thread and passed
+// in as workerData.device, with a CPU fallback below — see the DEVICE block.
+// One multi-process concern from that history still holds: only ONE process
+// per host should embed on the GPU (the embed sidecar on a sidecar host, the
+// operator on a packaged desktop), so contexts are not multiplied per process.
 //
 // EI-20493854163389792: WI-3792's fix was a hardcoded `intraOpNumThreads: 4`,
 // an ABSOLUTE constant — it capped the 128-core host and never scaled DOWN. On
@@ -83,18 +68,45 @@ const ORT_SESSION_OPTIONS = {
   interOpNumThreads: 1,
 };
 
+// DEVICE (memory-reduction-2026-09-24 P-008 / D-003). The main thread decides
+// it (embed-device.ts: PAPERCUSP_EMBED_DEVICE auto|gpu|cpu, the installed CUDA
+// provider, the NVIDIA driver, any earlier demotion) and hands it over as
+// workerData.device — this file is copied into bundles as ONE file, so it cannot
+// import that module. What is decided here is only the FALLBACK: a CUDA session
+// that will not construct, or a forward pass that fails on the GPU, is rebuilt on
+// the CPU, and the switch is sticky for this worker's life. Every construction
+// is reported back as { kind: 'device', model, device, demotion } so /healthz
+// states what actually runs, not what was asked for.
+//
+// Never pass `dtype`: stored vectors come from the default (fp32) weights, and
+// only the device may move without drifting the vector space (CPU vs CUDA
+// cosine 0.9999999, measured 2026-09-24). embed-device.test.ts pins this file.
+const REQUESTED_DEVICE = workerData && workerData.device === 'cuda' ? 'cuda' : 'cpu';
+let device = REQUESTED_DEVICE;
+// Test seam only: the worker test points this at a fake module so the fallback
+// can be exercised without a GPU. Production never sets it.
+const TRANSFORMERS_SPECIFIER =
+  (workerData && typeof workerData.transformersSpecifier === 'string' && workerData.transformersSpecifier) ||
+  '@huggingface/transformers';
+
+/** An error that means the GPU itself failed, not the input. */
+const GPU_FAILURE_PATTERN = /\b(cuda|cudnn|cublas|curand|cufft|gpu|tensorrt)\b|out of memory/i;
+
+function errorMessage(err) {
+  return err && err.message ? err.message : String(err);
+}
+
 // One warm pipeline PER model id, so a process mixing BGE (default local) and
 // EmbeddingGemma (via an explicit model) keeps both loaded rather than
-// thrashing a single-model cache.
+// thrashing a single-model cache. Values are Promise<{ pipe, device }>.
 const pipelinesByModel = new Map();
 
-async function getPipeline(model) {
-  const key = model || DEFAULT_MODEL;
-  let p = pipelinesByModel.get(key);
-  if (!p) {
+let transformersPromise = null;
+function loadTransformers() {
+  if (!transformersPromise) {
     // Dynamic import keeps the worker spawn cheap when @huggingface/transformers
     // isn't installed — the package only loads on first embed.
-    p = import('@huggingface/transformers').then((t) => {
+    transformersPromise = import(TRANSFORMERS_SPECIFIER).then((t) => {
       if (
         process.env.PAPERCUSP_DISTRIBUTION_PROFILE === 'vm-release' ||
         process.env.PAPERCUSP_TRANSFORMERS_LOCAL_ONLY === '1'
@@ -102,18 +114,83 @@ async function getPipeline(model) {
         t.env.allowLocalModels = true;
         t.env.allowRemoteModels = false;
       }
-      return t.pipeline('feature-extraction', key, { session_options: ORT_SESSION_OPTIONS });
+      return t;
+    });
+    transformersPromise.catch(() => {
+      transformersPromise = null;
+    });
+  }
+  return transformersPromise;
+}
+
+function demote(stage, err) {
+  const demotion = { from: device, stage, cause: errorMessage(err) };
+  device = 'cpu';
+  return demotion;
+}
+
+async function buildPipeline(key) {
+  const t = await loadTransformers();
+  const build = (d) => t.pipeline('feature-extraction', key, { session_options: ORT_SESSION_OPTIONS, device: d });
+  if (device === 'cpu') {
+    const pipe = await build('cpu');
+    parentPort.postMessage({ kind: 'device', model: key, device: 'cpu', demotion: null });
+    return { pipe, device: 'cpu' };
+  }
+  try {
+    const pipe = await build(device);
+    parentPort.postMessage({ kind: 'device', model: key, device, demotion: null });
+    return { pipe, device };
+  } catch (err) {
+    const demotion = demote('construct', err);
+    const pipe = await build('cpu');
+    parentPort.postMessage({ kind: 'device', model: key, device: 'cpu', demotion });
+    return { pipe, device: 'cpu' };
+  }
+}
+
+function getPipeline(model) {
+  const key = model || DEFAULT_MODEL;
+  let p = pipelinesByModel.get(key);
+  if (!p) {
+    p = buildPipeline(key);
+    // A failed build must not stay cached: without this, one transient load
+    // failure made every later embed of that model reject for the worker's life.
+    p.catch(() => {
+      if (pipelinesByModel.get(key) === p) pipelinesByModel.delete(key);
     });
     pipelinesByModel.set(key, p);
   }
   return p;
 }
 
+async function runEmbed(msg, entry) {
+  const { text } = msg;
+  const pooling = msg.pooling || 'mean';
+  const normalize = msg.normalize === undefined ? true : msg.normalize;
+  const pipe = entry.pipe;
+  // Models whose ONNX export bakes pooling+normalize INTO the graph expose a
+  // single pre-pooled output (e.g. harrier's 'sentence_embedding') and have
+  // no last_hidden_state for the pipeline's pooling path — `output` names
+  // that graph output; tokenize + run the model directly and return it.
+  if (msg.output) {
+    const enc = pipe.tokenizer(text, { padding: true, truncation: true });
+    const out = await pipe.model(enc);
+    const tensor = out[msg.output];
+    if (!tensor) {
+      throw new Error(`model output '${msg.output}' missing (has: ${Object.keys(out).join(', ')})`);
+    }
+    return Array.from(tensor.data);
+  }
+  const result = await pipe(text, { pooling, normalize });
+  return Array.from(result.data);
+}
+
 parentPort.on('message', async (msg) => {
   if (!msg || typeof msg !== 'object') return;
   if (msg.kind !== 'embed') return;
 
-  const { id, text, model } = msg;
+  const { id, model } = msg;
   // BGE-small defaults (mean pooling, normalized) when unspecified; Gemma passes
   // normalize:false and truncate-then-normalizes in the caller (MRL).
   //
@@ -125,30 +202,33 @@ parentPort.on('message', async (msg) => {
   // widened to a batch, right-padding would silently pool a PAD embedding for
   // every text shorter than the longest: no error, just quietly wrong vectors.
   // Batch this only alongside a mask-aware last-token gather.
-  const pooling = msg.pooling || 'mean';
-  const normalize = msg.normalize === undefined ? true : msg.normalize;
+  const key = model || DEFAULT_MODEL;
   try {
-    const pipe = await getPipeline(model);
-    // Models whose ONNX export bakes pooling+normalize INTO the graph expose a
-    // single pre-pooled output (e.g. harrier's 'sentence_embedding') and have
-    // no last_hidden_state for the pipeline's pooling path — `output` names
-    // that graph output; tokenize + run the model directly and return it.
-    if (msg.output) {
-      const enc = pipe.tokenizer(text, { padding: true, truncation: true });
-      const out = await pipe.model(enc);
-      const tensor = out[msg.output];
-      if (!tensor) {
-        throw new Error(`model output '${msg.output}' missing (has: ${Object.keys(out).join(', ')})`);
-      }
-      parentPort.postMessage({ kind: 'embed_ok', id, vector: Array.from(tensor.data) });
-      return;
+    const entry = await getPipeline(key);
+    let vector;
+    try {
+      vector = await runEmbed(msg, entry);
+    } catch (err) {
+      // A forward pass that fails ON THE GPU (out of memory, a CUDA/cuDNN
+      // error) is a device failure, not a bad input: rebuild this model on the
+      // CPU and retry once, so the GPU stays opportunistic and never becomes a
+      // way for embeds to fail. Any other error is the request's own.
+      if (entry.device === 'cpu' || !GPU_FAILURE_PATTERN.test(errorMessage(err))) throw err;
+      const demotion = device === 'cpu' ? null : demote('inference', err);
+      pipelinesByModel.delete(key);
+      const t = await loadTransformers();
+      const pipe = await t.pipeline('feature-extraction', key, { session_options: ORT_SESSION_OPTIONS, device: 'cpu' });
+      const cpuEntry = { pipe, device: 'cpu' };
+      pipelinesByModel.set(key, Promise.resolve(cpuEntry));
+      parentPort.postMessage({
+        kind: 'device',
+        model: key,
+        device: 'cpu',
+        demotion: demotion ?? { from: 'cuda', stage: 'inference', cause: errorMessage(err) },
+      });
+      vector = await runEmbed(msg, cpuEntry);
     }
-    const result = await pipe(text, { pooling, normalize });
-    parentPort.postMessage({
-      kind: 'embed_ok',
-      id,
-      vector: Array.from(result.data),
-    });
+    parentPort.postMessage({ kind: 'embed_ok', id, vector });
   } catch (err) {
     parentPort.postMessage({
       kind: 'embed_err',
