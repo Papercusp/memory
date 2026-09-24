@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { coalesceEmbedFn, coalesceEmbedFnWithStats, normalizeEmbeddingText } from './embed-coalesce';
 
@@ -27,6 +27,91 @@ function slowEmbedder(vector: number[] = [1, 2, 3]) {
 }
 
 describe('coalesceEmbedFn', () => {
+  it('cancels one waiter without cancelling a sibling that still needs the vector', async () => {
+    let upstream!: AbortSignal;
+    let resolve!: (vector: number[]) => void;
+    const fn = vi.fn((_text: string, signal?: AbortSignal) => {
+      upstream = signal!;
+      return new Promise<number[]>((res) => { resolve = res; });
+    });
+    const embed = coalesceEmbedFn(fn);
+    const first = new AbortController();
+    const cancelled = embed('q', first.signal);
+    const observed = expect(cancelled).rejects.toThrow('obsolete');
+    const sibling = embed('q');
+    first.abort(new Error('obsolete'));
+    await observed;
+    expect(upstream.aborted).toBe(false);
+    resolve([7]);
+    await expect(sibling).resolves.toEqual([7]);
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it('aborts upstream only when the last consumer leaves', async () => {
+    let upstream!: AbortSignal;
+    const embed = coalesceEmbedFn((_text, signal) => {
+      upstream = signal!;
+      return new Promise((_resolve, reject) => signal!.addEventListener('abort', () => reject(signal!.reason)));
+    });
+    const a = new AbortController();
+    const b = new AbortController();
+    const pa = embed('q', a.signal);
+    const pb = embed('q', b.signal);
+    const observed = Promise.allSettled([pa, pb]);
+    a.abort();
+    expect(upstream.aborted).toBe(false);
+    b.abort();
+    expect(upstream.aborted).toBe(true);
+    expect((await observed).map((r) => r.status)).toEqual(['rejected', 'rejected']);
+  });
+
+  it('does not start work or return a cache hit for a pre-aborted consumer', async () => {
+    const fn = vi.fn(async () => [1]);
+    const embed = coalesceEmbedFn(fn);
+    const controller = new AbortController();
+    controller.abort(new Error('obsolete'));
+    await expect(embed('q', controller.signal)).rejects.toThrow('obsolete');
+    expect(fn).not.toHaveBeenCalled();
+    await embed('q');
+    await expect(embed('q', controller.signal)).rejects.toThrow('obsolete');
+    expect(fn).toHaveBeenCalledOnce();
+  });
+
+  it('a late cancelled generation cannot cache a vector or remove its replacement', async () => {
+    const releases: Array<(v: number[]) => void> = [];
+    const fn = vi.fn(() => new Promise<number[]>((resolve) => { releases.push(resolve); }));
+    const { embed, stats } = coalesceEmbedFnWithStats(fn);
+    const controller = new AbortController();
+    const old = embed('q', controller.signal);
+    const observed = expect(old).rejects.toThrow('obsolete');
+    controller.abort(new Error('obsolete'));
+    await observed;
+    const current = embed('q');
+    releases[0]([1]); // Models a native implementation that cannot cancel.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(stats.size()).toBe(0);
+    const sibling = embed('q');
+    expect(fn).toHaveBeenCalledTimes(2);
+    releases[1]([2]);
+    await expect(current).resolves.toEqual([2]);
+    await expect(sibling).resolves.toEqual([2]);
+    await expect(embed('q')).resolves.toEqual([2]);
+  });
+
+  it('removes abort listeners after success and failure', async () => {
+    for (const fail of [false, true]) {
+      const controller = new AbortController();
+      const remove = vi.spyOn(controller.signal, 'removeEventListener');
+      const embed = coalesceEmbedFn(async () => {
+        if (fail) throw new Error('failed');
+        return [1];
+      });
+      await Promise.allSettled([embed('q', controller.signal)]);
+      expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
+    }
+  });
+
   it('coalesces concurrent same-text calls onto ONE underlying embed (the injection 3-leg case)', async () => {
     const under = slowEmbedder([7, 8]);
     const { embed, stats } = coalesceEmbedFnWithStats(under.fn);

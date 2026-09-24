@@ -153,6 +153,26 @@ describe('Mem0Backend.search — batched multi-scope path (EI-12962)', () => {
   });
 
   // EI-21348316803580175 — the opt-in query-embed budget.
+  it('cancels an expired query embed at the upstream seam without starting legacy searches', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: [], 'harness:x': [] }, calls);
+    let upstream!: AbortSignal;
+    const embedQuery = vi.fn((_text: string, signal?: AbortSignal) => {
+      upstream = signal!;
+      return new Promise<number[]>((_resolve, reject) => {
+        signal!.addEventListener('abort', () => reject(signal!.reason), { once: true });
+      });
+    });
+    const vectorSearch = vi.fn(async () => []);
+    const be = new Mem0Backend({ getClient: async () => client, embedQuery, vectorSearch });
+    await expect(be.search('q', { scope: ['userA', 'harness:x'], embedTimeoutMs: 20 }))
+      .rejects.toMatchObject({ name: 'EmbedBudgetExceededError', budgetMs: 20 });
+    expect(upstream.aborted).toBe(true);
+    expect(upstream.reason).toMatchObject({ name: 'EmbedBudgetExceededError' });
+    expect(calls).toHaveLength(0);
+    expect(vectorSearch).not.toHaveBeenCalled();
+  });
+
   it('embedTimeoutMs OMITTED leaves the embed unbounded — a slow embed still resolves', async () => {
     const calls: Record<string, unknown>[] = [];
     const client = fakeClient({ userA: [], 'harness:x': [] }, calls);
