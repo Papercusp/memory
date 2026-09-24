@@ -192,6 +192,7 @@ export {
 // verified-by-construction GPU choice and a recorded CPU fallback.
 export {
   EMBED_DEVICE_ENV,
+  _resetEmbedDeviceState,
   constructEmbedPipeline,
   currentEmbedDeviceDecision,
   decideEmbedDevice,
