@@ -68,6 +68,10 @@ interface WorkerState {
    */
   refd: boolean;
   lastFallbackWarnAt: number;
+  /** A graceful recycle in progress (`recycleEmbedWorker`); new embeds wait on it. */
+  recycling: Promise<void> | null;
+  /** Resolvers waiting for `pending` to empty (a recycle's drain). */
+  drainWaiters: Array<() => void>;
 }
 
 // tsx can evaluate this module through both CJS and ESM in one process.
@@ -75,8 +79,20 @@ interface WorkerState {
 const state = pinModuleState<WorkerState>('@papercusp/memory.local-embedder-worker', () => ({
   worker: null, workerReady: null, nextId: 0, pending: new Map(),
   workerDisabled: false, beforeExitHookInstalled: false, beforeExitListener: null,
-  refd: false, lastFallbackWarnAt: 0,
+  refd: false, lastFallbackWarnAt: 0, recycling: null, drainWaiters: [],
 }));
+
+/** Wake every drain waiter once nothing is in flight. Call after any `pending` removal. */
+function notifyIfDrained(): void {
+  if (state.pending.size > 0 || state.drainWaiters.length === 0) return;
+  const waiters = state.drainWaiters.splice(0);
+  for (const wake of waiters) wake();
+}
+
+function waitForDrain(): Promise<void> {
+  if (state.pending.size === 0) return Promise.resolve();
+  return new Promise<void>((resolve) => state.drainWaiters.push(resolve));
+}
 
 /**
  * Hold the loop open for EXACTLY as long as a request is in flight, and not one
@@ -314,11 +330,13 @@ function ensureWorker(): Promise<void> {
       } else {
         p.reject(new Error(msg.error ?? 'worker error'));
       }
+      notifyIfDrained();
     });
     state.worker.on('error', (err) => {
       // Reject every pending request — the worker crashed.
       for (const [, p] of state.pending) p.reject(err);
       state.pending.clear();
+      notifyIfDrained();
       // EI-20012631851693581: deliberately NOT `state.workerDisabled`. A runtime
       // crash is TRANSIENT; clearing the handle is what makes the next call
       // respawn. Latching here condemned every later embed in the process to
@@ -349,6 +367,7 @@ function ensureWorker(): Promise<void> {
         for (const [, p] of state.pending) p.reject(err);
         state.pending.clear();
       }
+      notifyIfDrained();
       state.worker = null;
       state.workerReady = null;
       state.refd = false;
@@ -398,6 +417,10 @@ export interface EmbedViaWorkerOpts {
  * — callers should fall back to inline embedding in that case.
  */
 export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}): Promise<number[]> {
+  // A device change is recycling the worker: wait for it rather than land on
+  // the old worker (which would keep embedding on the old device) or race its
+  // termination.
+  while (state.recycling) await state.recycling;
   await ensureWorker();
   if (!state.worker) throw new Error('worker not initialized');
 
@@ -440,8 +463,33 @@ export async function _resetWorker(): Promise<void> {
     for (const [, p] of state.pending) p.reject(err);
   }
   state.pending.clear();
+  notifyIfDrained();
   state.refd = false;
   state.nextId = 0;
+}
+
+/**
+ * Restart the embedding worker so its pipelines are rebuilt on the CURRENT
+ * device decision — the live half of a Settings device change (plan D-008).
+ *
+ * Graceful, unlike `_resetWorker`: new embeds wait on the recycle instead of
+ * reaching the old worker, the requests already in flight finish on it, and only
+ * then is it terminated. The next embed spawns a fresh worker, which reads
+ * `currentEmbedDeviceDecision()` at spawn. Concurrent calls share one recycle.
+ * With no worker running there is nothing to rebuild: the next spawn already
+ * reads the new decision.
+ */
+export function recycleEmbedWorker(): Promise<void> {
+  if (state.recycling) return state.recycling;
+  if (!state.worker && !state.workerReady) return Promise.resolve();
+  const run = (async () => {
+    await waitForDrain();
+    await _resetWorker();
+  })().finally(() => {
+    state.recycling = null;
+  });
+  state.recycling = run;
+  return run;
 }
 
 /**

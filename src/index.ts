@@ -165,6 +165,7 @@ export {
   getWorkerState,
   _resetWorker,
   shutdownLocalEmbedder,
+  recycleEmbedWorker,
   LOCAL_EMBEDDER_MODEL,
 } from './local-embedder-worker';
 
@@ -186,16 +187,20 @@ export {
   type EmbedRequestedExecution,
 } from './execution-target';
 
-// Which device the embedders run on (PAPERCUSP_EMBED_DEVICE auto|gpu|cpu), with
-// a verified-by-construction GPU choice and a recorded CPU fallback.
+// Which device the embedders run on (auto|gpu|cpu: a concrete PAPERCUSP_EMBED_DEVICE
+// host override, else the host-supplied Settings choice), with a
+// verified-by-construction GPU choice and a recorded CPU fallback.
 export {
   EMBED_DEVICE_ENV,
   constructEmbedPipeline,
   currentEmbedDeviceDecision,
   decideEmbedDevice,
   embedDeviceDemotion,
+  embedDeviceSetting,
   embedPipelineDevices,
+  parseEmbedDevicePreference,
   resolveEmbedDevicePreference,
+  setEmbedDeviceSetting,
   type EmbedDevice,
   type EmbedDeviceDecision,
   type EmbedDeviceDemotion,

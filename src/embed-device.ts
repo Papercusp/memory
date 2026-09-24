@@ -4,7 +4,17 @@
  *
  * ## The contract
  *
- * `PAPERCUSP_EMBED_DEVICE` = `auto` (default) | `gpu`/`cuda` | `cpu`.
+ * The preference is `auto` (default) | `gpu`/`cuda` | `cpu`, from two layers
+ * (plan D-008):
+ *
+ *  1. `PAPERCUSP_EMBED_DEVICE` set to a CONCRETE device (`cpu`, `gpu`/`cuda`) is
+ *     a host-level hard override and always wins — it is how one host (a
+ *     headless verify instance, a box with a broken GPU) is pinned without
+ *     touching the shared setting.
+ *  2. Otherwise the user's SETTING applies (`setEmbedDeviceSetting`, fed from the
+ *     host's Settings row — this module stays storage-free). Env unset or
+ *     `auto` defers to it; an unrecognised env value is ignored and flagged.
+ *  3. Neither → `auto`.
  *
  *  - `auto` picks CUDA only when BOTH cheap preconditions hold: a CUDA/TensorRT
  *    execution-provider library sits beside the onnxruntime binding (the
@@ -54,7 +64,7 @@ export type EmbedDevice = 'cpu' | 'cuda';
 /** What the host asked for. `auto` = decide from the host. */
 export type EmbedDevicePreference = 'auto' | 'cuda' | 'cpu';
 
-/** The environment variable that forces a device (D-003's Settings override). */
+/** The environment variable that forces a device on one host (outranks the Settings choice when concrete). */
 export const EMBED_DEVICE_ENV = 'PAPERCUSP_EMBED_DEVICE';
 
 /** The ONNX Runtime binding transformers.js uses under Node. */
@@ -68,10 +78,18 @@ export const NVIDIA_DRIVER_PROBE_PATH = '/proc/driver/nvidia/version';
 
 export type EmbedDeviceSelection = {
   preference: EmbedDevicePreference;
-  /** `env` = set explicitly; `default` = unset; `env-invalid` = set to something unrecognised (treated as auto). */
-  source: 'env' | 'default' | 'env-invalid';
-  /** The raw value when `source` is `env-invalid`, so a typo is visible rather than silently ignored. */
+  /**
+   * Which layer decided `preference`:
+   *  - `env` = `PAPERCUSP_EMBED_DEVICE` (a concrete device, or `auto` with no setting);
+   *  - `setting` = the user's Settings choice;
+   *  - `default` = neither is set;
+   *  - `env-invalid` = the env value is unrecognised and no setting exists (auto applies).
+   */
+  source: 'env' | 'setting' | 'default' | 'env-invalid';
+  /** An unrecognised env value, kept visible rather than silently ignored (any source). */
   invalidValue: string | null;
+  /** The Settings choice as stored, even when a concrete env override outranks it. `null` = none. */
+  setting: EmbedDevicePreference | null;
 };
 
 export type EmbedDeviceDecision = {
@@ -98,25 +116,76 @@ type EmbedDeviceState = {
   demotion: EmbedDeviceDemotion | null;
   /** model id → the device its pipeline actually constructed on. */
   pipelines: Record<string, EmbedDevice>;
+  /** The user's Settings choice, pushed in by the host. `null` = none. */
+  setting: EmbedDevicePreference | null;
 };
 
 const state = pinModuleState<EmbedDeviceState>('@papercusp/memory.embed-device', () => ({
   providerLibraries: undefined,
   demotion: null,
   pipelines: {},
+  setting: null,
 }));
 
-/** Parse the device preference. Never throws: a typo must not take embeds down. */
+/**
+ * Parse a stored/requested preference. `gpu` is the user-facing word for
+ * `cuda`. Anything else → `null` (never throws: a bad row must not take embeds down).
+ */
+export function parseEmbedDevicePreference(value: unknown): EmbedDevicePreference | null {
+  if (typeof value !== 'string') return null;
+  const v = value.trim().toLowerCase();
+  if (v === 'auto' || v === 'cpu') return v;
+  if (v === 'cuda' || v === 'gpu') return 'cuda';
+  return null;
+}
+
+/**
+ * Resolve the preference from the env and the Settings choice (precedence in the
+ * module header). Never throws: a typo must not take embeds down.
+ */
 export function resolveEmbedDevicePreference(
   env: Record<string, string | undefined> = typeof process === 'undefined' ? {} : process.env,
+  setting: EmbedDevicePreference | null = state.setting,
 ): EmbedDeviceSelection {
   const raw = (env[EMBED_DEVICE_ENV] ?? '').trim();
-  const v = raw.toLowerCase();
-  if (v === '') return { preference: 'auto', source: 'default', invalidValue: null };
-  if (v === 'auto') return { preference: 'auto', source: 'env', invalidValue: null };
-  if (v === 'cpu') return { preference: 'cpu', source: 'env', invalidValue: null };
-  if (v === 'cuda' || v === 'gpu') return { preference: 'cuda', source: 'env', invalidValue: null };
-  return { preference: 'auto', source: 'env-invalid', invalidValue: raw };
+  const fromEnv = raw === '' ? null : parseEmbedDevicePreference(raw);
+  const invalidValue = raw !== '' && fromEnv === null ? raw : null;
+  if (fromEnv === 'cpu' || fromEnv === 'cuda') {
+    return { preference: fromEnv, source: 'env', invalidValue: null, setting };
+  }
+  if (setting) return { preference: setting, source: 'setting', invalidValue, setting };
+  if (fromEnv === 'auto') return { preference: 'auto', source: 'env', invalidValue: null, setting };
+  if (invalidValue !== null) return { preference: 'auto', source: 'env-invalid', invalidValue, setting };
+  return { preference: 'auto', source: 'default', invalidValue: null, setting };
+}
+
+/** The Settings choice this process was last given. `null` = none. */
+export function embedDeviceSetting(): EmbedDevicePreference | null {
+  return state.setting;
+}
+
+/**
+ * Hand this process the user's Settings choice (`null` clears it).
+ *
+ * Returns whether the EFFECTIVE preference changed. When it did, the per-process
+ * GPU demotion and the per-model device record are cleared: the user asked for a
+ * different device, so a GPU that failed earlier gets one fresh attempt, and the
+ * old record describes pipelines the caller is about to rebuild. Rebuilding them
+ * (recycling the worker) is the caller's job — see `recycleEmbedWorker`.
+ */
+export function setEmbedDeviceSetting(
+  setting: EmbedDevicePreference | null,
+  env: Record<string, string | undefined> = typeof process === 'undefined' ? {} : process.env,
+): { changed: boolean; selection: EmbedDeviceSelection } {
+  const before = resolveEmbedDevicePreference(env, state.setting).preference;
+  state.setting = setting;
+  const selection = resolveEmbedDevicePreference(env, setting);
+  const changed = selection.preference !== before;
+  if (changed) {
+    state.demotion = null;
+    state.pipelines = {};
+  }
+  return { changed, selection };
 }
 
 /**
@@ -174,12 +243,17 @@ export function decideEmbedDevice(input: {
 }): EmbedDeviceDecision {
   const { selection, providerLibraries, nvidiaDriver, demotion } = input;
   const invalid =
-    selection.source === 'env-invalid'
-      ? ` (${EMBED_DEVICE_ENV}=${JSON.stringify(selection.invalidValue)} is not auto|gpu|cuda|cpu, so auto applies)`
+    selection.invalidValue !== null
+      ? ` (${EMBED_DEVICE_ENV}=${JSON.stringify(selection.invalidValue)} is not auto|gpu|cuda|cpu, so it is ignored)`
       : '';
+  const forcedBy =
+    selection.source === 'setting'
+      ? `the Settings choice (${selection.preference === 'cuda' ? 'GPU' : 'CPU'})`
+      : `${EMBED_DEVICE_ENV}=${selection.preference} (a host override, which outranks the Settings choice)`;
+  const auto = selection.source === 'setting' ? `auto (the Settings choice)${invalid}` : `auto${invalid}`;
 
   if (selection.preference === 'cpu') {
-    return { device: 'cpu', why: `${EMBED_DEVICE_ENV}=cpu forces the CPU` };
+    return { device: 'cpu', why: `${forcedBy} forces the CPU${invalid}` };
   }
   if (demotion) {
     return {
@@ -192,7 +266,7 @@ export function decideEmbedDevice(input: {
   if (selection.preference === 'cuda') {
     return {
       device: 'cuda',
-      why: `${EMBED_DEVICE_ENV} forces the GPU; the session is still verified at construction and falls back to the CPU if it will not build`,
+      why: `${forcedBy} forces the GPU${invalid}; the session is still verified at construction and falls back to the CPU if it will not build`,
     };
   }
 
@@ -201,27 +275,27 @@ export function decideEmbedDevice(input: {
   if (providerLibraries === null) {
     return {
       device: 'cpu',
-      why: `auto${invalid}: the onnxruntime provider directory could not be read, so no GPU provider is known to be installed`,
+      why: `${auto}: the onnxruntime provider directory could not be read, so no GPU provider is known to be installed`,
     };
   }
   if (cudaLibs.length === 0) {
     return {
       device: 'cpu',
       why:
-        `auto${invalid}: no CUDA execution-provider library is installed beside the onnxruntime binding ` +
+        `${auto}: no CUDA execution-provider library is installed beside the onnxruntime binding ` +
         '(the installer adds it where the platform supports it — scripts/install-onnxruntime-node.mjs)',
     };
   }
   if (nvidiaDriver === false) {
     return {
       device: 'cpu',
-      why: `auto${invalid}: the CUDA provider is installed but no NVIDIA driver is loaded (${NVIDIA_DRIVER_PROBE_PATH} is absent)`,
+      why: `${auto}: the CUDA provider is installed but no NVIDIA driver is loaded (${NVIDIA_DRIVER_PROBE_PATH} is absent)`,
     };
   }
   return {
     device: 'cuda',
     why:
-      `auto${invalid}: the CUDA provider is installed (${cudaLibs.join(', ')})` +
+      `${auto}: the CUDA provider is installed (${cudaLibs.join(', ')})` +
       (nvidiaDriver ? ' and the NVIDIA driver is loaded' : '') +
       '; the session is verified at construction and falls back to the CPU if it will not build',
   };
@@ -331,9 +405,10 @@ export async function constructEmbedPipeline<P>(
   }
 }
 
-/** Test-only: forget the scan, the demotion and the per-model record. */
+/** Test-only: forget the scan, the demotion, the per-model record and the setting. */
 export function _resetEmbedDeviceState(): void {
   state.providerLibraries = undefined;
   state.demotion = null;
   state.pipelines = {};
+  state.setting = null;
 }
