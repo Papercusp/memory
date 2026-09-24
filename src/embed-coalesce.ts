@@ -52,27 +52,76 @@ export interface CoalesceEmbedStats {
 }
 
 export function coalesceEmbedFn(
-  fn: (text: string) => Promise<number[]>,
+  fn: (text: string, signal?: AbortSignal) => Promise<number[]>,
   opts: CoalesceEmbedOptions = {},
-): (text: string) => Promise<number[]> {
+): (text: string, signal?: AbortSignal) => Promise<number[]> {
   return coalesceEmbedFnWithStats(fn, opts).embed;
 }
 
 export function coalesceEmbedFnWithStats(
-  fn: (text: string) => Promise<number[]>,
+  fn: (text: string, signal?: AbortSignal) => Promise<number[]>,
   opts: CoalesceEmbedOptions = {},
-): { embed: (text: string) => Promise<number[]>; stats: CoalesceEmbedStats } {
+): { embed: (text: string, signal?: AbortSignal) => Promise<number[]>; stats: CoalesceEmbedStats } {
   const ttlMs = opts.ttlMs ?? 60_000;
   const maxEntries = opts.maxEntries ?? 64;
   const now = opts.now ?? Date.now;
 
-  const inFlight = new Map<string, Promise<number[]>>();
+  type Flight = {
+    promise: Promise<number[]>;
+    controller: AbortController;
+    consumers: number;
+    settled: boolean;
+  };
+  const inFlight = new Map<string, Flight>();
   // Map iteration order = insertion order; a fresh hit is re-inserted so the
   // first key is always the least-recently-used one.
   const done = new Map<string, { vector: number[]; at: number }>();
   const stats: CoalesceEmbedStats = { hits: 0, coalesced: 0, misses: 0, size: () => done.size };
 
-  const embed = (text: string): Promise<number[]> => {
+  const join = (key: string, flight: Flight, signal?: AbortSignal): Promise<number[]> => {
+    flight.consumers += 1;
+    return new Promise((resolve, reject) => {
+      let left = false;
+      let cancelled = false;
+      let cancellationReason: unknown;
+      const leave = () => {
+        if (left) return false;
+        left = true;
+        signal?.removeEventListener('abort', abort);
+        flight.consumers -= 1;
+        if (flight.consumers === 0 && !flight.settled) {
+          // Remove before notifying upstream: a new caller must never join an
+          // abandoned generation, even if abort handlers re-enter this seam.
+          if (inFlight.get(key) === flight) inFlight.delete(key);
+          flight.controller.abort(signal?.reason);
+        }
+        return true;
+      };
+      const abort = () => {
+        cancelled = true;
+        cancellationReason = signal!.reason;
+        leave();
+        // Keep this raw operation pending until upstream settles. The caller's
+        // deadline wrapper bounds its wait separately and uses this promise to
+        // retain admission while a native embed ignores cancellation.
+      };
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted) abort();
+      flight.promise.then(
+        (value) => {
+          if (cancelled) reject(cancellationReason);
+          else if (leave()) resolve(value);
+        },
+        (error) => {
+          if (cancelled) reject(cancellationReason);
+          else if (leave()) reject(error);
+        },
+      );
+    });
+  };
+
+  const embed = (text: string, signal?: AbortSignal): Promise<number[]> => {
+    if (signal?.aborted) return Promise.reject(signal.reason);
     const key = createHash('sha256').update(normalizeEmbeddingText(text)).digest('base64');
 
     const hit = done.get(key);
@@ -89,14 +138,30 @@ export function coalesceEmbedFnWithStats(
     const pending = inFlight.get(key);
     if (pending) {
       stats.coalesced += 1;
-      return pending;
+      return join(key, pending, signal);
     }
 
     stats.misses += 1;
-    const p = (async () => {
-      const vector = await fn(text);
+    let resolve!: (vector: number[]) => void;
+    let reject!: (error: unknown) => void;
+    const flight: Flight = {
+      promise: new Promise<number[]>((res, rej) => { resolve = res; reject = rej; }),
+      controller: new AbortController(),
+      consumers: 0,
+      settled: false,
+    };
+    inFlight.set(key, flight);
+    const caller = join(key, flight, signal);
+    const finish = () => {
+      flight.settled = true;
+      if (inFlight.get(key) === flight) inFlight.delete(key);
+    };
+    const completed = (vector: number[]) => {
+      finish();
       // Cache only a real vector — an empty/degenerate result must not stick.
-      if (Array.isArray(vector) && vector.length > 0) {
+      // A native embed may ignore abort: its late result cannot replace a
+      // newer generation's cached vector.
+      if (!flight.controller.signal.aborted && Array.isArray(vector) && vector.length > 0) {
         done.set(key, { vector, at: now() });
         while (done.size > maxEntries) {
           const oldest = done.keys().next().value;
@@ -104,15 +169,15 @@ export function coalesceEmbedFnWithStats(
           done.delete(oldest);
         }
       }
-      return vector;
-    })();
-    // Settled promises leave the in-flight table either way; a rejection is
-    // therefore never coalesced onto later calls (they retry the embedder).
-    const tracked = p.finally(() => {
-      inFlight.delete(key);
-    });
-    inFlight.set(key, tracked);
-    return tracked;
+      resolve(vector);
+    };
+    const failed = (error: unknown) => { finish(); reject(error); };
+    try {
+      void fn(text, flight.controller.signal).then(completed, failed);
+    } catch (error) {
+      failed(error);
+    }
+    return caller;
   };
 
   return { embed, stats };

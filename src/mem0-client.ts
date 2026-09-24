@@ -67,7 +67,7 @@ let _llmFactoryPatched = false;
 // embedder.config during Zod validation, so the patched 'custom'
 // embedder (below) reads this live module var instead of config.embed.
 // Set in tryLoad() before each (re)build.
-let _currentEmbedFn: ((text: string) => Promise<number[]>) | null = null;
+let _currentEmbedFn: ((text: string, signal?: AbortSignal) => Promise<number[]>) | null = null;
 let _currentEmbeddingProfile: EmbedderProfileSpec | null = null;
 const embeddedQueryProfiles = new WeakMap<number[], EmbedderProfileSpec>();
 /**
@@ -189,14 +189,20 @@ export async function vectorSearchCanonical(
  * when no client/embedder is up OR the embed fails — callers must fall back
  * to the legacy per-scope `client.search` path (correctness over speed).
  */
-export async function embedForCurrentClient(text: string): Promise<number[] | null> {
+export async function embedForCurrentClient(text: string, signal?: AbortSignal): Promise<number[] | null> {
+  signal?.throwIfAborted();
   const client = await getMemoryClient().catch(() => null);
+  signal?.throwIfAborted();
   if (!client || !_currentEmbedFn || !_currentEmbeddingProfile) return null;
   try {
-    const vector = await _currentEmbedFn(text);
+    const vector = await _currentEmbedFn(text, signal);
+    signal?.throwIfAborted();
     embeddedQueryProfiles.set(vector, _currentEmbeddingProfile);
     return vector;
   } catch {
+    // Cancellation must not become null: that would start a legacy embed for
+    // every scope after the caller has already abandoned this search.
+    signal?.throwIfAborted();
     return null;
   }
 }
@@ -267,7 +273,7 @@ export function patchEmbedderFactory(mem0Module: {
  * `resolveEmbedder()` before each (re)build. Not re-exported from index.ts.
  */
 export function _setCurrentEmbedFnForTest(
-  fn: ((text: string) => Promise<number[]>) | null,
+  fn: ((text: string, signal?: AbortSignal) => Promise<number[]>) | null,
 ): void {
   _currentEmbedFn = fn;
 }

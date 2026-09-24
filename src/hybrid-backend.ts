@@ -152,7 +152,7 @@ export class HybridBackend implements MemoryBackend {
    * made the EI-12992 shared-embed a NO-OP under `hybrid-pg` — the production
    * backend — while it worked in the bare-Mem0Backend tests.
    */
-  readonly embedQuery?: (text: string) => Promise<number[] | null>;
+  readonly embedQuery?: (text: string, signal?: AbortSignal) => Promise<number[] | null>;
 
   constructor(
     private readonly lexical: MemoryBackend,

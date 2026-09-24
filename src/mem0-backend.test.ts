@@ -153,6 +153,32 @@ describe('Mem0Backend.search — batched multi-scope path (EI-12962)', () => {
   });
 
   // EI-21348316803580175 — the opt-in query-embed budget.
+  it('forwards caller cancellation with no embed budget and prevents a late vector search', async () => {
+    const calls: Record<string, unknown>[] = [];
+    const client = fakeClient({ userA: [], 'harness:x': [] }, calls);
+    let resolve!: (v: number[]) => void;
+    let upstream!: AbortSignal;
+    let markStarted!: () => void;
+    const started = new Promise<void>((res) => { markStarted = res; });
+    const embedQuery = vi.fn((_text: string, signal?: AbortSignal) => {
+      upstream = signal!;
+      markStarted();
+      return new Promise<number[]>((res) => { resolve = res; });
+    });
+    const vectorSearch = vi.fn(async () => []);
+    const be = new Mem0Backend({ getClient: async () => client, embedQuery, vectorSearch });
+    const controller = new AbortController();
+    const search = be.search('q', { scope: ['userA', 'harness:x'], signal: controller.signal });
+    const observed = expect(search).rejects.toThrow('obsolete');
+    await started;
+    controller.abort(new Error('obsolete'));
+    expect(upstream.aborted).toBe(true);
+    resolve([0.5]); // A non-cooperative embed must not start downstream SQL.
+    await observed;
+    expect(vectorSearch).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(0);
+  });
+
   it('cancels an expired query embed at the upstream seam without starting legacy searches', async () => {
     const calls: Record<string, unknown>[] = [];
     const client = fakeClient({ userA: [], 'harness:x': [] }, calls);

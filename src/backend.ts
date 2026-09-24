@@ -228,6 +228,10 @@ export interface RememberOptions {
 }
 
 export interface SearchOptionsCommon {
+  /** Caller lifetime. Cancellable query embeds honor it; implementations must
+   * not start another phase after it expires. Already-running native/SQL work
+   * may still need to drain. */
+  signal?: AbortSignal;
   /**
    * One or more pools to search. `limit` applies PER SCOPE; the merged
    * result is sorted by score (desc) but NOT globally truncated —
@@ -583,11 +587,13 @@ export interface MemoryBackend {
    * embedder, for a caller that will issue several `search()` calls against the
    * SAME query text and wants to pay the embed cost once — pass the result as
    * `SearchOptions.vector` on each call. Returns null when the embedder is
-   * unavailable/degraded (never throws) — callers fall back to per-call
+   * unavailable/degraded — callers fall back to per-call
    * embedding (today's behavior) on a null. Backends that don't embed (a
    * lexical/file store) omit it; callers feature-test (`backend.embedQuery?.(…)`).
+   * An optional signal cancels this consumer; cancellation throws instead of
+   * returning null so it cannot accidentally start legacy fallback embeds.
    */
-  embedQuery?(text: string): Promise<number[] | null>;
+  embedQuery?(text: string, signal?: AbortSignal): Promise<number[] | null>;
 }
 
 /** Normalize a `scope: string | readonly string[]` arg to a de-duped array. */

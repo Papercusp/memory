@@ -16,6 +16,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { coalesceEmbedFn } from './embed-coalesce';
+import { Mem0Backend } from './mem0-backend';
 import {
   buildSidecarFirstEmbedder,
   resolveEmbedSidecarUrl,
@@ -72,6 +74,63 @@ async function startStubSidecar(
 const closers: Array<() => Promise<void>> = [];
 afterEach(async () => {
   while (closers.length) await closers.pop()!();
+});
+
+describe('memory query budget through coalescer and HTTP', () => {
+  it('last-consumer expiry closes the actual request without retry or a legacy embed', async () => {
+    let requestSeen!: () => void;
+    const seen = new Promise<void>((resolve) => { requestSeen = resolve; });
+    let requestClosed!: () => void;
+    const closed = new Promise<void>((resolve) => { requestClosed = resolve; });
+    const stub = await startStubSidecar((_body, res) => {
+      res.on('close', requestClosed);
+      requestSeen(); // Intentionally no response; cancellation must close it.
+    });
+    closers.push(stub.close);
+    const legacy = vi.fn(async () => ({ results: [] }));
+    const embedQuery = coalesceEmbedFn(buildSidecarFirstEmbedder({
+      url: stub.url, model: 'gemma', kind: 'query',
+      fallback: async () => { throw new Error('unexpected fallback'); },
+    }));
+    const backend = new Mem0Backend({
+      getClient: async () => ({ search: legacy } as never),
+      embedQuery,
+      vectorSearch: async () => [],
+    });
+    const search = backend.search('budgeted', { scope: ['user:a', 'harness:x'], embedTimeoutMs: 250 });
+    const outcome = expect(search).rejects.toMatchObject({ name: 'EmbedBudgetExceededError' });
+    await seen;
+    await outcome;
+    await closed;
+    expect(stub.requests).toHaveLength(1);
+    expect(legacy).not.toHaveBeenCalled();
+  }, 5_000);
+
+  it('a shorter budget leaves the shared HTTP request alive for a longer-budget sibling', async () => {
+    let respond!: () => void;
+    let requestSeen!: () => void;
+    const seen = new Promise<void>((resolve) => { requestSeen = resolve; });
+    const stub = await startStubSidecar((_body, res) => {
+      respond = () => res.end(JSON.stringify({ vectors: [PINNED_VECTOR], dims: 3 }));
+      requestSeen();
+    });
+    closers.push(stub.close);
+    const embedQuery = coalesceEmbedFn(buildSidecarFirstEmbedder({
+      url: stub.url, model: 'gemma', kind: 'query',
+      fallback: async () => { throw new Error('unexpected fallback'); },
+    }));
+    const vectorSearch = vi.fn(async () => []);
+    const backend = new Mem0Backend({ getClient: async () => ({} as never), embedQuery, vectorSearch });
+    const short = backend.search('shared', { scope: ['user:a', 'harness:x'], embedTimeoutMs: 250 });
+    const observed = expect(short).rejects.toMatchObject({ name: 'EmbedBudgetExceededError' });
+    const long = backend.search('shared', { scope: ['user:b', 'harness:x'], embedTimeoutMs: 2_000 });
+    await seen;
+    await observed;
+    respond();
+    await expect(long).resolves.toEqual([]);
+    expect(stub.requests).toHaveLength(1);
+    expect(vectorSearch).toHaveBeenCalledTimes(2);
+  }, 5_000);
 });
 
 describe('resolveEmbedSidecarUrl', () => {
@@ -382,6 +441,23 @@ describe('buildSidecarFirstEmbedder', () => {
     });
     expect(await embed('x')).toEqual([1, 2, 3]);
     expect(fetched).toBe(0);
+  });
+
+  it('does not start local inference after cancellation during model initialization', async () => {
+    let ready!: (embed: (text: string) => Promise<number[]>) => void;
+    const local = vi.fn(async () => [1]);
+    const embed = buildSidecarFirstEmbedder({
+      model: 'gemma', kind: 'query', url: null,
+      fallback: () => new Promise((resolve) => { ready = resolve; }),
+    });
+    const controller = new AbortController();
+    const pending = embed('q', controller.signal);
+    const observed = expect(pending).rejects.toThrow('obsolete');
+    await Promise.resolve();
+    controller.abort(new Error('obsolete'));
+    ready(local);
+    await observed;
+    expect(local).not.toHaveBeenCalled();
   });
 
   it('identical-vector pin (D-002 at the seam): sidecar path and fallback path return the same vector', async () => {

@@ -329,7 +329,7 @@ export interface Mem0BackendDeps {
    * batched multi-scope search (EI-12962). null ⇒ the caller falls back to the
    * legacy per-scope `client.search` path. Defaults to `embedForCurrentClient`.
    */
-  embedQuery?: (text: string) => Promise<number[] | null>;
+  embedQuery?: (text: string, signal?: AbortSignal) => Promise<number[] | null>;
   /**
    * Test seam — the precomputed-vector canonical search the batched path fans
    * out per scope (EI-12962). Defaults to `vectorSearchCanonical`.
@@ -363,20 +363,21 @@ export class EmbedBudgetExceededError extends Error {
  * pass-through — byte-identical to awaiting `embed()` directly, which is what
  * keeps every caller that has not opted in unchanged.
  *
- * `MemoryBackend.embedQuery` takes no `AbortSignal`, so an over-budget embed
- * cannot be cancelled — it is abandoned and its late settle swallowed. That is
- * not pure waste here: the in-flight embed keeps warming the module's
- * short-TTL coalescing cache, so the NEXT call for the same text can still hit
- * it. (`libs/generic/search`'s sibling helper does pass a derived signal; its
- * `Embedder` contract accepts one and returns a non-nullable vector, which is
- * why that helper cannot simply be imported here.)
+ * Cancel this consumer on expiry. The shared embed coalescer aborts upstream
+ * only after its last consumer leaves, preserving another search's live work.
+ * A non-cooperative native implementation may still finish; the timer bounds
+ * this caller's wait, and the coalescer discards that obsolete completion.
  */
 async function embedWithinBudget(
-  embed: () => Promise<number[] | null>,
+  embed: (signal?: AbortSignal) => Promise<number[] | null>,
   budgetMs: number | undefined,
+  signal?: AbortSignal,
 ): Promise<number[] | null> {
-  if (budgetMs === undefined || budgetMs <= 0) return embed();
-  const pending = embed();
+  signal?.throwIfAborted();
+  if (budgetMs === undefined || budgetMs <= 0) return embed(signal);
+  const controller = new AbortController();
+  const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+  const pending = embed(combined);
   return await new Promise<number[] | null>((resolve, reject) => {
     let settled = false;
     const finish = (fn: () => void): void => {
@@ -386,7 +387,11 @@ async function embedWithinBudget(
       fn();
     };
     const timer = setTimeout(
-      () => finish(() => reject(new EmbedBudgetExceededError(budgetMs))),
+      () => finish(() => {
+        const error = new EmbedBudgetExceededError(budgetMs);
+        controller.abort(error);
+        reject(error);
+      }),
       budgetMs,
     );
     pending.then(
@@ -417,7 +422,7 @@ export class Mem0Backend implements MemoryBackend {
   /** PUBLIC (EI-12992): satisfies MemoryBackend.embedQuery? — a caller issuing
    *  several search() calls against the same query text embeds once here and
    *  passes the result as SearchOptions.vector on each call. */
-  readonly embedQuery: (text: string) => Promise<number[] | null>;
+  readonly embedQuery: (text: string, signal?: AbortSignal) => Promise<number[] | null>;
   private readonly vectorSearch: (
     vector: number[],
     topK: number,
@@ -505,7 +510,9 @@ export class Mem0Backend implements MemoryBackend {
   }
 
   async search(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
+    opts.signal?.throwIfAborted();
     const client = await this.client();
+    opts.signal?.throwIfAborted();
     const limit = opts.limit ?? DEFAULT_SEARCH_LIMIT;
     // Scope invariant (P-003): every search fans out per scope with a `user_id`
     // filter, so a query only ever races its OWN pool (a user / harness / project),
@@ -552,7 +559,8 @@ export class Mem0Backend implements MemoryBackend {
       // N more. Throwing is what lets the caller degrade to the embed-free
       // lexical leg instead.
       const vector =
-        opts.vector ?? (await embedWithinBudget(() => this.embedQuery(query), opts.embedTimeoutMs));
+        opts.vector ?? (await embedWithinBudget((signal) => this.embedQuery(query, signal), opts.embedTimeoutMs, opts.signal));
+      opts.signal?.throwIfAborted();
       if (vector) {
         const pulls = scopes.map(async (scope) => {
           const rows = await this.vectorSearch(vector, limit, {
@@ -569,6 +577,7 @@ export class Mem0Backend implements MemoryBackend {
     }
 
     if (merged === null) {
+      opts.signal?.throwIfAborted();
       const pulls = scopes.map(async (scope) => {
         // mem0's Memory.search reads `topK` (default 20) and IGNORES a
         // `limit` key — passing only `limit` silently over-fetched and
@@ -587,6 +596,7 @@ export class Mem0Backend implements MemoryBackend {
       });
       merged = mergeById((await Promise.all(pulls)).flat());
     }
+    opts.signal?.throwIfAborted();
     const ranked = merged.sort(
       (a, b) => (b.score ?? 0) - (a.score ?? 0),
     );

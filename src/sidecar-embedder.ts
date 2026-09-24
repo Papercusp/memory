@@ -255,7 +255,12 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
       }
       return fallbackPromise;
     };
-    return async (text: string) => (await getFallback())(text);
+    return async (text: string, signal?: AbortSignal) => {
+      signal?.throwIfAborted();
+      const embed = await getFallback();
+      signal?.throwIfAborted();
+      return embed(text, signal);
+    };
   }
 
   let wasDown = false;

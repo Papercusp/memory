@@ -40,9 +40,9 @@ describe('coalesceEmbedFn', () => {
     const observed = expect(cancelled).rejects.toThrow('obsolete');
     const sibling = embed('q');
     first.abort(new Error('obsolete'));
-    await observed;
     expect(upstream.aborted).toBe(false);
     resolve([7]);
+    await observed;
     await expect(sibling).resolves.toEqual([7]);
     expect(fn).toHaveBeenCalledOnce();
   });
@@ -85,9 +85,13 @@ describe('coalesceEmbedFn', () => {
     const old = embed('q', controller.signal);
     const observed = expect(old).rejects.toThrow('obsolete');
     controller.abort(new Error('obsolete'));
-    await observed;
+    let settled = false;
+    void old.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false); // An abort acknowledgement is not native exit.
     const current = embed('q');
     releases[0]([1]); // Models a native implementation that cannot cancel.
+    await observed;
     await Promise.resolve();
     await Promise.resolve();
     expect(stats.size()).toBe(0);
