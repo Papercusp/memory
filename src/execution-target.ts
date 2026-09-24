@@ -120,6 +120,8 @@ export type EmbedRequestedExecution = {
   preference: EmbedDeviceSelection['preference'];
   source: EmbedDeviceSelection['source'];
   invalidValue: string | null;
+  /** The Settings choice this process holds, even when a host override outranks it. `null` = none. */
+  setting: EmbedDeviceSelection['setting'];
   why: string;
 };
 
@@ -191,6 +193,7 @@ export function embedRequestedExecution(): EmbedRequestedExecution {
     preference: d.selection.preference,
     source: d.selection.source,
     invalidValue: d.selection.invalidValue,
+    setting: d.selection.setting,
     why: d.why,
   };
 }
