@@ -754,8 +754,8 @@ export class CanonicalVectorStore {
    * memory-pg-lexical-own-injection-2026-07-13 also the FIRST-CLASS lexical
    * leg of the `hybrid-pg` backend, brought to scoring parity with the
    * claude-file leg that benched best on exact-identifier recall. Pulls
-   * candidates matching ANY query token (ILIKE) across the payload's `name`,
-   * `description`, and `data` fields, then field-weight scores in JS — per
+   * candidates matching ANY query token across the payload's `name`,
+   * `description`, and `data` fields, then field-weight scores in SQL — per
    * token: name hit ×3, else description hit ×2, else data hit ×1,
    * normalized 0..1 by tokens×3. NOT on the cosine scale; ordering only.
    * Reuses the store-kind + archived guards and the post-filter semantics of
@@ -861,13 +861,18 @@ export class CanonicalVectorStore {
     // change to this query on EXECUTION TIME, not on the buffer count.
     const scoreTerms: string[] = [];
     const matchTerms: string[] = [];
+    // P-004: tokens are already lowercase. Lower each field once inside the
+    // existing OFFSET fence, then use LIKE. Repeating ILIKE lowercased the same
+    // potentially long field for every token in both filtering and scoring.
+    // Keep PostgreSQL's own lower/collation semantics (never JS-normalize stored
+    // text), NULL behavior, escaping, scope, validity and rank-before-limit.
     for (const t of tokens) {
       params.push(`%${t.replace(/[\\%_]/g, (m) => `\\${m}`)}%`);
       const p = `$${idx++}`;
       scoreTerms.push(
-        `CASE WHEN nm ILIKE ${p} THEN 3 WHEN ds ILIKE ${p} THEN 2 WHEN dt ILIKE ${p} THEN 1 ELSE 0 END`,
+        `CASE WHEN nm LIKE ${p} THEN 3 WHEN ds LIKE ${p} THEN 2 WHEN dt LIKE ${p} THEN 1 ELSE 0 END`,
       );
-      matchTerms.push(`nm ILIKE ${p} OR ds ILIKE ${p} OR dt ILIKE ${p}`);
+      matchTerms.push(`nm LIKE ${p} OR ds LIKE ${p} OR dt LIKE ${p}`);
     }
     const rawScore = scoreTerms.join(' + ');
     params.push(topK);
@@ -893,9 +898,9 @@ export class CanonicalVectorStore {
                   (${rawScore})::float AS lex_raw
            FROM (
              SELECT id, valid_at, invalid_at, superseded_by, created_at,
-                    payload->>'name' AS nm,
-                    payload->>'description' AS ds,
-                    payload->>'data' AS dt
+                    lower(payload->>'name') AS nm,
+                    lower(payload->>'description') AS ds,
+                    lower(payload->>'data') AS dt
              FROM ${this.cfg.schema}.memory_canonical
              WHERE ${conds.join(' AND ')}
              OFFSET 0

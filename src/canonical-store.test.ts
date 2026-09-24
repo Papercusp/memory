@@ -516,7 +516,7 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     return { store, queries };
   }
 
-  it('emits a token-ILIKE query over the canonical text with kind + archived + scope guards — and NO vec-table join', async () => {
+  it('normalizes fields once with kind + archived + scope guards and no vec-table join', async () => {
     const { store, queries } = makeLexStore([]);
     await store.lexicalSearch('embed sidecar concurrency', 5, { user_id: 'scope-a' });
     expect(queries).toHaveLength(1);
@@ -528,12 +528,12 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     // subquery and matched/scored via their aliases — never re-extracted per token
     // (each `payload->>'…'` detoasts the whole jsonb; per-token repetition was 28x
     // the buffers). P-002: all three fields score, one shared param per token.
-    expect(q.sql).toContain("payload->>'name' AS nm");
-    expect(q.sql).toContain("payload->>'description' AS ds");
-    expect(q.sql).toContain("payload->>'data' AS dt");
-    expect(q.sql).toContain('dt ILIKE');
-    expect(q.sql).toContain('nm ILIKE');
-    expect(q.sql).toContain('ds ILIKE');
+    expect(q.sql).toContain("lower(payload->>'name') AS nm");
+    expect(q.sql).toContain("lower(payload->>'description') AS ds");
+    expect(q.sql).toContain("lower(payload->>'data') AS dt");
+    expect(q.sql).toContain('dt LIKE');
+    expect(q.sql).toContain('nm LIKE');
+    expect(q.sql).toContain('ds LIKE');
     // Exactly one extraction per field, however many tokens the query has.
     expect(q.sql.match(/payload->>'name'/g)).toHaveLength(1);
     expect(q.sql.match(/payload->>'description'/g)).toHaveLength(1);
@@ -569,7 +569,7 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     await store.lexicalSearch('embed sidecar', 5, { user_id: 'u' });
     const { sql, params } = queries[0];
     // The weights live in SQL: name ×3 > description ×2 > data ×1, per token.
-    expect(sql).toContain('CASE WHEN nm ILIKE');
+    expect(sql).toContain('CASE WHEN nm LIKE');
     expect(sql).toContain('THEN 3 WHEN');
     expect(sql).toContain('THEN 2 WHEN');
     expect(sql).toContain('THEN 1 ELSE 0 END');
@@ -582,7 +582,7 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     // of the match chain — measured 761 ms vs 430 ms at 24 tokens. Rows that score 0
     // are already excluded by the match predicate below.
     expect(sql).not.toContain('lex_raw > 0');
-    expect(sql).toMatch(/WHERE \(nm ILIKE/);
+    expect(sql).toMatch(/WHERE \(nm LIKE/);
     // NOT a recency-ranked candidate pull, and no candidate cap above topK.
     expect(sql).not.toContain('ORDER BY created_at DESC');
     expect(params.at(-1)).toBe(5); // the only LIMIT is topK itself
