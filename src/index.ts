@@ -57,6 +57,8 @@ export {
   type ListOptions,
   type MemoryAvailability,
   type MemoryBackend,
+  type ManagedMemoryWrites,
+  type ManagedMemoryResource,
   type LegRunStats,
   type MemoryEntry,
   type RetrievalProvenance,

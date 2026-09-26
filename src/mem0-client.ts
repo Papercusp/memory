@@ -47,6 +47,7 @@
  */
 
 import { CanonicalVectorStore } from './canonical-store';
+import type { ManagedMemoryWrites } from './backend';
 import { memoryHost, memoryLocalStoreDir, memorySchema } from './config';
 import { coalesceEmbedFn } from './embed-coalesce';
 import { FallbackExtractionLlm, type ExtractionLlm } from './extraction-llm';
@@ -111,6 +112,22 @@ function patchVectorStoreFactory(mem0Module: {
  * the connection doesn't leak across the hourly TTL rebuild / invalidate.
  */
 const _liveCanonicalStores = new Set<CanonicalVectorStore>();
+
+/** Capture one coherent store/embedder pair before the asynchronous write. */
+async function currentManagedWrites(): Promise<ManagedMemoryWrites> {
+  await getMemoryClient();
+  const store = [..._liveCanonicalStores][0];
+  const embed = _currentEmbedFn;
+  if (!store || !embed) throw new Error('mem0_unavailable');
+  return store.managedWrites(embed);
+}
+
+export const canonicalManagedWrites: ManagedMemoryWrites = {
+  create: async (key, text, opts) => (await currentManagedWrites()).create(key, text, opts),
+  recover: async (key, scope) => (await currentManagedWrites()).recover(key, scope),
+  cancel: async (key, scope) => (await currentManagedWrites()).cancel(key, scope),
+  removeIfUnchanged: async (resource, scope) => (await currentManagedWrites()).removeIfUnchanged(resource, scope),
+};
 
 /** Close + forget every tracked canonical store's PG client. Fire-and-forget
  *  safe — `dispose()` is idempotent and tolerant of an in-flight client. */

@@ -37,6 +37,9 @@ import type {
 export class LexicalLegBackend implements MemoryBackend {
   readonly name = 'lexical-leg';
 
+  /** Same storage identity; the hybrid must not create a second projection. */
+  get managedWrites() { return this.inner.managedWrites; }
+
   /** Both methods forward to the wrapped backend's `searchLexical`. */
   readonly scoreScale = 'lexical' as const;
   readonly lexicalScoreScale = 'lexical' as const;

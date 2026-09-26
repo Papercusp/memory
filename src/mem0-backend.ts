@@ -33,12 +33,14 @@ import {
   type MemoryAvailability,
   type MemoryBackend,
   type MemoryEntry,
+  type ManagedMemoryWrites,
   type RememberOptions,
   type SearchOptions,
   type UpdatePatch,
 } from './backend';
 import {
   embedForCurrentClient,
+  canonicalManagedWrites,
   getMemoryClient,
   invalidateEntryCanonical,
   invalidateMemoryClient,
@@ -305,6 +307,7 @@ function mergeById(entries: MemoryEntry[]): MemoryEntry[] {
 }
 
 export interface Mem0BackendDeps {
+  managedWrites?: ManagedMemoryWrites;
   /** Test seam — defaults to the real cached mem0 client accessor. */
   getClient?: () => Promise<MemoryClient | null>;
   /** Test seam — the metadata merge-patch (defaults to the real canonical-store path). */
@@ -403,6 +406,7 @@ async function embedWithinBudget(
 
 export class Mem0Backend implements MemoryBackend {
   readonly name = 'mem0';
+  readonly managedWrites?: ManagedMemoryWrites;
 
   /** pgvector similarity — an absolute, cross-call-comparable measure. */
   readonly scoreScale = 'cosine' as const;
@@ -430,6 +434,8 @@ export class Mem0Backend implements MemoryBackend {
   ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
 
   constructor(deps: Mem0BackendDeps = {}) {
+    // A replaced client must explicitly supply its own coherent storage seam.
+    this.managedWrites = deps.managedWrites ?? (deps.getClient ? undefined : canonicalManagedWrites);
     this.getClient = deps.getClient ?? getMemoryClient;
     this.updatePayload = deps.updatePayload ?? updateMemoryPayload;
     this.lexicalSearch = deps.lexicalSearch ?? lexicalSearchCanonical;

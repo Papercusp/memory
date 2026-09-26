@@ -39,6 +39,7 @@ import type {
   ListOptions,
   MemoryAvailability,
   MemoryBackend,
+  ManagedMemoryWrites,
   MemoryEntry,
   RememberOptions,
   SearchLegStats,
@@ -118,6 +119,7 @@ export interface HybridBackendOptions {
 
 export class HybridBackend implements MemoryBackend {
   readonly name: string;
+  readonly managedWrites?: ManagedMemoryWrites;
 
   /**
    * `search()` ALWAYS returns fused RRF scores — there is no branch that
@@ -162,6 +164,12 @@ export class HybridBackend implements MemoryBackend {
     this.name = opts.name ?? "hybrid";
     const cosineEmbed = cosine.embedQuery?.bind(cosine);
     if (cosineEmbed) this.embedQuery = cosineEmbed;
+    // Only advertise atomic managed writes when BOTH legs share the same
+    // storage capability. A separate file projection currently cannot fence a
+    // late write or compare-and-delete atomically, so refuse before any write.
+    if (cosine.managedWrites && lexical.managedWrites === cosine.managedWrites) {
+      this.managedWrites = cosine.managedWrites;
+    }
   }
 
   available(): Promise<MemoryAvailability> {
