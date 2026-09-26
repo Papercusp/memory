@@ -39,6 +39,7 @@ import {
   memoryHost,
   isMemoryConfigured,
   memorySchema,
+  memoryLocalStoreDir,
   type MemoryHost,
 } from './config';
 
@@ -148,5 +149,28 @@ describe('memorySchema — host.schema ?? "public"', () => {
 
   it('throws (via memoryHost) when unconfigured — schema is not resolvable with no host', () => {
     expect(() => memorySchema()).toThrow(/not configured/);
+  });
+});
+
+describe('memoryLocalStoreDir — where mem0 keeps its SQLite history', () => {
+  it('passes a directory, null (in-memory) and unset (tmpdir default) through', () => {
+    configureMemory(host({ localStoreDir: '/state' }));
+    expect(memoryLocalStoreDir()).toBe('/state');
+    configureMemory(host({ localStoreDir: null }));
+    expect(memoryLocalStoreDir()).toBeNull();
+    configureMemory(host());
+    expect(memoryLocalStoreDir()).toBeUndefined();
+  });
+
+  it('resolves a function on every read, not when the host is installed', () => {
+    // WI-10003279: the operator installs its host at import time, before a
+    // test points its environment at a private state directory. A directory
+    // captured at install time sent that test's history into the live one.
+    let stateDir: string | null = '/live';
+    configureMemory(host({ localStoreDir: () => stateDir }));
+    stateDir = '/fixture';
+    expect(memoryLocalStoreDir()).toBe('/fixture');
+    stateDir = null;
+    expect(memoryLocalStoreDir()).toBeNull();
   });
 });

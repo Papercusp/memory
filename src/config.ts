@@ -109,10 +109,17 @@ export interface MemoryHost {
 
   /**
    * Directory for mem0's local SQLite event-history file. Default the OS
-   * tmpdir. The operator passes `~/.papercusp` so the log survives across
-   * restarts. Set to `null` to force the in-memory (`:memory:`) history.
+   * tmpdir. The operator passes its state directory so the log survives
+   * across restarts. Set to `null` to force the in-memory (`:memory:`)
+   * history.
+   *
+   * A function is resolved each time a client is built, not when this host is
+   * installed. A host whose state directory is chosen by its environment needs
+   * that: the host is usually installed at import time, before a test or an
+   * embedding process has pointed the environment at its own directory, and a
+   * directory fixed then is shared with every other process on the machine.
    */
-  localStoreDir?: string | null;
+  localStoreDir?: string | null | (() => string | null | undefined);
 
   /**
    * Which `MemoryBackend` `getMemoryBackend()` serves — a registered
@@ -136,6 +143,16 @@ export interface MemoryHost {
 /** Resolved memory-table schema — host config, defaulting to `public`. */
 export function memorySchema(): string {
   return memoryHost().schema ?? 'public';
+}
+
+/**
+ * The mem0 history directory in force right now: `null` forces in-memory
+ * history, `undefined` means the default (the OS tmpdir). A function-valued
+ * `localStoreDir` is called here, on every read.
+ */
+export function memoryLocalStoreDir(): string | null | undefined {
+  const configured = memoryHost().localStoreDir;
+  return typeof configured === 'function' ? configured() : configured;
 }
 
 // The host is stored on a process-global slot, NOT a module-level `let`.

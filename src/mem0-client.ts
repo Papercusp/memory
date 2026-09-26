@@ -47,7 +47,7 @@
  */
 
 import { CanonicalVectorStore } from './canonical-store';
-import { memoryHost, memorySchema } from './config';
+import { memoryHost, memoryLocalStoreDir, memorySchema } from './config';
 import { coalesceEmbedFn } from './embed-coalesce';
 import { FallbackExtractionLlm, type ExtractionLlm } from './extraction-llm';
 import { dynamicImport } from './dynamic-import';
@@ -679,7 +679,7 @@ async function buildClient(): Promise<MemoryClient | null> {
   // there so the event log survives restarts. `localStoreDir: null`
   // forces the in-memory history.
   let historyDbPath = ':memory:';
-  const localStoreDir = memoryHost().localStoreDir;
+  const localStoreDir = memoryLocalStoreDir();
   if (localStoreDir !== null) {
     try {
       const os = await import('node:os');
