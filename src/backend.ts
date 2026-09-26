@@ -476,9 +476,27 @@ export class MemoryUnavailableError extends Error {
  * and out-of-lib backends registered via `registerMemoryBackend()`
  * (e.g. a Claude-topic-file bridge).
  */
+export interface ManagedMemoryResource {
+  id: string;
+  /** Original backend fingerprint, never recomputed from a later edit. */
+  fingerprint: string;
+  disposition?: 'absent' | 'changed';
+}
+
+/** Optional exact-write capability. Each key names one immutable operation.
+ * Cancellation must persist even before create arrives, and survive deletion of
+ * the memory itself. Prepared writes are hidden from ordinary recall. */
+export interface ManagedMemoryWrites {
+  create(key: string, text: string, opts: RememberOptions): Promise<ManagedMemoryResource[]>;
+  recover(key: string, scope: string): Promise<ManagedMemoryResource[]>;
+  cancel(key: string, scope: string): Promise<void>;
+  removeIfUnchanged(resource: ManagedMemoryResource, scope: string): Promise<'removed' | 'absent' | 'changed'>;
+}
+
 export interface MemoryBackend {
   /** Stable backend identifier (registry key, diagnostics). */
   readonly name: string;
+  readonly managedWrites?: ManagedMemoryWrites;
 
   /**
    * Non-throwing availability probe. `{ ok: false, reason }` means the

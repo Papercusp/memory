@@ -42,6 +42,7 @@
  */
 
 import { Pool as PgPool, type PoolClient, type QueryResult } from 'pg';
+import { CanonicalManagedWrites } from './canonical-managed-writes';
 import {
   pgvectorMetricSpec,
   pgvectorScoreFromDistance,
@@ -473,6 +474,12 @@ export class CanonicalVectorStore {
     }
     this.cfg = config;
     this.storeKind = config.collectionName?.endsWith('_entities') ? 'entity' : 'memory';
+  }
+
+  managedWrites(embed: (text: string) => Promise<number[] | null>): CanonicalManagedWrites {
+    if (this.storeKind !== 'memory') throw new Error('managed writes require the memory store');
+    return new CanonicalManagedWrites({ pool: () => this.getClient(), schema: this.cfg.schema,
+      vecTable: this.cfg.vecTable, dims: this.cfg.embeddingModelDims, embed });
   }
 
   private async getClient(): Promise<PgPool> {
