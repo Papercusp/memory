@@ -10,7 +10,7 @@
  *   - `ClaudeFileMemoryBackend` on a temp dir (a real backend
  *     end-to-end; never the live ~/.claude store).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -175,6 +175,32 @@ describe('seedCorpus', () => {
     const manifest = await seedCorpus(noop, CORPUS, { scope: 'bench' });
     expect(manifest.failed.sort()).toEqual(['alpha', 'beta', 'gamma']);
     expect(Object.values(manifest.ids).flat()).toEqual([]);
+  });
+
+  it('retries only failed rows without double-counting corpus size or progress', async () => {
+    const be = new LexicalDouble();
+    const remember = be.remember.bind(be);
+    const calls = new Map<string, number>();
+    vi.spyOn(be, 'remember').mockImplementation(async (text, opts) => {
+      const key = String(opts.metadata?.corpus_key);
+      const count = (calls.get(key) ?? 0) + 1;
+      calls.set(key, count);
+      if (key === 'beta' && count === 1) throw new Error('transient sidecar outage');
+      return remember(text, opts);
+    });
+    const progress: number[] = [];
+
+    const manifest = await seedCorpus(be, CORPUS, {
+      scope: 'bench',
+      concurrency: 2,
+      maxAttempts: 2,
+      onProgress: (done) => progress.push(done),
+    });
+
+    expect(manifest.failed).toEqual([]);
+    expect(calls).toEqual(new Map([['alpha', 1], ['beta', 2], ['gamma', 1]]));
+    expect(manifest.totalChars).toBe(CORPUS.reduce((sum, entry) => sum + entry.text.length, 0));
+    expect(progress).toEqual([1, 2, 3]);
   });
 
   it('unseedCorpus removes what was created', async () => {

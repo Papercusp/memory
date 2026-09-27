@@ -21,6 +21,10 @@ export interface SeedOptions {
   verbatim?: boolean;
   /** Parallel remember() calls (default 8; 1 = serial). */
   concurrency?: number;
+  /** Total attempts for rows whose remember() throws or persists zero events. */
+  maxAttempts?: number;
+  /** Delay between failed-row-only attempts (default 0). */
+  retryDelayMs?: number;
   /** Progress callback (done, total). */
   onProgress?: (done: number, total: number) => void;
 }
@@ -33,48 +37,58 @@ export async function seedCorpus(
 ): Promise<SeedManifest> {
   const verbatim = opts.verbatim ?? true;
   const concurrency = Math.max(1, opts.concurrency ?? 8);
+  const maxAttempts = Math.max(1, Math.floor(opts.maxAttempts ?? 1));
+  const retryDelayMs = Math.max(0, Math.floor(opts.retryDelayMs ?? 0));
   const manifest: SeedManifest = {
     backend: backend.name,
     scope: opts.scope,
     ids: {},
     failed: [],
     rememberMs: new Array(corpus.length).fill(0),
-    totalChars: 0,
+    totalChars: corpus.reduce((sum, entry) => sum + entry.text.length, 0),
   };
 
-  let next = 0;
-  let done = 0;
-  async function worker(): Promise<void> {
-    for (;;) {
-      const i = next++;
-      if (i >= corpus.length) return;
-      const entry = corpus[i];
-      const t0 = performance.now();
-      try {
-        const r = await backend.remember(entry.text, {
-          scope: opts.scope,
-          kind: entry.kind,
-          verbatim,
-          metadata: {
-            ...(entry.description ? { description: entry.description } : {}),
-            ...(entry.metadata ?? {}),
-            corpus_key: entry.key,
-          },
-        });
-        manifest.ids[entry.key] = r.ids;
-        const persisted = r.storedEvents ?? r.ids.length;
-        if (persisted === 0) manifest.failed.push(entry.key);
-      } catch {
-        manifest.ids[entry.key] = [];
-        manifest.failed.push(entry.key);
+  let pending = corpus.map((_, index) => index);
+  for (let attempt = 1; attempt <= maxAttempts && pending.length > 0; attempt++) {
+    let next = 0;
+    let done = 0;
+    const failed: number[] = [];
+    async function worker(): Promise<void> {
+      for (;;) {
+        const pendingIndex = next++;
+        if (pendingIndex >= pending.length) return;
+        const i = pending[pendingIndex];
+        const entry = corpus[i];
+        const t0 = performance.now();
+        let persisted = false;
+        try {
+          const r = await backend.remember(entry.text, {
+            scope: opts.scope,
+            kind: entry.kind,
+            verbatim,
+            metadata: {
+              ...(entry.description ? { description: entry.description } : {}),
+              ...(entry.metadata ?? {}),
+              corpus_key: entry.key,
+            },
+          });
+          manifest.ids[entry.key] = r.ids;
+          persisted = (r.storedEvents ?? r.ids.length) > 0;
+        } catch {
+          manifest.ids[entry.key] = [];
+        }
+        manifest.rememberMs[i] += performance.now() - t0;
+        if (!persisted) failed.push(i);
+        if (attempt === 1) opts.onProgress?.(++done, corpus.length);
       }
-      manifest.rememberMs[i] = performance.now() - t0;
-      manifest.totalChars += entry.text.length;
-      done += 1;
-      opts.onProgress?.(done, corpus.length);
+    }
+    await Promise.all(Array.from({ length: Math.min(concurrency, pending.length || 1) }, worker));
+    pending = failed;
+    if (pending.length > 0 && attempt < maxAttempts && retryDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
     }
   }
-  await Promise.all(Array.from({ length: Math.min(concurrency, corpus.length || 1) }, worker));
+  manifest.failed = pending.map((index) => corpus[index].key);
   return manifest;
 }
 
