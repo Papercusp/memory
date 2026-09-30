@@ -30,6 +30,31 @@ export interface SeedOptions {
 }
 
 /** Seed one corpus into one backend; returns the key→ids manifest. */
+/**
+ * `null` when every one of `expected` corpus entries persisted; otherwise a
+ * one-line reason: how many seeded, how many failed, a sample of failed keys, and
+ * the FIRST error remember() threw. A bench must refuse to report over a partially
+ * seeded store, because an empty pool scores zero (or "admits nothing") for
+ * infrastructure reasons, not retrieval reasons. The error text is the point: a
+ * schema fault that rejected every write read only as "114 failed" for four weeks
+ * (WI-10004107).
+ *
+ * A failed key is not counted as seeded even though seedCorpus records `ids[key] = []`
+ * for it, so a total failure reads "0/N seeded", never "N/N seeded, N failed".
+ */
+export function seedFailureReason(manifest: SeedManifest, expected: number): string | null {
+  const failed = new Set(manifest.failed);
+  const seeded = Object.keys(manifest.ids).filter((k) => !failed.has(k)).length;
+  if (seeded === expected && failed.size === 0) return null;
+  const sample = manifest.failed.slice(0, 3).join(', ');
+  const firstKey = manifest.failed.find((k) => manifest.errors?.[k]);
+  return (
+    `corpus seed incomplete: ${seeded}/${expected} seeded, ${manifest.failed.length} failed` +
+    (sample ? ` (e.g. ${sample})` : '') +
+    (firstKey ? ` — first error (${firstKey}): ${manifest.errors[firstKey]}` : '')
+  );
+}
+
 export async function seedCorpus(
   backend: MemoryBackend,
   corpus: readonly CorpusEntry[],
@@ -44,6 +69,7 @@ export async function seedCorpus(
     scope: opts.scope,
     ids: {},
     failed: [],
+    errors: {},
     rememberMs: new Array(corpus.length).fill(0),
     totalChars: corpus.reduce((sum, entry) => sum + entry.text.length, 0),
   };
@@ -74,8 +100,11 @@ export async function seedCorpus(
           });
           manifest.ids[entry.key] = r.ids;
           persisted = (r.storedEvents ?? r.ids.length) > 0;
-        } catch {
+          if (persisted) delete manifest.errors[entry.key];
+          else manifest.errors[entry.key] = 'remember() returned without persisting anything';
+        } catch (err) {
           manifest.ids[entry.key] = [];
+          manifest.errors[entry.key] = err instanceof Error ? err.message : String(err);
         }
         manifest.rememberMs[i] += performance.now() - t0;
         if (!persisted) failed.push(i);

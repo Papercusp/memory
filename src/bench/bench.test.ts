@@ -36,7 +36,7 @@ import {
 import { rankedCorpusKeys, runGoldSet } from './retrieval';
 import { distinctiveToken, runRoundtrips } from './roundtrip';
 import { renderScorecardMarkdown, rememberP50 } from './scorecard';
-import { seedCorpus, unseedCorpus } from './seed';
+import { seedCorpus, seedFailureReason, unseedCorpus } from './seed';
 import { generateSyntheticCorpus } from './synthetic';
 import type { BackendScorecard, CorpusEntry, GoldQuery, QueryOutcome } from './types';
 
@@ -198,9 +198,42 @@ describe('seedCorpus', () => {
     });
 
     expect(manifest.failed).toEqual([]);
+    // A row that recovered on retry carries no stale error.
+    expect(manifest.errors).toEqual({});
+    expect(seedFailureReason(manifest, CORPUS.length)).toBeNull();
     expect(calls).toEqual(new Map([['alpha', 1], ['beta', 2], ['gamma', 1]]));
     expect(manifest.totalChars).toBe(CORPUS.reduce((sum, entry) => sum + entry.text.length, 0));
     expect(progress).toEqual([1, 2, 3]);
+  });
+
+  it('records WHY each row failed, and seedFailureReason quotes it (WI-10004107)', async () => {
+    // The shape of the real fault: every write rejected by the schema. It used to
+    // surface only as "3 failed", with the message swallowed.
+    const be = new LexicalDouble();
+    const schemaFault = 'null value in column "row_kind" of relation "memory_vec_harrier" violates not-null constraint';
+    vi.spyOn(be, 'remember').mockRejectedValue(new Error(schemaFault));
+
+    const manifest = await seedCorpus(be, CORPUS, { scope: 'bench' });
+
+    expect(manifest.failed.sort()).toEqual(['alpha', 'beta', 'gamma']);
+    expect(manifest.errors).toEqual({ alpha: schemaFault, beta: schemaFault, gamma: schemaFault });
+    // "0/3 seeded" — never "3/3 seeded, 3 failed", although ids[key] = [] exists per key.
+    expect(seedFailureReason(manifest, CORPUS.length)).toMatch(
+      /^corpus seed incomplete: 0\/3 seeded, 3 failed \(e\.g\. .+\) — first error \((alpha|beta|gamma)\): null value in column "row_kind"/,
+    );
+  });
+
+  it('names a silent no-op write (resolved, nothing persisted) as a failure reason too', async () => {
+    const be = new LexicalDouble();
+    vi.spyOn(be, 'remember').mockResolvedValue({ ids: [] } as Awaited<ReturnType<LexicalDouble['remember']>>);
+    const manifest = await seedCorpus(be, CORPUS, { scope: 'bench' });
+    expect(Object.values(manifest.errors)).toEqual(new Array(3).fill('remember() returned without persisting anything'));
+  });
+
+  it('seedFailureReason flags a corpus that seeded fewer rows than expected, even with no failures', async () => {
+    const manifest = await seedCorpus(new LexicalDouble(), CORPUS, { scope: 'bench' });
+    expect(seedFailureReason(manifest, CORPUS.length)).toBeNull();
+    expect(seedFailureReason(manifest, CORPUS.length + 1)).toMatch(/3\/4 seeded, 0 failed/);
   });
 
   it('unseedCorpus removes what was created', async () => {
