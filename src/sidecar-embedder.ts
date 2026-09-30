@@ -50,6 +50,8 @@ export interface SidecarEmbedBatchOpts {
   model: string;
   kind: GemmaEmbedKind;
   texts: string[];
+  /** Evaluate inference directly rather than the sidecar's cache. */
+  bypassCache?: boolean;
   timeoutMs?: number;
   /** Optional caller lifetime. Aborting it closes the HTTP request immediately
    *  instead of leaving stale work in the shared sidecar FIFO until the
@@ -63,6 +65,7 @@ export interface SidecarEmbedResponse {
   dims: number;
   runtime: string;
   modelRev: string;
+  cache?: { hits: number; coalesced: number; inferred: number };
 }
 
 export const DEFAULT_SIDECAR_TIMEOUT_MS = 15_000;
@@ -171,7 +174,8 @@ export async function sidecarEmbedBatch(url: string, opts: SidecarEmbedBatchOpts
     const res = await fetchFn(`${url.replace(/\/$/, '')}/embed`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: opts.model, kind: opts.kind, texts }),
+      body: JSON.stringify({ model: opts.model, kind: opts.kind, texts,
+        ...(opts.bypassCache === undefined ? {} : { bypassCache: opts.bypassCache }) }),
       signal: ctl.signal,
     });
     if (!res.ok) {

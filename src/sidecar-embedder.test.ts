@@ -144,6 +144,13 @@ describe('resolveEmbedSidecarUrl', () => {
 });
 
 describe('sidecarEmbedBatch', () => {
+  it('preserves explicit cache bypass for repeatable candidate inference measurements', async () => {
+    const stub = await startStubSidecar();
+    closers.push(stub.close);
+    await sidecarEmbedBatch(stub.url, { model: 'mdenseon', kind: 'query', texts: ['same'], bypassCache: true });
+    expect(stub.requests).toEqual([{ model: 'mdenseon', kind: 'query', texts: ['same'], bypassCache: true }]);
+  });
+
   it('speaks the D-004 wire: {model, kind, texts} → {vectors, dims, runtime, modelRev}', async () => {
     const stub = await startStubSidecar();
     closers.push(stub.close);
