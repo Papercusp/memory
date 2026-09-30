@@ -33,7 +33,7 @@ import {
   recallAtKBySet,
   reciprocalRank,
 } from './metrics';
-import { rankedCorpusKeys, runGoldSet } from './retrieval';
+import { rankedCorpusKeys, runGoldSet, searchFailureReason } from './retrieval';
 import { distinctiveToken, runRoundtrips } from './roundtrip';
 import { renderScorecardMarkdown, rememberP50 } from './scorecard';
 import { seedCorpus, seedFailureReason, unseedCorpus } from './seed';
@@ -329,6 +329,52 @@ describe('runGoldSet', () => {
     expect(seen[0].lexicalQuery).toBe('port 3170 staging operator deploy-cli');
     // Absent — not undefined-valued — so an arm-free replay is byte-identical.
     expect('lexicalQuery' in seen[1]).toBe(false);
+  });
+
+  describe('search errors are never scored as misses', () => {
+    // A backend that works except for ONE query, whose search throws. Before
+    // EI-24653769281762544 the throw was swallowed into an empty hit list, so a
+    // failing backend printed confident zeros indistinguishable from real misses.
+    const failingQueryId = GOLD[0].id;
+    const flaky = (): MemoryBackend => {
+      const be = new LexicalDouble();
+      return {
+        ...be,
+        name: 'flaky',
+        available: () => be.available(),
+        remember: (t, o) => be.remember(t, o),
+        list: (o) => be.list(o),
+        get: (id) => be.get(id),
+        forget: (id) => be.forget(id),
+        update: (id, p) => be.update(id, p),
+        search: (q, o) => (q === GOLD[0].query ? Promise.reject(new Error('connection refused')) : be.search(q, o)),
+      };
+    };
+
+    it('rejects the run by default, naming the errored count and the first error', async () => {
+      await expect(runGoldSet(flaky(), GOLD, { scope: 'bench', limit: 10 })).rejects.toThrow(
+        new RegExp(`1/${GOLD.length} searches threw — first error \\(${failingQueryId}\\): connection refused`),
+      );
+    });
+
+    it('with tolerateSearchErrors, finishes and marks exactly the errored outcome', async () => {
+      const r = await runGoldSet(flaky(), GOLD, { scope: 'bench', limit: 10, tolerateSearchErrors: true });
+      const errored = r.perQuery.filter((q) => q.error !== undefined);
+      expect(errored.map((q) => q.queryId)).toEqual([failingQueryId]);
+      expect(errored[0].error).toBe('connection refused');
+      expect(errored[0].rawHits).toBe(0);
+      expect(searchFailureReason(r)).toContain('1/');
+    });
+
+    it('a clean run has no errors and no failure reason (calibration)', async () => {
+      const be = new LexicalDouble();
+      await seedCorpus(be, CORPUS, { scope: 'bench' });
+      const r = await runGoldSet(be, GOLD, { scope: 'bench', limit: 10 });
+      expect(r.perQuery.every((q) => !('error' in q))).toBe(true);
+      expect(searchFailureReason(r)).toBeNull();
+      // NoopBackend returns nothing without throwing: an honest zero, not an error.
+      expect(searchFailureReason(await runGoldSet(new NoopBackend(), GOLD, { scope: 'bench' }))).toBeNull();
+    });
   });
 
   it('rankedCorpusKeys dedupes and drops unstamped hits', () => {

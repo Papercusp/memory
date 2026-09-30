@@ -36,7 +36,7 @@ export {
 } from './metrics';
 
 export { seedCorpus, seedFailureReason, unseedCorpus, type SeedOptions } from './seed';
-export { rankedCorpusKeys, runGoldSet, toCandidateHit, type RetrievalOptions } from './retrieval';
+export { rankedCorpusKeys, runGoldSet, searchFailureReason, toCandidateHit, type RetrievalOptions } from './retrieval';
 export {
   queryLevelPRF,
   runFloorSweep,

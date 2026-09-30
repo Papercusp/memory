@@ -34,6 +34,15 @@ export interface RetrievalOptions {
    * Off by default: the text payload is only worth holding when it is used.
    */
   captureCandidates?: boolean;
+  /**
+   * Keep going when `backend.search` throws: the query scores as an empty hit
+   * list with `QueryOutcome.error` set. OFF by default — a run with ANY errored
+   * query then REJECTS with `searchFailureReason`, because an errored query is
+   * indistinguishable from a genuine miss in every metric, and a bench over a
+   * failing backend otherwise prints confident zeros. Opt in only where the
+   * caller surfaces `searchFailureReason` itself (a multi-backend comparison).
+   */
+  tolerateSearchErrors?: boolean;
   /** Progress callback (done, total). */
   onProgress?: (done: number, total: number) => void;
 }
@@ -60,6 +69,18 @@ export function rankedCorpusKeys(hits: readonly MemoryEntry[]): string[] {
     keys.push(key);
   }
   return keys;
+}
+
+/**
+ * Why a replay's metrics cannot be trusted, or null when every search ran. The
+ * search-side twin of `seedFailureReason`: names the errored count and the first
+ * error, so a refusal says what broke instead of only that something did.
+ */
+export function searchFailureReason(run: { readonly perQuery: readonly QueryOutcome[] }): string | null {
+  const errored = run.perQuery.filter((o) => o !== undefined && o.error !== undefined);
+  if (errored.length === 0) return null;
+  const first = errored[0];
+  return `gold replay incomplete: ${errored.length}/${run.perQuery.length} searches threw — first error (${first.queryId}): ${first.error}`;
 }
 
 /** Replay the gold set against one backend. */
@@ -95,6 +116,7 @@ export async function runGoldSet(
       const q = gold[i];
       const t0 = performance.now();
       let hits: MemoryEntry[] = [];
+      let error: string | undefined;
       try {
         hits = await backend.search(q.query, {
           scope: opts.scope,
@@ -106,8 +128,11 @@ export async function runGoldSet(
           ...(q.lexicalQuery ? { lexicalQuery: q.lexicalQuery } : {}),
           ...floorPolicy,
         });
-      } catch {
-        hits = []; // an unavailable backend scores zero, it doesn't crash the run
+      } catch (e) {
+        // Scored as an empty list so the run can finish, but RECORDED: the query
+        // measured nothing, and the run is refused below unless tolerated.
+        hits = [];
+        error = e instanceof Error ? e.message : String(e);
       }
       const ms = performance.now() - t0;
       outcomes[i] = {
@@ -119,6 +144,7 @@ export async function runGoldSet(
         ...(typeof hits[0]?.score === 'number' ? { topScore: hits[0].score } : {}),
         ...(typeof hits[0]?.text === 'string' ? { topText: hits[0].text } : {}),
         ...(opts.captureCandidates ? { candidates: hits.map(toCandidateHit) } : {}),
+        ...(error !== undefined ? { error } : {}),
         ms,
       };
       done += 1;
@@ -126,6 +152,11 @@ export async function runGoldSet(
     }
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, gold.length || 1) }, worker));
+
+  const failure = searchFailureReason({ perQuery: outcomes });
+  if (failure !== null && !opts.tolerateSearchErrors) {
+    throw new Error(`${failure} — refusing to report metrics over searches that never ran (backend ${backend.name})`);
+  }
 
   const { byClass, overall } = aggregateByClass(outcomes);
   return {

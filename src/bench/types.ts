@@ -120,6 +120,13 @@ export interface QueryOutcome {
    * second retrieval instead of the one these metrics describe.
    */
   candidates?: CandidateHit[];
+  /**
+   * Set when `backend.search` THREW for this query. The outcome then carries an
+   * empty hit list that measured nothing — not a real miss — so a run with any
+   * errored query is refused unless the caller opted into tolerating them
+   * (`RetrievalOptions.tolerateSearchErrors`); see `searchFailureReason`.
+   */
+  error?: string;
   /** Search wall-clock ms. */
   ms: number;
 }
