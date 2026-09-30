@@ -43,6 +43,7 @@
 
 import { Pool as PgPool, type PoolClient, type QueryResult } from 'pg';
 import { CanonicalManagedWrites } from './canonical-managed-writes';
+import { ARCHIVED_ELIGIBLE_FILTER } from './backend';
 import {
   pgvectorMetricSpec,
   pgvectorScoreFromDistance,
@@ -394,6 +395,43 @@ export function splitTemporalControls(filters?: SearchFilters): {
   };
 }
 
+interface ArchivedEligibility { key: string; values: string[] }
+
+/**
+ * Split the archived-eligibility control out of the filter map. A malformed
+ * control admits nothing: archived rows stay excluded, which is the default,
+ * and ordinary recall is never affected by it.
+ */
+export function splitArchivedEligibility(filters?: SearchFilters): {
+  eligible: ArchivedEligibility | null;
+  rest: SearchFilters | undefined;
+} {
+  if (!filters || !(ARCHIVED_ELIGIBLE_FILTER in filters)) return { eligible: null, rest: filters };
+  const { [ARCHIVED_ELIGIBLE_FILTER]: raw, ...rest } = filters;
+  let parsed: unknown = raw;
+  if (typeof raw === 'string') {
+    try { parsed = JSON.parse(raw); } catch { parsed = null; }
+  }
+  const candidate = parsed as { key?: unknown; values?: unknown } | null;
+  const key = typeof candidate?.key === 'string' ? safeKey(candidate.key) : '';
+  const values = Array.isArray(candidate?.values)
+    ? candidate.values.filter((value): value is string => typeof value === 'string' && value.length > 0)
+    : [];
+  return { eligible: key && values.length > 0 ? { key, values } : null, rest };
+}
+
+/** `state != 'archived'`, widened to the named archived rows when eligible. */
+function archivedCond(
+  alias: string,
+  eligible: ArchivedEligibility | null,
+  params: unknown[],
+  nextIdx: () => number,
+): string {
+  if (!eligible) return `${alias}state != 'archived'`;
+  params.push(eligible.values);
+  return `(${alias}state != 'archived' OR ${alias}payload->>'${eligible.key}' = ANY($${nextIdx()}::text[]))`;
+}
+
 /**
  * The default current-rows clause (memory kind only — entity rows are mem0's
  * lifecycle, exempt by design). With `asOf` it becomes the point-in-time
@@ -678,17 +716,18 @@ export class CanonicalVectorStore {
     // they'd become payload-equality conds matching nothing); the validity
     // clause itself applies to memory rows only — entity rows are mem0's
     // lifecycle, exempt by design.
-    const { temporal, rest } = splitTemporalControls(filters);
+    const { eligible, rest: controls } = splitArchivedEligibility(filters);
+    const { temporal, rest } = splitTemporalControls(controls);
+    const params: unknown[] = [toVectorLiteral(query), topK];
+    let idx = 3;
     // The `v.` discriminator is what lets the planner choose the partial
     // memory-only HNSW index (migration 1093); the `c.` one is the retained
     // correctness backstop. See vecKindCond for the measurement.
     const conds: string[] = [
       vecKindCond('v.', this.storeKind),
       storeKindCond('c.', this.storeKind),
-      `c.state != 'archived'`,
+      archivedCond('c.', eligible, params, () => idx++),
     ];
-    const params: unknown[] = [toVectorLiteral(query), topK];
-    let idx = 3;
     if (rest) {
       for (const [key, value] of Object.entries(rest)) {
         if (value === undefined || value === null) continue;
@@ -777,10 +816,11 @@ export class CanonicalVectorStore {
     const tokens = lexicalTokens(query);
     if (tokens.length === 0) return [];
     const client = await this.getClient();
-    const { temporal, rest } = splitTemporalControls(filters);
-    const conds: string[] = [storeKindCond('', this.storeKind), `state != 'archived'`];
+    const { eligible, rest: controls } = splitArchivedEligibility(filters);
+    const { temporal, rest } = splitTemporalControls(controls);
     const params: unknown[] = [];
     let idx = 1;
+    const conds: string[] = [storeKindCond('', this.storeKind), archivedCond('', eligible, params, () => idx++)];
     if (rest) {
       for (const [key, value] of Object.entries(rest)) {
         if (value === undefined || value === null) continue;

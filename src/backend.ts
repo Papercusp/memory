@@ -227,6 +227,13 @@ export interface RememberOptions {
   embedText?: string;
 }
 
+/** See `SearchOptionsCommon.archivedEligibility`. */
+export interface ArchivedEligibilityOption { key: string; values: readonly string[] }
+
+/** Filter-map spelling of `archivedEligibility`: a JSON string, so it crosses
+ * mem0's filter forwarding and the string-only lexical seam unchanged. */
+export const ARCHIVED_ELIGIBLE_FILTER = 'archived_eligible';
+
 export interface SearchOptionsCommon {
   /** Caller lifetime. Cancellable query embeds honor it; implementations must
    * not start another phase after it expires. Already-running native/SQL work
@@ -297,6 +304,15 @@ export interface SearchOptionsCommon {
    */
   asOf?: string;
   includeSuperseded?: boolean;
+  /**
+   * Admit specific ARCHIVED rows to this search. Archived rows are excluded
+   * from every recall leg; a row passes only when its payload `key` equals one
+   * of `values`. It is applied in the store's WHERE clause, before ranking and
+   * inside the scope filter, so it never widens the pools searched and never
+   * touches non-archived rows. An empty `values` admits nothing. Backends
+   * without an archived state ignore it.
+   */
+  archivedEligibility?: ArchivedEligibilityOption;
   /**
    * OPTIONAL read-time diversity re-rank (EI-10230, MMR). Off by default —
    * omit for today's pure-relevance ordering. When set, the backend applies

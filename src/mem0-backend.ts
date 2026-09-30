@@ -28,6 +28,7 @@ import { createTextSimilarity, diversityDisabledByEnv, diversityRerank } from '.
 import { embedAndUpsertVector } from './vec-write';
 import {
   MemoryUnavailableError,
+  ARCHIVED_ELIGIBLE_FILTER,
   scopesOf,
   type ListOptions,
   type MemoryAvailability,
@@ -61,6 +62,20 @@ function temporalFilters(opts: { asOf?: string; includeSuperseded?: boolean }): 
   return {
     ...(opts.asOf !== undefined ? { as_of: opts.asOf } : {}),
     ...(opts.includeSuperseded ? { include_superseded: 'true' } : {}),
+  };
+}
+
+/**
+ * `SearchOptions.archivedEligibility` as a search FILTER key, JSON-encoded for
+ * the same string-only seam. Search legs only: list() is not recall.
+ */
+function recallFilters(opts: SearchOptions): Record<string, string> {
+  const eligible = opts.archivedEligibility;
+  return {
+    ...temporalFilters(opts),
+    ...(eligible && eligible.values.length > 0
+      ? { [ARCHIVED_ELIGIBLE_FILTER]: JSON.stringify({ key: eligible.key, values: [...eligible.values] }) }
+      : {}),
   };
 }
 
@@ -571,7 +586,7 @@ export class Mem0Backend implements MemoryBackend {
         const pulls = scopes.map(async (scope) => {
           const rows = await this.vectorSearch(vector, limit, {
             user_id: scope,
-            ...temporalFilters(opts),
+            ...recallFilters(opts),
           });
           return rows.map((row) => {
             tsById.set(row.id, canonicalPayloadTimestampMs(row.payload));
@@ -591,7 +606,7 @@ export class Mem0Backend implements MemoryBackend {
         // memory-backend-benchmark P-007 run). Keep `limit` for any
         // non-mem0 MemoryClient test doubles.
         const r = await client.search(query, {
-          filters: { user_id: scope, ...temporalFilters(opts) },
+          filters: { user_id: scope, ...recallFilters(opts) },
           topK: limit,
           limit,
         });
@@ -652,7 +667,7 @@ export class Mem0Backend implements MemoryBackend {
     const merged = new Map<string, { entry: MemoryEntry; scopeIndex: number; rowIndex: number }>();
     await forEachWithConcurrency(scopes, LEXICAL_SCOPE_CONCURRENCY, async (scope, scopeIndex) => {
       await withLexicalScopeAdmission(async () => {
-        const rows = await this.lexicalSearch(query, limit, { user_id: scope, ...temporalFilters(opts) });
+        const rows = await this.lexicalSearch(query, limit, { user_id: scope, ...recallFilters(opts) });
         for (const [rowIndex, row] of rows.entries()) {
           const entry = canonicalRowToEntry(row, scope);
           const prior = merged.get(entry.id);
