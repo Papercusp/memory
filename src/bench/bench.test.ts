@@ -232,6 +232,26 @@ describe('runGoldSet', () => {
     expect(r.latency.n).toBe(4);
   });
 
+  it('captureCandidates keeps every hit in rank order, aligned with rankedKeys; off by default', async () => {
+    const be = new LexicalDouble();
+    await seedCorpus(be, CORPUS, { scope: 'bench' });
+    const plain = await runGoldSet(be, GOLD, { scope: 'bench', limit: 10 });
+    expect(plain.perQuery.every((q) => q.candidates === undefined)).toBe(true);
+
+    const captured = await runGoldSet(be, GOLD, { scope: 'bench', limit: 10, captureCandidates: true });
+    for (const q of captured.perQuery) {
+      expect(q.candidates).toHaveLength(q.rawHits);
+      // The keys the filter arms will re-rank from must be the SAME keys the
+      // metrics were computed from — a divergence would score a different set.
+      const keys = [...new Set(q.candidates!.map((c) => c.key).filter((k): k is string => k !== null))];
+      expect(keys).toEqual(q.rankedKeys);
+      for (const c of q.candidates!) expect(c.text.length).toBeGreaterThan(0);
+    }
+    // Positive control: at least one query actually returned a candidate, so
+    // the loop above did not pass vacuously over empty lists.
+    expect(captured.perQuery.some((q) => (q.candidates?.length ?? 0) > 0)).toBe(true);
+  });
+
   it('NoopBackend control scores zero everywhere', async () => {
     const r = await runGoldSet(new NoopBackend(), GOLD, { scope: 'bench' });
     expect(r.overall.p5).toBe(0);
