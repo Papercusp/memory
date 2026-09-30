@@ -1,5 +1,7 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { patchEmbedderFactory, _setCurrentEmbedFnForTest } from './mem0-client';
+import { Mem0Backend } from './mem0-backend';
+import type { MemoryClient } from './mem0-client';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -65,6 +67,44 @@ describe('patchEmbedderFactory — mem0ai 3.x custom-embedder compatibility', ()
     // Non-custom providers still route through to the real factory (unknown
     // ones still throw — we didn't swallow the original behavior).
     expect(() => oss.EmbedderFactory.create('not-a-real-provider', {})).toThrow();
+  });
+
+  it('single-scope search forwards cancellation to query embeds and never starts an obsolete entity embed', async () => {
+    const oss = await import('mem0ai/oss');
+    patchEmbedderFactory(oss);
+    const live = oss.EmbedderFactory.create('custom', {}) as {
+      embed: (text: string) => Promise<number[]>;
+    };
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const ready = new Promise<void>((resolve) => { started = resolve; });
+    const injected = vi.fn(async (_text: string, _signal?: AbortSignal) => {
+      started();
+      await gate;
+      return [0.5];
+    });
+    _setCurrentEmbedFnForTest(injected);
+    const client = { search: async () => {
+      await live.embed('query');
+      await live.embed('entity');
+      return { results: [] };
+    } } as unknown as MemoryClient;
+    const controller = new AbortController();
+    const be = new Mem0Backend({ getClient: async () => client });
+    const search = be.search('query', { scope: 'user', signal: controller.signal });
+    const outcome = expect(search).rejects.toThrow('obsolete');
+    await ready;
+    const upstream = injected.mock.calls[0][1];
+    controller.abort(new Error('obsolete'));
+    release();
+    try {
+      await outcome;
+      expect(upstream).toBe(controller.signal);
+      expect(injected.mock.calls.map(([text]) => text)).toEqual(['query']);
+    } finally {
+      _setCurrentEmbedFnForTest(null);
+    }
   });
 });
 

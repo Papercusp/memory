@@ -70,6 +70,31 @@ describe("HybridBackend identity (memory-declaude-and-defaults-2026-07-28 P-003)
 });
 
 describe("HybridBackend (P-020)", () => {
+  it('never starts the gated lexical phase after an obsolete cosine result arrives', async () => {
+    let release!: (hits: MemoryEntry[]) => void;
+    const cosine = fakeBackend('cosine', [], {
+      search: vi.fn(() => new Promise<MemoryEntry[]>((resolve) => { release = resolve; })),
+    });
+    const lexicalSearch = vi.fn(async () => [e('lexical', 0.9)]);
+    const hy = new HybridBackend(fakeBackend('lexical', [], { search: lexicalSearch }), cosine);
+    const controller = new AbortController();
+    const search = hy.search('q', { scope: 's', fusionMode: 'cosine-gated', signal: controller.signal });
+    const outcome = expect(search).rejects.toThrow('obsolete');
+    controller.abort(new Error('obsolete'));
+    release([e('cosine', 0.9)]);
+    await outcome;
+    expect(lexicalSearch).not.toHaveBeenCalled();
+  });
+
+  it('forwards caller lifetime to the concurrent lexical leg', async () => {
+    const lexicalSearch = vi.fn(async (_query: string, _opts: SearchOptions) => [e('lexical', 0.9)]);
+    const controller = new AbortController();
+    const hy = new HybridBackend(fakeBackend('lexical', [], { search: lexicalSearch }),
+      fakeBackend('cosine', [e('cosine', 0.9)]));
+    await hy.search('q', { scope: 's', signal: controller.signal });
+    expect(lexicalSearch.mock.calls[0][1].signal).toBe(controller.signal);
+  });
+
   it("fuses: an exact-id hit (in both legs) ranks above a paraphrase (cosine-only)", async () => {
     const cosine = fakeBackend("cosine", [e("para", 0.6), e("exact", 0.5)]);
     const lexical = fakeBackend("lexical", [e("exact", 9)]);
