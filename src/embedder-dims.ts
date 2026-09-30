@@ -487,7 +487,12 @@ export const EMBEDDER_DIM_SPECS: Readonly<Record<EmbedderMode, EmbedderProfileSp
  * neither direction. What these specs assert is only that a width is declared
  * and reviewable — the gold set, not this table, says which model to ship.
  */
-export const CANDIDATE_DIM_SPECS: Record<'granite97' | 'granite311' | 'qwen3', EmbedderDimSpec> = {
+export const CANDIDATE_DIM_SPECS: Record<'granite97' | 'granite311' | 'qwen3' | 'mdenseon', EmbedderDimSpec> = {
+  // Pinned local ONNX validation candidate; native width only, no MRL claim.
+  mdenseon: {
+    model: 'lightonai/mDenseOn', nativeDims: 768, targetDims: 768,
+    mrl: 'none', trainedDims: [768],
+  },
   /**
    * Granite-Embedding-97M-Multilingual-R2 — natively 384. The cheapest
    * possible resolution of the untrained-cut bug: at the width the prose

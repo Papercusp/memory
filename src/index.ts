@@ -171,6 +171,17 @@ export {
   LOCAL_EMBEDDER_MODEL,
 } from './local-embedder-worker';
 
+export {
+  buildMdenseOnEmbedder,
+  mdenseOnPrompt,
+  readMdenseOnExport,
+  MDENSEON_MODEL,
+  MDENSEON_REVISION,
+  MDENSEON_NATIVE_DIMS,
+  type MdenseOnKind,
+  type MdenseOnExportManifest,
+} from './mdenseon-embedder';
+
 // What device the embedders actually run on. Exported so the sidecar's /healthz
 // can report it: embed latency had no detector, so fourteen filings searched the
 // scheduler for a cause that lived in the execution target.
