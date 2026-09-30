@@ -82,6 +82,16 @@ export interface SeedManifest {
   totalChars: number;
 }
 
+/** One raw search hit captured for a downstream admission filter. */
+export interface CandidateHit {
+  /** Backend id of the stored entry (ephemeral across re-seeds). */
+  id: string;
+  /** Corpus key from `metadata.corpus_key`, or null when the hit carries none. */
+  key: string | null;
+  text: string;
+  score?: number;
+}
+
 /** One replayed gold query with ranked, key-resolved results. */
 export interface QueryOutcome {
   queryId: string;
@@ -95,6 +105,14 @@ export interface QueryOutcome {
   topScore?: number;
   /** Text of the top hit (for downstream judged-usefulness tiers). */
   topText?: string;
+  /**
+   * Every hit the backend returned, in rank order, before key resolution —
+   * present only when the run asked for it (`captureCandidates`). An
+   * admission-filter arm (a judge, a reranker threshold) needs exactly the set
+   * the floor let through, and re-running search to recover it would measure a
+   * second retrieval instead of the one these metrics describe.
+   */
+  candidates?: CandidateHit[];
   /** Search wall-clock ms. */
   ms: number;
 }

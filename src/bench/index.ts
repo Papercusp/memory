@@ -12,6 +12,7 @@
 export {
   GOLD_QUERY_CLASSES,
   type BackendScorecard,
+  type CandidateHit,
   type CorpusEntry,
   type GoldQuery,
   type GoldQueryClass,
@@ -35,7 +36,7 @@ export {
 } from './metrics';
 
 export { seedCorpus, unseedCorpus, type SeedOptions } from './seed';
-export { rankedCorpusKeys, runGoldSet, type RetrievalOptions } from './retrieval';
+export { rankedCorpusKeys, runGoldSet, toCandidateHit, type RetrievalOptions } from './retrieval';
 export {
   queryLevelPRF,
   runFloorSweep,

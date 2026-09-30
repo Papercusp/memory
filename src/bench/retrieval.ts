@@ -7,7 +7,7 @@
 
 import type { MemoryBackend, MemoryEntry, SearchFloorPolicy } from '../backend';
 import { aggregateByClass, latencyStats } from './metrics';
-import type { GoldQuery, QueryOutcome, RetrievalRunResult } from './types';
+import type { CandidateHit, GoldQuery, QueryOutcome, RetrievalRunResult } from './types';
 
 export interface RetrievalOptions {
   /** The seeded pool to search. */
@@ -28,8 +28,25 @@ export interface RetrievalOptions {
   minLexScore?: number;
   /** Hybrid-only: fusion mode passed through to backend.search (P-031 sweep). */
   fusionMode?: 'floored-union' | 'cosine-gated';
+  /**
+   * Keep every returned hit on its outcome (`QueryOutcome.candidates`), for an
+   * admission-filter arm that must judge exactly what this floor admitted.
+   * Off by default: the text payload is only worth holding when it is used.
+   */
+  captureCandidates?: boolean;
   /** Progress callback (done, total). */
   onProgress?: (done: number, total: number) => void;
+}
+
+/** One hit as a capturable candidate (see `RetrievalOptions.captureCandidates`). */
+export function toCandidateHit(hit: MemoryEntry): CandidateHit {
+  const key = hit.metadata?.corpus_key;
+  return {
+    id: hit.id,
+    key: typeof key === 'string' && key.length > 0 ? key : null,
+    text: hit.text,
+    ...(typeof hit.score === 'number' ? { score: hit.score } : {}),
+  };
 }
 
 /** Resolve one ranked hit list to deduped corpus keys. */
@@ -101,6 +118,7 @@ export async function runGoldSet(
         rawHits: hits.length,
         ...(typeof hits[0]?.score === 'number' ? { topScore: hits[0].score } : {}),
         ...(typeof hits[0]?.text === 'string' ? { topText: hits[0].text } : {}),
+        ...(opts.captureCandidates ? { candidates: hits.map(toCandidateHit) } : {}),
         ms,
       };
       done += 1;
