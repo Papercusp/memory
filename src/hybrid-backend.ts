@@ -258,6 +258,7 @@ export class HybridBackend implements MemoryBackend {
   }
 
   async search(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
+    opts.signal?.throwIfAborted();
     const totalStartedAt = nowMs();
     // Per-call overrides (the P-031 sweep) win over the constructor defaults.
     const mode = opts.fusionMode ?? this.opts.fusionMode ?? "floored-union";
@@ -302,11 +303,14 @@ export class HybridBackend implements MemoryBackend {
       (async () => {
         const startedAt = nowMs();
         try {
+          opts.signal?.throwIfAborted();
           return await this.lexical.search(lexicalText, {
             scope: opts.scope,
             limit: depth,
+            ...(opts.signal ? { signal: opts.signal } : {}),
           });
         } catch {
+          opts.signal?.throwIfAborted();
           return [];
         } finally {
           lexicalDurationMs = Math.max(0, nowMs() - startedAt);
@@ -316,6 +320,9 @@ export class HybridBackend implements MemoryBackend {
     const gated = mode === "cosine-gated";
     // Union mode: start the lexical leg NOW so it overlaps the embed-bound cosine call.
     const inFlightLexical = gated ? null : runLexical();
+    // The cosine leg may reject before the concurrent lexical leg settles.
+    // Retain its rejection handler even when the caller has already left.
+    void inFlightLexical?.catch(() => {});
 
     // The cosine leg carries the FP floor (opts.minScore).
     //
@@ -355,6 +362,7 @@ export class HybridBackend implements MemoryBackend {
     };
     const cosineStartedAt = nowMs();
     const cosineHits = await this.cosine.search(query, cosineOpts);
+    opts.signal?.throwIfAborted();
     const cosineDurationMs = Math.max(0, nowMs() - cosineStartedAt);
     if (cosineHits.length === 0 && gated) {
       // The lexical leg NEVER STARTED — contracted behaviour, not a failure.
@@ -376,6 +384,7 @@ export class HybridBackend implements MemoryBackend {
       return []; // lexical leg never started — as contracted
     }
     const lexicalHits = await (inFlightLexical ?? runLexical());
+    opts.signal?.throwIfAborted();
     const observedFusion: {
       current?: {
         cosineCandidates: number;

@@ -48,6 +48,7 @@ import {
   lexicalSearchCanonical,
   updateMemoryPayload,
   vectorSearchCanonical,
+  withMemoryClientSignal,
   type Mem0Row,
   type MemoryClient,
 } from './mem0-client';
@@ -605,11 +606,11 @@ export class Mem0Backend implements MemoryBackend {
         // broke the seam's per-scope limit contract (caught by the
         // memory-backend-benchmark P-007 run). Keep `limit` for any
         // non-mem0 MemoryClient test doubles.
-        const r = await client.search(query, {
+        const r = await withMemoryClientSignal(opts.signal, () => client.search(query, {
           filters: { user_id: scope, ...recallFilters(opts) },
           topK: limit,
           limit,
-        });
+        }));
         return (r.results ?? []).map((row) => {
           tsById.set(row.id, rowTimestampMs(row));
           return toEntry(row, scope);
@@ -656,6 +657,7 @@ export class Mem0Backend implements MemoryBackend {
    * not apply.
    */
   async searchLexical(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {
+    opts.signal?.throwIfAborted();
     const limit = opts.limit ?? DEFAULT_SEARCH_LIMIT;
     const scopes = scopesOf(opts.scope);
     // Do not collect one result array per scope and flatten it after a
@@ -667,7 +669,9 @@ export class Mem0Backend implements MemoryBackend {
     const merged = new Map<string, { entry: MemoryEntry; scopeIndex: number; rowIndex: number }>();
     await forEachWithConcurrency(scopes, LEXICAL_SCOPE_CONCURRENCY, async (scope, scopeIndex) => {
       await withLexicalScopeAdmission(async () => {
+        opts.signal?.throwIfAborted();
         const rows = await this.lexicalSearch(query, limit, { user_id: scope, ...recallFilters(opts) });
+        opts.signal?.throwIfAborted();
         for (const [rowIndex, row] of rows.entries()) {
           const entry = canonicalRowToEntry(row, scope);
           const prior = merged.get(entry.id);
