@@ -72,7 +72,20 @@ interface WorkerState {
   recycling: Promise<void> | null;
   /** Resolvers waiting for `pending` to empty (a recycle's drain). */
   drainWaiters: Array<() => void>;
+  /**
+   * Outcome of pinning the ONNX native binding in the spawning thread
+   * (`pinOnnxRuntimeBinding`, WI-10005090). Null until the first spawn tries it.
+   * Optional because a module record from an older build may have created this
+   * pinned state object before the field existed.
+   */
+  onnxBindingPin?: OnnxBindingPin | null;
 }
+
+/** What `pinOnnxRuntimeBinding` achieved. Never thrown — reported. */
+export type OnnxBindingPin =
+  | { status: 'pinned'; path: string }
+  | { status: 'unavailable'; reason: string }
+  | { status: 'failed'; reason: string };
 
 // tsx can evaluate this module through both CJS and ESM in one process.
 // Shutdown and health reads must see the worker started through either loader.
@@ -80,6 +93,7 @@ const state = pinModuleState<WorkerState>('@papercusp/memory.local-embedder-work
   worker: null, workerReady: null, nextId: 0, pending: new Map(),
   workerDisabled: false, beforeExitHookInstalled: false, beforeExitListener: null,
   refd: false, lastFallbackWarnAt: 0, recycling: null, drainWaiters: [],
+  onnxBindingPin: null,
 }));
 
 /** Wake every drain waiter once nothing is in flight. Call after any `pending` removal. */
@@ -265,13 +279,73 @@ function workerPath(): string {
   return resolveWorkerScriptPath();
 }
 
+/**
+ * Load the onnxruntime-node binding ONCE in the thread that spawns the worker,
+ * before any worker loads it, and keep it loaded for the life of the process.
+ *
+ * WHY (WI-10005090, measured 2026-10-01, onnxruntime-node 1.24.3 / node 25.9):
+ * the binding registers itself with Node only when its shared library is first
+ * mapped. Node keeps a per-process map so later threads reuse that registration,
+ * but drops the entry when the LAST thread holding the binding goes away, while
+ * the library itself stays mapped. So once the embed worker terminates (a crash
+ * respawn, or `recycleEmbedWorker()` on a device change), every later load in
+ * the process fails with "Module did not self-register": the respawned worker
+ * AND the embedders' main-thread fallback. Local embedding is then dead until
+ * the process restarts. Holding one reference here keeps the entry alive, so a
+ * respawned worker and the inline fallback both load normally. Probe:
+ * .papercusp/scratch/wi5090-inline-fallback-probe.mjs (logs
+ * ~/.cache/agent-capacity/wi5090/). The pin costs ~10 MB anon and holds no
+ * model, so terminating the worker still frees the model's memory.
+ *
+ * `fromPath` is the worker script: the binding is resolved from the
+ * transformers package that script imports, the same way transformers' own
+ * `import 'onnxruntime-node'` resolves, so the pinned file is the file the
+ * worker loads. Never throws: no transformers install is `unavailable`
+ * (embedding cannot work there anyway), and a load error is `failed`, recorded
+ * for `getOnnxBindingPin()`. Idempotent: the first outcome stands, because a
+ * binding cannot be un-pinned and a failed pin will not succeed on retry.
+ *
+ * The reranker worker (libs/generic/rerank/src/local-reranker-worker.ts) pins
+ * the same binding the same way; whichever spawns first holds it.
+ */
+export function pinOnnxRuntimeBinding(fromPath: string): OnnxBindingPin {
+  if (!state.onnxBindingPin) state.onnxBindingPin = loadOnnxBindingFrom(fromPath);
+  return state.onnxBindingPin;
+}
+
+function loadOnnxBindingFrom(fromPath: string): OnnxBindingPin {
+  let transformersEntry: string;
+  try {
+    transformersEntry = createRequire(fromPath).resolve(TRANSFORMERS_PACKAGE);
+  } catch {
+    return { status: 'unavailable', reason: `${TRANSFORMERS_PACKAGE} is not resolvable from ${fromPath}` };
+  }
+  try {
+    const fromTransformers = createRequire(transformersEntry);
+    const path = fromTransformers.resolve('onnxruntime-node');
+    fromTransformers('onnxruntime-node');
+    return { status: 'pinned', path };
+  } catch (err) {
+    return { status: 'failed', reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** The pin outcome, or null when no worker has been spawned yet in this process. */
+export function getOnnxBindingPin(): OnnxBindingPin | null {
+  return state.onnxBindingPin ?? null;
+}
+
 function ensureWorker(): Promise<void> {
   if (state.workerDisabled) return Promise.reject(new Error('worker disabled'));
   if (state.workerReady) return state.workerReady;
 
   state.workerReady = new Promise<void>((resolveReady, rejectReady) => {
     try {
-      state.worker = new Worker(workerPath(), {
+      const scriptPath = workerPath();
+      // WI-10005090: before the first worker can load the ONNX binding (and so
+      // before it can ever exit holding the last reference to it).
+      pinOnnxRuntimeBinding(scriptPath);
+      state.worker = new Worker(scriptPath, {
         // execArgv passthrough is fine — the script is plain JS,
         // no ts-node loader needed.
         //
