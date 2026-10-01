@@ -488,6 +488,142 @@ describe("HybridBackend (P-020)", () => {
     expect(lexSearch).not.toHaveBeenCalled();
   });
 
+  describe("overlapGatedLexical — opt-in overlap of the gated lexical leg (WI-10004485)", () => {
+    it("starts the gated lexical leg BEFORE the cosine leg settles, and still fuses its rows", async () => {
+      // The latency the flag exists for: in series, total = cosine + lexical.
+      // Asserting the lexical call happened while cosine is still pending is
+      // what proves the overlap — a timing assertion would be flaky.
+      let release!: (hits: MemoryEntry[]) => void;
+      const cosine = fakeBackend("cosine", [], {
+        search: vi.fn(() => new Promise<MemoryEntry[]>((resolve) => { release = resolve; })),
+      });
+      const lexSearch = vi.fn(async () => [e("both", 1.0), e("lex-only", 0.9)]);
+      const hy = new HybridBackend(fakeBackend("lexical", [], { search: lexSearch }), cosine);
+      const search = hy.search("q", {
+        scope: "s",
+        fusionMode: "cosine-gated",
+        overlapGatedLexical: true,
+      });
+      await Promise.resolve();
+      expect(lexSearch).toHaveBeenCalledTimes(1);
+      release([e("both", 0.9)]);
+      // Gate open: same fused output as the serial path — cosine-gated still
+      // admits only cosine-backed entries, so the lexical-only row stays out.
+      expect((await search).map((x) => x.id)).toEqual(["both"]);
+      expect(lexSearch).toHaveBeenCalledTimes(1);
+    });
+
+    it("an empty cosine set still returns [], ABORTS the eager leg, and reports it discarded", async () => {
+      const seenSignals: Array<AbortSignal | undefined> = [];
+      const lexSearch = vi.fn(async (_q: string, o: SearchOptions) => {
+        seenSignals.push(o.signal);
+        return [e("CODEX_HOME", 1.0)];
+      });
+      const hy = new HybridBackend(
+        fakeBackend("lexical", [], { search: lexSearch }),
+        fakeBackend("cosine", []),
+      );
+      const seen: SearchLegStats[] = [];
+      const out = await hy.search("CODEX_HOME", {
+        scope: "s",
+        fusionMode: "cosine-gated",
+        minScore: 0.45,
+        overlapGatedLexical: true,
+        onLegStats: (s) => seen.push(s),
+      });
+      expect(out).toEqual([]);
+      expect(lexSearch).toHaveBeenCalledTimes(1);
+      // The leg ran under its OWN child signal (no caller signal here), now aborted.
+      expect(seenSignals[0]?.aborted).toBe(true);
+      // ran:false keeps the skip-rate population stable; discarded:true is the
+      // cost side — a query was issued and thrown away.
+      expect(seen).toHaveLength(1);
+      expect(seen[0].lexical).toEqual({ ran: false, discarded: true });
+      expect(seen[0].fused).toBe(0);
+    });
+
+    it("composes with the caller's signal: a caller abort still reaches the eager leg", async () => {
+      const seenSignals: Array<AbortSignal | undefined> = [];
+      const lexSearch = vi.fn(async (_q: string, o: SearchOptions) => {
+        seenSignals.push(o.signal);
+        return [];
+      });
+      let release!: (hits: MemoryEntry[]) => void;
+      const cosine = fakeBackend("cosine", [], {
+        search: vi.fn(() => new Promise<MemoryEntry[]>((resolve) => { release = resolve; })),
+      });
+      const hy = new HybridBackend(fakeBackend("lexical", [], { search: lexSearch }), cosine);
+      const controller = new AbortController();
+      const search = hy.search("q", {
+        scope: "s",
+        fusionMode: "cosine-gated",
+        overlapGatedLexical: true,
+        signal: controller.signal,
+      });
+      const outcome = expect(search).rejects.toThrow("caller-gone");
+      await Promise.resolve();
+      // A derived signal, never the caller's own object — so the gate can abort it alone.
+      expect(seenSignals[0]).not.toBe(controller.signal);
+      expect(seenSignals[0]?.aborted).toBe(false);
+      controller.abort(new Error("caller-gone"));
+      expect(seenSignals[0]?.aborted).toBe(true);
+      release([e("a", 0.9)]);
+      await outcome;
+    });
+
+    it("aborts the eager leg when the cosine leg FAILS", async () => {
+      const seenSignals: Array<AbortSignal | undefined> = [];
+      const lexSearch = vi.fn(async (_q: string, o: SearchOptions) => {
+        seenSignals.push(o.signal);
+        return [];
+      });
+      const cosine = fakeBackend("cosine", [], {
+        search: vi.fn(async () => {
+          throw new Error("embedder down");
+        }),
+      });
+      const hy = new HybridBackend(fakeBackend("lexical", [], { search: lexSearch }), cosine);
+      await expect(
+        hy.search("q", { scope: "s", fusionMode: "cosine-gated", overlapGatedLexical: true }),
+      ).rejects.toThrow("embedder down");
+      expect(seenSignals[0]?.aborted).toBe(true);
+    });
+
+    it("is never forwarded to the cosine leg, and is inert outside cosine-gated", async () => {
+      const cosineSearch = vi.fn(async (_q: string, _o: SearchOptions) => [e("a", 0.9)]);
+      const lexSearch = vi.fn(async (_q: string, _o: SearchOptions) => [e("a", 0.9)]);
+      const controller = new AbortController();
+      const hy = new HybridBackend(
+        fakeBackend("lexical", [], { search: lexSearch }),
+        fakeBackend("cosine", [], { search: cosineSearch }),
+      );
+      await hy.search("q", {
+        scope: "s",
+        fusionMode: "floored-union",
+        overlapGatedLexical: true,
+        signal: controller.signal,
+      });
+      expect(cosineSearch.mock.calls[0][1]).not.toHaveProperty("overlapGatedLexical");
+      // Union mode keeps forwarding the caller's own signal unchanged.
+      expect(lexSearch.mock.calls[0][1].signal).toBe(controller.signal);
+    });
+
+    it("without the flag, cosine-gated keeps the strict series (lexical waits for cosine)", async () => {
+      let release!: (hits: MemoryEntry[]) => void;
+      const cosine = fakeBackend("cosine", [], {
+        search: vi.fn(() => new Promise<MemoryEntry[]>((resolve) => { release = resolve; })),
+      });
+      const lexSearch = vi.fn(async () => [e("a", 1.0)]);
+      const hy = new HybridBackend(fakeBackend("lexical", [], { search: lexSearch }), cosine);
+      const search = hy.search("q", { scope: "s", fusionMode: "cosine-gated" });
+      await Promise.resolve();
+      expect(lexSearch).not.toHaveBeenCalled();
+      release([e("a", 0.9)]);
+      await search;
+      expect(lexSearch).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe("onLegStats — per-leg reporting (P-002)", () => {
     it("reports the short-circuited lexical leg as ran:false, NOT as zero candidates", async () => {
       // THE distinction this seam exists for. The lexical leg contributing

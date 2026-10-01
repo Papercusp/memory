@@ -132,6 +132,16 @@ export interface LegRunStats {
    * apart reads a short-circuit as a retrieval failure.
    */
   ran: boolean;
+  /**
+   * Set ONLY on a lexical leg that was STARTED EAGERLY under
+   * `SearchOptions.overlapGatedLexical` and then thrown away because the
+   * `cosine-gated` gate closed (empty cosine set). `ran` stays `false` on
+   * purpose: nothing the leg returned reached the fusion, so the short-circuit
+   * contract on the OUTPUT is unchanged and a skip-rate query keyed on `ran`
+   * keeps counting the same population. `discarded` is what says a lexical
+   * query was nonetheless issued — the cost side of the overlap.
+   */
+  discarded?: boolean;
   /** Rows the leg returned, pre-fusion. Undefined when it did not run. */
   candidates?: number;
   /**
@@ -378,6 +388,26 @@ export interface SearchOptionsCommon {
    * so an entry that reaches a render surface still knows which leg found it.
    */
   onLegStats?: (stats: SearchLegStats) => void;
+  /**
+   * HYBRID-ONLY, OPT-IN, `cosine-gated` ONLY: start the lexical leg
+   * CONCURRENTLY with the cosine leg instead of after it.
+   *
+   * `cosine-gated` runs the legs in SERIES by contract: an empty cosine set
+   * means "nothing relevant", so the lexical leg is never searched at all. That
+   * saves one lexical query when the gate closes, and costs the whole lexical
+   * leg's latency on the critical path every time it opens (total = cosine +
+   * lexical). Measured on the turn-start push path (WI-10004485, 2026-10-01,
+   * n=1,620 recalls): the gate closed on 0.4% of calls while the serial lexical
+   * leg cost p50 386 ms of a 2 s build deadline. A caller on a latency budget
+   * whose gate almost never closes trades that rare query for the latency.
+   *
+   * The OUTPUT contract does not change: an empty cosine set still returns
+   * `[]`. The eagerly-started leg is aborted through its own child signal
+   * (best-effort — a leg that ignores the signal runs to completion) and its
+   * rows are discarded, reported as `lexical: { ran: false, discarded: true }`.
+   * Ignored outside `cosine-gated`, where the legs already overlap.
+   */
+  overlapGatedLexical?: boolean;
 }
 
 /**

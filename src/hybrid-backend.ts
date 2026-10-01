@@ -276,14 +276,21 @@ export class HybridBackend implements MemoryBackend {
     // round-trip to the embedder); the lexical leg is embed-free and DB-bound. Overlapping
     // them hides the cheaper one entirely behind the one we cannot avoid.
     //
-    // ⚠ ONLY the union path is overlapped. `cosine-gated` mode carries a DELIBERATE
-    // short-circuit — an empty cosine set means "nothing relevant", so the lexical leg
-    // must never be searched at all (that contract is pinned by hybrid-backend.test.ts
-    // "cosine-gated early-return short-circuits the lexical leg entirely"). Racing the
-    // leg eagerly would silently spend the very work that mode exists to avoid. So in
-    // gated mode we keep the strict sequence; in floored-union mode (the default, and
-    // what hybrid-pg runs) the leg ALWAYS runs anyway, so starting it early costs
-    // nothing and removes it from the critical path.
+    // ⚠ By DEFAULT only the union path is overlapped. `cosine-gated` mode carries a
+    // DELIBERATE short-circuit — an empty cosine set means "nothing relevant", so the
+    // lexical leg must never be searched at all (that contract is pinned by
+    // hybrid-backend.test.ts "cosine-gated early-return short-circuits the lexical leg
+    // entirely"). Racing the leg eagerly would silently spend the very work that mode
+    // exists to avoid. So in gated mode we keep the strict sequence; in floored-union
+    // mode (the default, and what hybrid-pg runs) the leg ALWAYS runs anyway, so
+    // starting it early costs nothing and removes it from the critical path.
+    //
+    // The ONE exception is the caller's explicit `opts.overlapGatedLexical` (see its
+    // doc on SearchOptionsCommon): a latency-bound caller whose gate almost never
+    // closes buys the lexical leg off its critical path for one discarded query on the
+    // rare closed gate. The eager leg runs under its OWN child signal so a closed gate
+    // (or a failed cosine leg) aborts it, and the output contract is unchanged — an
+    // empty cosine set still returns [].
     //
     // The leg is wrapped in an async IIFE with a try/catch — NOT a trailing `.catch()` on
     // the call — because `.catch()` only handles an async REJECTION, while a SYNCHRONOUS
@@ -299,15 +306,21 @@ export class HybridBackend implements MemoryBackend {
     // that wins on them) and for the length warning that comes with it.
     const lexicalText = opts.lexicalQuery?.trim() ? opts.lexicalQuery : query;
     let lexicalDurationMs: number | undefined;
-    const runLexical = (): Promise<MemoryEntry[]> =>
+    // `signal` is the lifetime the LEG runs under; it defaults to the caller's. Only
+    // the eager gated leg passes a narrower one (caller's ∪ its own abort). A rethrow
+    // is decided by the CALLER's signal alone: the eager leg's own abort means "result
+    // discarded", which degrades to [] like any other leg failure.
+    const runLexical = (
+      signal: AbortSignal | undefined = opts.signal,
+    ): Promise<MemoryEntry[]> =>
       (async () => {
         const startedAt = nowMs();
         try {
-          opts.signal?.throwIfAborted();
+          signal?.throwIfAborted();
           return await this.lexical.search(lexicalText, {
             scope: opts.scope,
             limit: depth,
-            ...(opts.signal ? { signal: opts.signal } : {}),
+            ...(signal ? { signal } : {}),
           });
         } catch {
           opts.signal?.throwIfAborted();
@@ -318,8 +331,19 @@ export class HybridBackend implements MemoryBackend {
       })();
 
     const gated = mode === "cosine-gated";
-    // Union mode: start the lexical leg NOW so it overlaps the embed-bound cosine call.
-    const inFlightLexical = gated ? null : runLexical();
+    const overlapGated = gated && opts.overlapGatedLexical === true;
+    const eagerLexicalAbort = overlapGated ? new AbortController() : null;
+    // Union mode, or gated mode with the caller's opt-in: start the lexical leg NOW
+    // so it overlaps the embed-bound cosine call.
+    const inFlightLexical = !gated
+      ? runLexical()
+      : eagerLexicalAbort
+        ? runLexical(
+            opts.signal
+              ? AbortSignal.any([opts.signal, eagerLexicalAbort.signal])
+              : eagerLexicalAbort.signal,
+          )
+        : null;
     // The cosine leg may reject before the concurrent lexical leg settles.
     // Retain its rejection handler even when the caller has already left.
     void inFlightLexical?.catch(() => {});
@@ -345,10 +369,13 @@ export class HybridBackend implements MemoryBackend {
     // `onLegStats` is stripped for the same reason as `diversify`/`lexicalQuery`
     // above — it is THIS backend's reporting seam, not the cosine leg's, and a
     // leg that later learned to read it would report its own half as the whole.
+    // `overlapGatedLexical` is stripped for the same reason: it schedules THIS
+    // backend's lexical leg and means nothing to the cosine leg.
     const {
       diversify,
       lexicalQuery: _lexicalQuery,
       onLegStats,
+      overlapGatedLexical: _overlapGatedLexical,
       ...cosineOpts
     } = opts;
     // A reporter must never be able to fail a search (SearchOptions.onLegStats).
@@ -361,13 +388,24 @@ export class HybridBackend implements MemoryBackend {
       }
     };
     const cosineStartedAt = nowMs();
-    const cosineHits = await this.cosine.search(query, cosineOpts);
-    opts.signal?.throwIfAborted();
+    let cosineHits: MemoryEntry[];
+    try {
+      cosineHits = await this.cosine.search(query, cosineOpts);
+      opts.signal?.throwIfAborted();
+    } catch (error) {
+      // Never leave an eager lexical query running for a search that has failed.
+      eagerLexicalAbort?.abort();
+      throw error;
+    }
     const cosineDurationMs = Math.max(0, nowMs() - cosineStartedAt);
     if (cosineHits.length === 0 && gated) {
       // The lexical leg NEVER STARTED — contracted behaviour, not a failure.
       // Reported as `ran: false` so a reader cannot mistake the short-circuit
       // for a leg that ran and found nothing; those have opposite fixes.
+      // Under `overlapGatedLexical` it DID start eagerly: abort it, discard its
+      // rows, and say so (`discarded: true`) — `ran` stays false because nothing
+      // it returned reaches the fusion.
+      eagerLexicalAbort?.abort();
       report({
         mode,
         cosine: {
@@ -377,11 +415,11 @@ export class HybridBackend implements MemoryBackend {
           ...(opts.limit !== undefined ? { depth: opts.limit } : {}),
           durationMs: cosineDurationMs,
         },
-        lexical: { ran: false },
+        lexical: eagerLexicalAbort ? { ran: false, discarded: true } : { ran: false },
         fused: 0,
         totalMs: Math.max(0, nowMs() - totalStartedAt),
       });
-      return []; // lexical leg never started — as contracted
+      return []; // no lexical rows reach the output — as contracted
     }
     const lexicalHits = await (inFlightLexical ?? runLexical());
     opts.signal?.throwIfAborted();
