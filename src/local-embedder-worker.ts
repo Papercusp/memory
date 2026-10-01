@@ -335,6 +335,15 @@ export function getOnnxBindingPin(): OnnxBindingPin | null {
   return state.onnxBindingPin ?? null;
 }
 
+/**
+ * Forget the recorded pin outcome so a test can observe a first-time pin. The
+ * binding itself stays loaded (Node's require cache holds it), so this cannot
+ * re-open the WI-10005090 hazard; it only clears the record.
+ */
+export function _resetOnnxBindingPinForTest(): void {
+  state.onnxBindingPin = null;
+}
+
 function ensureWorker(): Promise<void> {
   if (state.workerDisabled) return Promise.reject(new Error('worker disabled'));
   if (state.workerReady) return state.workerReady;
