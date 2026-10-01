@@ -29,8 +29,8 @@ describe('pinned mDenseOn worker contract', () => {
     expect(await buildMdenseOnEmbedder({ model, kind: 'query' })('question')).toEqual(vector);
     await buildMdenseOnEmbedder({ model, kind: 'document' })('passage');
     expect(worker.embed.mock.calls).toEqual([
-      ['query: question', { model, pooling: 'cls', normalize: true }],
-      ['document: passage', { model, pooling: 'cls', normalize: true }],
+      ['query: question', { model, pooling: 'cls', normalize: true, tokenizerBackend: 'rust' }],
+      ['document: passage', { model, pooling: 'cls', normalize: true, tokenizerBackend: 'rust' }],
     ]);
     expect(mdenseOnPrompt('document', '')).toBe('document: ');
   });

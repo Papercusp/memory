@@ -50,7 +50,7 @@ export function buildMdenseOnEmbedder(opts: { kind: MdenseOnKind; model: string 
   readMdenseOnExport(opts.model);
   return async (text) => {
     const vector = await embedViaWorker(mdenseOnPrompt(opts.kind, text), {
-      model: opts.model, pooling: 'cls', normalize: true,
+      model: opts.model, pooling: 'cls', normalize: true, tokenizerBackend: 'rust',
     });
     const norm = Math.sqrt(vector.reduce((sum, x) => sum + x * x, 0));
     if (vector.length !== MDENSEON_NATIVE_DIMS || vector.some((x) => !Number.isFinite(x)) || Math.abs(norm - 1) > 0.001) {
