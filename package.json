@@ -23,7 +23,8 @@
   },
   "dependencies": {
     "@papercusp/module-singleton": "*",
-    "pg": "^8.20.0"
+    "pg": "^8.20.0",
+    "tokenizers": "0.23.2"
   },
   "devDependencies": {
     "@types/pg": "^8.15.5",
