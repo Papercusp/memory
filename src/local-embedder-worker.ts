@@ -404,6 +404,8 @@ export interface EmbedViaWorkerOpts {
   pooling?: 'mean' | 'cls' | 'none' | 'last_token';
   normalize?: boolean;
   output?: string;
+  /** Explicit candidate contract; the default retains the SDK tokenizer. */
+  tokenizerBackend?: 'rust';
 }
 
 /**
@@ -439,6 +441,7 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
       pooling: opts.pooling,
       normalize: opts.normalize,
       output: opts.output,
+      tokenizerBackend: opts.tokenizerBackend,
     });
   });
 }

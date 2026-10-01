@@ -17,6 +17,8 @@
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
+import { readFileSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
 import { availableParallelism } from 'node:os';
 
 const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
@@ -164,11 +166,43 @@ function getPipeline(model) {
   return p;
 }
 
+const rustTokenizersByModel = new Map();
+async function rustTokenize(model, text) {
+  if (!isAbsolute(model)) throw new Error('Rust tokenizer requires an explicit local model directory');
+  let tokenizer = rustTokenizersByModel.get(model);
+  if (!tokenizer) {
+    const { Tokenizer } = await import('tokenizers');
+    const config = JSON.parse(readFileSync(join(model, 'tokenizer_config.json'), 'utf8'));
+    if (!Number.isInteger(config.model_max_length) || config.model_max_length < 1) {
+      throw new Error('Rust tokenizer requires a finite pinned context limit');
+    }
+    tokenizer = Tokenizer.fromFile(join(model, 'tokenizer.json'));
+    tokenizer.setTruncation(config.model_max_length);
+    rustTokenizersByModel.set(model, tokenizer);
+  }
+  return tokenizer.encode(text);
+}
+
 async function runEmbed(msg, entry) {
   const { text } = msg;
   const pooling = msg.pooling || 'mean';
   const normalize = msg.normalize === undefined ? true : msg.normalize;
   const pipe = entry.pipe;
+  if (msg.tokenizerBackend === 'rust') {
+    if (pooling !== 'cls' || msg.output) throw new Error('Rust candidate contract requires native CLS output');
+    const encoding = await rustTokenize(msg.model, text);
+    const t = await loadTransformers();
+    const ids = encoding.getIds();
+    const shape = [1, ids.length];
+    const inputs = {
+      input_ids: new t.Tensor('int64', BigInt64Array.from(ids, BigInt), shape),
+      attention_mask: new t.Tensor('int64', BigInt64Array.from(encoding.getAttentionMask(), BigInt), shape),
+    };
+    const output = await pipe.model(inputs);
+    if (!output.last_hidden_state) throw new Error('Rust candidate graph lacks last_hidden_state');
+    const cls = output.last_hidden_state.slice(null, 0);
+    return Array.from((normalize ? cls.normalize(2, -1) : cls).data);
+  }
   // Models whose ONNX export bakes pooling+normalize INTO the graph expose a
   // single pre-pooled output (e.g. harrier's 'sentence_embedding') and have
   // no last_hidden_state for the pipeline's pooling path — `output` names
