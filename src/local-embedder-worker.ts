@@ -79,6 +79,10 @@ interface WorkerState {
    * pinned state object before the field existed.
    */
   onnxBindingPin?: OnnxBindingPin | null;
+  /** The armed idle-unload timer (`armIdleUnload`, WI-10005070), if any. */
+  idleTimer?: ReturnType<typeof setTimeout> | null;
+  /** How many times the idle unload has released the worker in this process. */
+  idleUnloads?: number;
 }
 
 /** What `pinOnnxRuntimeBinding` achieved. Never thrown — reported. */
@@ -93,8 +97,67 @@ const state = pinModuleState<WorkerState>('@papercusp/memory.local-embedder-work
   worker: null, workerReady: null, nextId: 0, pending: new Map(),
   workerDisabled: false, beforeExitHookInstalled: false, beforeExitListener: null,
   refd: false, lastFallbackWarnAt: 0, recycling: null, drainWaiters: [],
-  onnxBindingPin: null,
+  onnxBindingPin: null, idleTimer: null, idleUnloads: 0,
 }));
+
+/** Env override for the idle-unload window, in ms. `0` disables the unload. */
+export const EMBED_WORKER_IDLE_MS_ENV = 'PAPERCUSP_EMBED_WORKER_IDLE_MS';
+/** Default idle-unload window: long enough that an active host never pays a reload. */
+export const DEFAULT_EMBED_WORKER_IDLE_MS = 10 * 60_000;
+
+/** The effective idle-unload window. A malformed or negative value keeps the default. */
+export function embedWorkerIdleMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = env[EMBED_WORKER_IDLE_MS_ENV];
+  if (raw === undefined || raw.trim() === '') return DEFAULT_EMBED_WORKER_IDLE_MS;
+  const ms = Number(raw);
+  return Number.isFinite(ms) && ms >= 0 ? ms : DEFAULT_EMBED_WORKER_IDLE_MS;
+}
+
+function cancelIdleUnload(): void {
+  if (state.idleTimer) clearTimeout(state.idleTimer);
+  state.idleTimer = null;
+}
+
+/**
+ * Release the worker, and with it the model, once the host has embedded nothing
+ * for `embedWorkerIdleMs()` (WI-10005070). The next embed respawns a worker and
+ * reloads the model (~2 s for EmbeddingGemma on CPU).
+ *
+ * WHY: every Server loads the model at boot (the transcript-search warm-up) and
+ * an idle Papercusp Server held ~1 GB more anon with the embedder than without
+ * it (plan agent-capacity-and-cost-gcp-2026-09-30, D-022). Terminating the
+ * worker returns most of that: measured 752 → 307 MB anon 5 s after terminate
+ * on this box (WI-10005090 probe). An active host never reaches the window,
+ * because every settled embed re-arms it.
+ *
+ * Armed only when the ONNX binding is pinned: without the pin a terminated
+ * worker leaves the process unable to load the binding again (WI-10005090), so
+ * unloading would trade memory for broken embedding. Unref'd, so it never
+ * keeps a process alive. Goes through `recycleEmbedWorker`, so it waits for any
+ * request in flight and new embeds wait for it.
+ */
+function armIdleUnload(): void {
+  cancelIdleUnload();
+  if (state.pending.size > 0 || !state.worker) return;
+  if (state.onnxBindingPin?.status !== 'pinned') return;
+  const ms = embedWorkerIdleMs();
+  if (ms <= 0) return;
+  const timer = setTimeout(() => {
+    state.idleTimer = null;
+    if (state.pending.size > 0 || !state.worker || state.recycling) return;
+    state.idleUnloads = (state.idleUnloads ?? 0) + 1;
+    recycleEmbedWorker().catch(() => {
+      /* the next embed respawns regardless; nothing to report here */
+    });
+  }, ms);
+  timer.unref?.();
+  state.idleTimer = timer;
+}
+
+/** Idle-unload telemetry: the window, whether a timer is armed, and unloads so far. */
+export function getEmbedWorkerIdleStats(): { idleMs: number; armed: boolean; idleUnloads: number } {
+  return { idleMs: embedWorkerIdleMs(), armed: state.idleTimer != null, idleUnloads: state.idleUnloads ?? 0 };
+}
 
 /** Wake every drain waiter once nothing is in flight. Call after any `pending` removal. */
 function notifyIfDrained(): void {
@@ -414,6 +477,8 @@ function ensureWorker(): Promise<void> {
         p.reject(new Error(msg.error ?? 'worker error'));
       }
       notifyIfDrained();
+      // WI-10005070: the last request landed, so start the idle window.
+      if (state.pending.size === 0) armIdleUnload();
     });
     state.worker.on('error', (err) => {
       // Reject every pending request — the worker crashed.
@@ -435,6 +500,7 @@ function ensureWorker(): Promise<void> {
       state.worker = null;
       state.workerReady = null;
       state.refd = false;
+      cancelIdleUnload();
       if (!initialized) rejectReady(err);
     });
     state.worker.on('exit', (code) => {
@@ -454,6 +520,7 @@ function ensureWorker(): Promise<void> {
       state.worker = null;
       state.workerReady = null;
       state.refd = false;
+      cancelIdleUnload();
     });
   });
 
@@ -508,6 +575,8 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
   while (state.recycling) await state.recycling;
   await ensureWorker();
   if (!state.worker) throw new Error('worker not initialized');
+  // WI-10005070: a request is starting, so the host is not idle.
+  cancelIdleUnload();
 
   const id = state.nextId++;
   return new Promise<number[]>((resolveEmbed, rejectEmbed) => {
@@ -534,6 +603,7 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
  *  directly); {@link shutdownLocalEmbedder} is the same function under a
  *  discoverable public name — see its doc for why both exist. */
 export async function _resetWorker(): Promise<void> {
+  cancelIdleUnload();
   if (state.worker) {
     try { await state.worker.terminate(); } catch { /* noop */ }
   }
