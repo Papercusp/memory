@@ -22,8 +22,22 @@ import {
   getOnnxBindingPin,
   getWorkerState,
   recycleEmbedWorker,
+  resolveWorkerScriptPath,
   shutdownLocalEmbedder,
 } from './local-embedder-worker';
+
+/** Whether onnxruntime-node is installed where the worker would load it. Without
+ *  it the binding cannot be pinned, so the unload is (correctly) never armed and
+ *  the timer tests have nothing to observe. */
+function onnxInstalled(): boolean {
+  try {
+    const transformersEntry = createRequire(resolveWorkerScriptPath()).resolve('@huggingface/transformers');
+    createRequire(transformersEntry).resolve('onnxruntime-node');
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const savedIdle = process.env[EMBED_WORKER_IDLE_MS_ENV];
 
