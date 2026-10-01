@@ -104,6 +104,15 @@ describe('every declared embedder spec is sound', () => {
 });
 
 describe('complete embedding-profile identity', () => {
+  it('represents CLS pooling explicitly for an independently identified candidate space', () => {
+    expect(validateEmbedderProfile('candidate', {
+      ...EMBEDDER_DIM_SPECS.gemma,
+      profileId: 'mdenseon-pinned-768@v1', model: 'lightonai/mDenseOn',
+      modelRevision: 'a5fdb000f7a21da96c3bddde3a782ef777316df3',
+      revisionPolicy: 'immutable-artifact', pooling: 'cls', mrl: 'none', trainedDims: [768],
+      documentRecipe: 'mdenseon-document-prefix@v1', queryRecipe: 'mdenseon-query-prefix@v1',
+    })).toEqual([]);
+  });
   it.each([
     'profileId',
     'model',

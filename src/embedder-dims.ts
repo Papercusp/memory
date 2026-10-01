@@ -97,7 +97,7 @@ export type EmbeddingProfileId = `${string}@v${number}`;
 export type EmbeddingRecipeId = `${string}@v${number}`;
 
 export type EmbeddingDistanceMetric = 'cosine' | 'l2' | 'inner-product' | 'l1';
-export type EmbeddingPooling = 'mean' | 'last-token' | 'model-graph' | 'provider-managed';
+export type EmbeddingPooling = 'mean' | 'cls' | 'last-token' | 'model-graph' | 'provider-managed';
 export type EmbeddingOutputDtype = 'float32';
 export type EmbeddingRevisionPolicy = 'profile-versioned-provider-model-id' | 'immutable-artifact';
 export type EmbeddingNormalization = Readonly<{
@@ -306,7 +306,7 @@ export function validateEmbedderProfile(mode: string, spec: EmbedderProfileSpec)
   ) {
     problems.push(`${at}: normalization.timing is not a supported closed value`);
   }
-  if (!['mean', 'last-token', 'model-graph', 'provider-managed'].includes(String(candidate.pooling))) {
+  if (!['mean', 'cls', 'last-token', 'model-graph', 'provider-managed'].includes(String(candidate.pooling))) {
     problems.push(`${at}: pooling is not a supported closed value`);
   }
   if (candidate.outputDtype !== 'float32') problems.push(`${at}: outputDtype must be 'float32'`);
