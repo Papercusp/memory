@@ -82,6 +82,68 @@ describe('diversityRerank', () => {
     expect(() => diversityRerank(xs, { lambda: 5, similarity: textSimilarity })).not.toThrow();
     expect(() => diversityRerank(xs, { lambda: -5, similarity: textSimilarity })).not.toThrow();
   });
+
+  // WI-10004485: the selection keeps a running max similarity per candidate
+  // instead of recomputing it against the whole selected set every round. These
+  // two pin that it is the SAME selection, at quadratic (not cubic) cost.
+  describe('incremental max-similarity (WI-10004485)', () => {
+    // The pre-WI-10004485 algorithm, kept verbatim as the reference: recompute
+    // each candidate's max similarity over the full selected set every round.
+    const reference = (
+      entries: MemoryEntry[],
+      lambda: number,
+      similarity: (a: MemoryEntry, b: MemoryEntry) => number,
+    ): MemoryEntry[] => {
+      const raw = entries.map((x) => (typeof x.score === 'number' ? x.score : 0));
+      const max = Math.max(0, ...raw) || 1;
+      const remaining = entries.map((x, i) => ({ x, norm: raw[i] / max }));
+      const selected: MemoryEntry[] = [];
+      while (remaining.length > 0) {
+        let bestIdx = 0;
+        let bestVal = -Infinity;
+        for (let i = 0; i < remaining.length; i++) {
+          let maxSim = 0;
+          for (const s of selected) maxSim = Math.max(maxSim, similarity(remaining[i].x, s));
+          const val = lambda * remaining[i].norm - (1 - lambda) * maxSim;
+          if (val > bestVal) {
+            bestVal = val;
+            bestIdx = i;
+          }
+        }
+        selected.push(remaining[bestIdx].x);
+        remaining.splice(bestIdx, 1);
+      }
+      return selected;
+    };
+
+    it('selects exactly what the full recompute selects, across random pools and lambdas', () => {
+      let seed = 7;
+      const rnd = () => (seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31;
+      const words = ['deploy', 'gate', 'staging', 'memory', 'jev', 'lexical', 'cosine', 'fleet', 'lock', 'sync'];
+      const text = () =>
+        Array.from({ length: 2 + Math.floor(rnd() * 8) }, () => words[Math.floor(rnd() * words.length)]).join(' ');
+      for (let trial = 0; trial < 60; trial++) {
+        const n = 2 + Math.floor(rnd() * 30);
+        // Coarse scores force ties, so tie-breaking must match too.
+        const pool = Array.from({ length: n }, (_, i) =>
+          e(`m${i}`, text(), rnd() < 0.1 ? undefined : Math.round(rnd() * 4) / 4),
+        );
+        for (const lambda of [0, 0.3, 0.5, 0.7, 0.9]) {
+          const got = diversityRerank(pool, { lambda, similarity: createTextSimilarity() });
+          const want = reference(pool, lambda, createTextSimilarity());
+          expect(got.map((x) => x.id)).toEqual(want.map((x) => x.id));
+        }
+      }
+    });
+
+    it('makes n(n-1)/2 similarity calls, not (n³-n)/6', () => {
+      const n = 36; // the turn-start shape: limit 12 x RERANK_DEPTH_FACTOR 3
+      const pool = Array.from({ length: n }, (_, i) => e(`m${i}`, `fact number ${i}`, 1 - i / 100));
+      const similarity = vi.fn(createTextSimilarity());
+      diversityRerank(pool, { lambda: 0.7, similarity });
+      expect(similarity).toHaveBeenCalledTimes((n * (n - 1)) / 2);
+    });
+  });
 });
 
 describe('lexicalSimilarity', () => {

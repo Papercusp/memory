@@ -86,26 +86,35 @@ export function diversityRerank(
   const rawScores = entries.map((e) => (typeof e.score === 'number' ? e.score : 0));
   const maxScore = Math.max(0, ...rawScores) || 1;
 
-  const remaining = entries.map((e, i) => ({ e, norm: rawScores[i] / maxScore }));
+  // Each candidate carries its running max similarity to the SELECTED set, and
+  // a round only compares it against the entry selected LAST. The max over a set
+  // does not depend on the order it is taken in, so the selection is identical to
+  // recomputing it over the whole selected set every round — which is what this
+  // loop used to do, at (n³ - n)/6 similarity calls instead of n(n - 1)/2.
+  // WI-10004485 measured that difference on the turn-start shape (36 entries:
+  // 7,770 calls vs 630): 93-216 ms p50 of synchronous CPU on the injection
+  // critical path, ahead of the Jev wait under the same 2 s build deadline.
+  const remaining = entries.map((e, i) => ({ e, norm: rawScores[i] / maxScore, maxSim: 0 }));
   const selected: MemoryEntry[] = [];
+  let last: MemoryEntry | null = null;
 
   while (remaining.length > 0) {
     let bestIdx = 0;
     let bestVal = -Infinity;
     for (let i = 0; i < remaining.length; i++) {
       const cand = remaining[i];
-      let maxSim = 0;
-      for (const s of selected) {
-        const sim = similarity(cand.e, s);
-        if (sim > maxSim) maxSim = sim;
+      if (last !== null) {
+        const sim = similarity(cand.e, last);
+        if (sim > cand.maxSim) cand.maxSim = sim;
       }
-      const val = lambda * cand.norm - (1 - lambda) * maxSim;
+      const val = lambda * cand.norm - (1 - lambda) * cand.maxSim;
       if (val > bestVal) {
         bestVal = val;
         bestIdx = i;
       }
     }
-    selected.push(remaining[bestIdx].e);
+    last = remaining[bestIdx].e;
+    selected.push(last);
     remaining.splice(bestIdx, 1);
   }
   return selected;
