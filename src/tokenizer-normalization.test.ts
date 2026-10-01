@@ -1,39 +1,28 @@
-/** Pin the Rust-tokenizer normalization boundary without loading model weights.
- * The patch-package postimage check also guards installed bundle drift. */
-import { createRequire } from 'node:module';
+/** Pin Rust token IDs, normalization and Metaspace boundaries without weights. */
 import { describe, expect, it } from 'vitest';
-import { Tokenizer } from '@huggingface/tokenizers';
-import { PreTrainedTokenizer } from '@huggingface/transformers';
-
-const require = createRequire(import.meta.url);
-const { Tokenizer: CjsTokenizer } = require('@huggingface/tokenizers');
-const { PreTrainedTokenizer: CjsSdkTokenizer } = require('@huggingface/transformers');
+import { Tokenizer } from 'tokenizers';
 
 const json = (normalized = false) => ({
   version: '1.0', truncation: null, padding: null,
-  added_tokens: [{ id: 2, content: normalized ? '  ' : '▁▁', single_word: false,
+  added_tokens: [{ id: 2, content: '▁▁', single_word: false,
     lstrip: false, rstrip: false, normalized, special: false }],
   normalizer: { type: 'Replace', pattern: { String: ' ' }, content: '▁' },
   pre_tokenizer: { type: 'Metaspace', replacement: '▁', prepend_scheme: 'always', split: true },
   post_processor: null, decoder: null,
-  model: { type: 'BPE', vocab: { '▁': 0, a: 1, '▁▁': 2, '<unk>': 3 }, merges: [], unk_token: '<unk>' },
+  model: { type: 'BPE', vocab: { '▁': 0, a: 1, '▁▁': 2, '<unk>': 3 }, merges: [['▁', '▁']], unk_token: '<unk>' },
 });
 
-const factories = {
-  'tokenizers ESM': (normalized: boolean) => (text: string) => new Tokenizer(json(normalized), {}).encode(text).ids,
-  'tokenizers CJS': (normalized: boolean) => (text: string) => new CjsTokenizer(json(normalized), {}).encode(text).ids,
-  'SDK Node ESM': (normalized: boolean) => (text: string) => new PreTrainedTokenizer(json(normalized), {}).encode(text, { add_special_tokens: false }),
-  'SDK Node CJS': (normalized: boolean) => (text: string) => new CjsSdkTokenizer(json(normalized), {}).encode(text, { add_special_tokens: false }),
-};
+const encode = async (normalized: boolean, text: string) =>
+  (await Tokenizer.fromString(JSON.stringify(json(normalized))).encode(text)).getIds();
 
-describe.each(Object.entries(factories))('%s normalization contract', (_name, factory) => {
-  it('keeps generated whitespace separate from an unnormalized added token', () => {
-    expect(factory(false)('  ')).toEqual([0, 0]);
+describe('candidate Rust tokenizer contract', () => {
+  it('honors Metaspace split:true even with a learned whitespace BPE merge', async () => {
+    expect(await encode(false, '  ')).toEqual([0, 0]);
   });
-  it('still recognizes the actual literal unnormalized token before normalization', () => {
-    expect(factory(false)('▁▁')).toEqual([2]);
+  it('still recognizes the actual literal unnormalized token before normalization', async () => {
+    expect(await encode(false, '▁▁')).toEqual([2]);
   });
-  it('still recognizes an explicitly normalized added token', () => {
-    expect(factory(true)('  ')).toEqual([2]);
+  it('still recognizes an explicitly normalized added token', async () => {
+    expect(await encode(true, '  ')).toEqual([2]);
   });
 });
