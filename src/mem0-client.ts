@@ -707,21 +707,20 @@ async function buildClient(): Promise<MemoryClient | null> {
     config: { embed: coalescedEmbed, embeddingDims: resolved.dims },
   };
 
-  // mem0 tracks add/update/delete event history in SQLite. Default is
-  // `:memory:` (lost on restart). When the host provides a `localStoreDir`
-  // (default the OS tmpdir; the operator passes ~/.papercusp), persist
-  // there so the event log survives restarts. `localStoreDir: null`
-  // forces the in-memory history.
+  // mem0 tracks add/update/delete event history (and the recent messages it
+  // feeds back into extraction) in SQLite through better-sqlite3, which runs
+  // every write synchronously on this thread. In memory (`:memory:`, the
+  // default) a write costs microseconds and touches no file lock. A
+  // persisted file is used only when the host names a directory; see
+  // `MemoryHost.localStoreDir` for why that is opt-in (WI-10003284).
   let historyDbPath = ':memory:';
   const localStoreDir = memoryLocalStoreDir();
   if (localStoreDir !== null) {
     try {
-      const os = await import('node:os');
       const path = await import('node:path');
       const fs = await import('node:fs/promises');
-      const dir = localStoreDir ?? os.tmpdir();
-      await fs.mkdir(dir, { recursive: true });
-      historyDbPath = path.join(dir, 'mem0-history.db');
+      await fs.mkdir(localStoreDir, { recursive: true });
+      historyDbPath = path.join(localStoreDir, 'mem0-history.db');
     } catch {
       /* fall back to in-memory if we can't write */
     }

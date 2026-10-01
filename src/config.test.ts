@@ -153,13 +153,24 @@ describe('memorySchema — host.schema ?? "public"', () => {
 });
 
 describe('memoryLocalStoreDir — where mem0 keeps its SQLite history', () => {
-  it('passes a directory, null (in-memory) and unset (tmpdir default) through', () => {
+  it('passes a named directory through', () => {
     configureMemory(host({ localStoreDir: '/state' }));
     expect(memoryLocalStoreDir()).toBe('/state');
+  });
+
+  it('keeps history IN MEMORY unless a host names a directory (WI-10003284)', () => {
+    // An unset host used to get a file in the OS tmpdir — one file shared by
+    // every process on the machine, written synchronously by better-sqlite3.
+    // Contended writes blocked the caller's event loop (32.8 s on a live :3070
+    // worker). Persisting must be an explicit choice, never a default.
+    configureMemory(host());
+    expect(memoryLocalStoreDir()).toBeNull();
     configureMemory(host({ localStoreDir: null }));
     expect(memoryLocalStoreDir()).toBeNull();
-    configureMemory(host());
-    expect(memoryLocalStoreDir()).toBeUndefined();
+    configureMemory(host({ localStoreDir: '   ' }));
+    expect(memoryLocalStoreDir()).toBeNull();
+    configureMemory(host({ localStoreDir: () => undefined }));
+    expect(memoryLocalStoreDir()).toBeNull();
   });
 
   it('resolves a function on every read, not when the host is installed', () => {
