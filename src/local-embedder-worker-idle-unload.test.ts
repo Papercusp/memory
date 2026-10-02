@@ -64,9 +64,12 @@ afterEach(async () => {
 });
 
 describe('embedWorkerIdleMs', () => {
-  it('defaults to 10 minutes and accepts a non-negative override', () => {
+  it('defaults to OFF (0) and accepts a non-negative override', () => {
+    // OFF because the unload measured net-negative on a real Server: a
+    // worker_thread terminate leaves most of the model in the process heap and
+    // the re-embed allocates it again (P-010 VM run, WI-10005070).
     expect(embedWorkerIdleMs({})).toBe(DEFAULT_EMBED_WORKER_IDLE_MS);
-    expect(DEFAULT_EMBED_WORKER_IDLE_MS).toBe(600_000);
+    expect(DEFAULT_EMBED_WORKER_IDLE_MS).toBe(0);
     expect(embedWorkerIdleMs({ [EMBED_WORKER_IDLE_MS_ENV]: '2500' })).toBe(2500);
     expect(embedWorkerIdleMs({ [EMBED_WORKER_IDLE_MS_ENV]: '0' })).toBe(0);
   });
@@ -125,6 +128,15 @@ describe.skipIf(!onnxInstalled())('embed worker idle unload (WI-10005070)', () =
     expect(getWorkerState().alive).toBe(true);
     await shutdownLocalEmbedder();
     expect(await pending).toBeInstanceOf(Error);
+  }, 20_000);
+
+  it('with no env set the worker stays loaded (default OFF)', async () => {
+    setIdleMs(undefined);
+    stubWorkerReplies({ reply: true });
+    await embedViaWorker('kept by default');
+    expect(getEmbedWorkerIdleStats()).toMatchObject({ idleMs: 0, armed: false });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(getWorkerState().alive).toBe(true);
   }, 20_000);
 
   it('a window of 0 disables the unload', async () => {
