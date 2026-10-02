@@ -5,8 +5,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { bindNativeLoaderClosure } from '../../../../packages/operator-core/lib/memory/bench/measurement-manifest';
 import { embedViaWorker, getWorkerState, shutdownLocalEmbedder, _resetBeforeExitHookForTest,
   type WorkerInputTrace, type WorkerInferenceTrace } from './local-embedder-worker';
 
@@ -310,13 +308,23 @@ try {
       const windows=starts.map((start:any)=>({runTag:start.runTag,processId:start.processId,nativeThreadId:start.nativeThreadId,
         startMonotonicNs:start.monotonicNs,endMonotonicNs:observed.native.find((event:any)=>
           event.inference.runTag===start.runTag && event.inference.phase==='end').inference.monotonicNs}));
-      const stderr=Buffer.from(child.stderr),closure=bindNativeLoaderClosure(stderr,windows,starts[0],{
-        source:'spawn-pipe',captureStartedBeforeExec:true,eof:true,processId:starts[0].processId,exitCode:child.status!,
-        signal:child.signal,bytes:stderr.length,sha256:createHash('sha256').update(stderr).digest('hex')});
-      expect(closure.completeBeforeInferenceClosureVerified).toBe(true);
-      expect(closure.unjoinedMappedFiles).toEqual([]);
-      expect(closure.runTag).toBe(starts[0].runTag);
-      expect(closure.objectMapJoins.some(join=>join.file.path.endsWith('.node'))).toBe(true);
+      // Keep the memory package's compiler root intact. The higher-layer
+      // benchmark guard evaluates these retained lower-layer observations in
+      // a separate diagnostic process; it never runs another model request.
+      const guardUrl=new URL('../../../../packages/operator-core/lib/memory/bench/measurement-manifest.ts',import.meta.url).href;
+      const assessment=`import fs from 'node:fs';import crypto from 'node:crypto';
+const module=await import(${JSON.stringify(guardUrl)}),guard=module.default??module;
+const input=JSON.parse(fs.readFileSync(0,'utf8')),stderr=Buffer.from(input.stderr);
+const result=guard.bindNativeLoaderClosure(stderr,input.windows,input.firstRun,{
+source:'spawn-pipe',captureStartedBeforeExec:true,eof:true,processId:input.firstRun.processId,
+exitCode:input.exitCode,signal:input.signal,bytes:stderr.length,sha256:crypto.createHash('sha256').update(stderr).digest('hex')});
+console.log(JSON.stringify({complete:result.completeBeforeInferenceClosureVerified,residue:result.unjoinedMappedFiles,
+runTag:result.runTag,hasAddon:result.objectMapJoins.some(join=>join.file.path.endsWith('.node'))}));`;
+      const evaluated=spawnSync(process.execPath,['--import',import.meta.resolve('tsx/esm'),'--input-type=module','--eval',assessment],{
+        input:JSON.stringify({stderr:child.stderr,windows,firstRun:starts[0],exitCode:child.status,signal:child.signal}),
+        encoding:'utf8',timeout:10000,maxBuffer:4*1024*1024,env:{...process.env,PAPERCUSP_FORBID_REAL_PG:'1'}});
+      expect(evaluated.status,evaluated.stderr).toBe(0);
+      expect(JSON.parse(evaluated.stdout.trim())).toEqual({complete:true,residue:[],runTag:starts[0].runTag,hasAddon:true});
       for (let i = 2; i < observed.native.length; i += 2) {
         expect(BigInt(observed.native[i].inference.monotonicNs)).toBeGreaterThan(BigInt(observed.native[i-1].inference.monotonicNs));
       }
