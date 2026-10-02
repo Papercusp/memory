@@ -210,8 +210,19 @@ const state = pinModuleState<WorkerState>('@papercusp/memory.local-embedder-work
 
 /** Env override for the idle-unload window, in ms. `0` disables the unload. */
 export const EMBED_WORKER_IDLE_MS_ENV = 'PAPERCUSP_EMBED_WORKER_IDLE_MS';
-/** Default idle-unload window: long enough that an active host never pays a reload. */
-export const DEFAULT_EMBED_WORKER_IDLE_MS = 10 * 60_000;
+/**
+ * Default idle-unload window: 0, i.e. OFF. Measured net-NEGATIVE on a real Server
+ * (P-010 VM run, cap-p011, 2026-10-02, WI-10005070): terminating the worker
+ * returns only ~0.35 GiB of the model to the OS, and a Server re-embeds within
+ * ~15 min anyway, so the respawned worker allocates the model afresh. Three
+ * tenants with a 10 min window settled at 4.1-4.4 GiB main-process anon against
+ * 2.61 GiB for the never-unloaded control. A worker_thread shares the process
+ * heap, so freed model memory stays in the allocator. Getting the memory back
+ * needs the model in a separate PROCESS whose exit returns everything; until
+ * then, keep the worker loaded. Set the env to a positive window only to
+ * re-measure.
+ */
+export const DEFAULT_EMBED_WORKER_IDLE_MS = 0;
 
 /** The effective idle-unload window. A malformed or negative value keeps the default. */
 export function embedWorkerIdleMs(env: Record<string, string | undefined> = process.env): number {
@@ -233,10 +244,11 @@ function cancelIdleUnload(): void {
  *
  * WHY: every Server loads the model at boot (the transcript-search warm-up) and
  * an idle Papercusp Server held ~1 GB more anon with the embedder than without
- * it (plan agent-capacity-and-cost-gcp-2026-09-30, D-022). Terminating the
- * worker returns most of that: measured 752 → 307 MB anon 5 s after terminate
- * on this box (WI-10005090 probe). An active host never reaches the window,
- * because every settled embed re-arms it.
+ * it (plan agent-capacity-and-cost-gcp-2026-09-30, D-022). A local probe saw
+ * 752 → 307 MB anon 5 s after terminate (WI-10005090), but on a real Server the
+ * unload/re-embed cycle is a net LOSS (see DEFAULT_EMBED_WORKER_IDLE_MS), so it
+ * is OFF by default and only arms when the env sets a positive window. An
+ * active host never reaches the window, because every settled embed re-arms it.
  *
  * Armed only when the ONNX binding is pinned: without the pin a terminated
  * worker leaves the process unable to load the binding again (WI-10005090), so
