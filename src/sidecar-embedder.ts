@@ -228,22 +228,32 @@ export interface SidecarFirstEmbedderOpts {
    *  it on demand. It should be cheap when the sidecar is already running.
    *  It runs inside the same total budget. If the budget runs out first, the
    *  attempt fails and the ensure keeps running, so a later call finds the
-   *  sidecar warming or ready. Leave unset for a sidecar another process owns. */
+   *  sidecar warming or ready. Leave unset for a sidecar another process owns.
+   *  It may resolve to the sidecar's current base URL; the client then sends
+   *  this and later attempts there (see nextSidecarUrl). */
   ensure?: () => Promise<unknown>;
+}
+
+/** P-530: an ensure hook may resolve to the sidecar's CURRENT base URL. A
+ *  sidecar this process spawns on an ephemeral port comes back on a different
+ *  port after an idle exit, so the client must follow it. Anything that is not
+ *  a non-empty string keeps the URL it already has. */
+export function nextSidecarUrl(current: string, ensured: unknown): string {
+  return typeof ensured === 'string' && ensured.trim() ? ensured.trim().replace(/\/$/, '') : current;
 }
 
 /** Settle `work` within `ms`, or reject with `sidecar_ensure_timeout`. A late
  *  settle of `work` is ignored. `Promise.race` subscribes to it, so a late
  *  rejection is never an unhandled rejection. */
-export async function settleSidecarEnsureWithin(
-  work: Promise<unknown>,
+export async function settleSidecarEnsureWithin<T>(
+  work: Promise<T>,
   ms: number,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let onAbort: (() => void) | undefined;
   try {
-    await Promise.race([
+    return await Promise.race([
       work,
       new Promise<never>((_, reject) => {
         timer = setTimeout(
@@ -306,6 +316,10 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
   }
 
   let wasDown = false;
+  // P-530: shared by every call of this embedder, so once an ensure reports a
+  // new address (a re-launched sidecar on a fresh ephemeral port) later calls
+  // start there too.
+  let currentUrl = url;
 
   return async (text: string, signal?: AbortSignal): Promise<number[]> => {
     const deadline = now() + timeoutMs;
@@ -316,11 +330,11 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
       try {
         let left = remaining;
         if (opts.ensure) {
-          await settleSidecarEnsureWithin(opts.ensure(), remaining, signal);
+          currentUrl = nextSidecarUrl(currentUrl, await settleSidecarEnsureWithin(opts.ensure(), remaining, signal));
           left = deadline - now();
           if (left <= 0) throw new Error('sidecar_ensure_timeout: budget spent re-establishing the sidecar');
         }
-        const res = await sidecarEmbedBatch(url, {
+        const res = await sidecarEmbedBatch(currentUrl, {
           model: opts.model,
           kind: opts.kind,
           texts: [text],
@@ -367,12 +381,12 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
     throw isNonRetryableSidecarError(lastErr)
       ? new Error(
           `sidecar_rejected_request: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
-            `(${url}, ${opts.model}:${opts.kind}) — the sidecar rejected this request (non-retryable); ` +
+            `(${currentUrl}, ${opts.model}:${opts.kind}) — the sidecar rejected this request (non-retryable); ` +
             'check payload shape/size — this is not a downtime issue',
         )
       : new Error(
           `sidecar_required_unavailable: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
-            `(${url}, ${opts.model}:${opts.kind}, budget ${timeoutMs}ms) — embedding requires the sidecar; ` +
+            `(${currentUrl}, ${opts.model}:${opts.kind}, budget ${timeoutMs}ms) — embedding requires the sidecar; ` +
             'writes are parked in the memory write journal and auto-recover when it returns',
         );
   };
