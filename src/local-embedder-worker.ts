@@ -238,6 +238,12 @@ function armIdleUnload(): void {
     state.idleTimer = null;
     if (state.pending.size > 0 || !state.worker || state.recycling) return;
     state.idleUnloads = (state.idleUnloads ?? 0) + 1;
+    // The ONE observable trace of this lever on a deployed host: without it the
+    // only evidence an unload happened is an RSS drop (the P-010 VM run had to
+    // infer it that way). Greppable as "idle unload".
+    console.log(
+      `[embed-worker] idle unload #${state.idleUnloads}: no embed for ${Math.round(ms / 1000)}s, releasing the worker and its model`,
+    );
     recycleEmbedWorker().catch(() => {
       /* the next embed respawns regardless; nothing to report here */
     });

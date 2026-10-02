@@ -82,6 +82,7 @@ describe.skipIf(!onnxInstalled())('embed worker idle unload (WI-10005070)', () =
   it('releases the worker after the idle window and respawns on the next embed', async () => {
     setIdleMs('150');
     stubWorkerReplies({ reply: true });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const before = getEmbedWorkerIdleStats().idleUnloads;
 
     expect(await embedViaWorker('first')).toEqual([0.25, 0.5]);
@@ -92,6 +93,9 @@ describe.skipIf(!onnxInstalled())('embed worker idle unload (WI-10005070)', () =
 
     await vi.waitFor(() => expect(getWorkerState().alive).toBe(false), { timeout: 5_000, interval: 25 });
     expect(getEmbedWorkerIdleStats()).toMatchObject({ armed: false, idleUnloads: before + 1 });
+    // The unload must leave a greppable trace in the host log: it is the only
+    // field evidence the lever fired (WI-10005070, P-010 VM run).
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^\[embed-worker\] idle unload #\d+: no embed for 0s/));
 
     expect(await embedViaWorker('after unload')).toEqual([0.25, 0.5]);
     expect(getWorkerState().alive).toBe(true);
