@@ -223,6 +223,44 @@ export interface SidecarFirstEmbedderOpts {
    *  refusing a bad request (deterministic 4xx) — distinct from 'down' so
    *  the log never claims the sidecar is unavailable when it isn't. */
   onTransition?: (state: 'down' | 'up' | 'rejected', detail: string) => void;
+  /** Re-establish the sidecar before each attempt. A sidecar this process
+   *  spawned may have exited after an idle period, and this hook re-launches
+   *  it on demand. It should be cheap when the sidecar is already running.
+   *  It runs inside the same total budget. If the budget runs out first, the
+   *  attempt fails and the ensure keeps running, so a later call finds the
+   *  sidecar warming or ready. Leave unset for a sidecar another process owns. */
+  ensure?: () => Promise<unknown>;
+}
+
+/** Settle `work` within `ms`, or reject with `sidecar_ensure_timeout`. A late
+ *  settle of `work` is ignored. `Promise.race` subscribes to it, so a late
+ *  rejection is never an unhandled rejection. */
+export async function settleSidecarEnsureWithin(
+  work: Promise<unknown>,
+  ms: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  try {
+    await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`sidecar_ensure_timeout: sidecar not ready within ${Math.max(0, Math.round(ms))}ms`)),
+          Math.max(0, ms),
+        );
+        if (signal) {
+          onAbort = () => reject(signal.reason ?? new Error('aborted'));
+          if (signal.aborted) onAbort();
+          else signal.addEventListener('abort', onAbort, { once: true });
+        }
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) signal?.removeEventListener('abort', onAbort);
+  }
 }
 
 /**
@@ -276,11 +314,17 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
       const remaining = deadline - now();
       if (remaining <= 0) break;
       try {
+        let left = remaining;
+        if (opts.ensure) {
+          await settleSidecarEnsureWithin(opts.ensure(), remaining, signal);
+          left = deadline - now();
+          if (left <= 0) throw new Error('sidecar_ensure_timeout: budget spent re-establishing the sidecar');
+        }
         const res = await sidecarEmbedBatch(url, {
           model: opts.model,
           kind: opts.kind,
           texts: [text],
-          timeoutMs: remaining,
+          timeoutMs: left,
           signal,
           fetchFn: opts.fetchFn,
         });
