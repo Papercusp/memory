@@ -75,13 +75,74 @@ function nativeFileFingerprint(file, mappedDevice, mappedInode) {
   } finally { closeSync(descriptor); }
 }
 
+/** Kernel auxv identifies the exec image, interpreter and kernel-supplied
+ * vDSO. Restrict qualification to the ELF64 little-endian hosts we inspect;
+ * unsupported layouts fail the requested diagnostic rather than guessing. */
+function sampleNativeLoaderProcess(libraries, vdsoRanges) {
+  if (!['x64', 'arm64'].includes(process.arch)) throw new Error('unsupported native loader ELF architecture');
+  const auxvBytes = readFileSync('/proc/self/auxv'), auxv = new Map();
+  if (auxvBytes.length % 16) throw new Error('native loader auxv malformed');
+  let terminated = false;
+  for (let offset=0; offset<auxvBytes.length; offset+=16) {
+    const key=auxvBytes.readBigUInt64LE(offset), value=auxvBytes.readBigUInt64LE(offset+8);
+    if (key===0n) { terminated=true; break; }
+    if (auxv.has(key)) throw new Error('native loader auxv repeated');
+    auxv.set(key,value);
+  }
+  if (!terminated || [3n,4n,5n,7n,9n,33n].some(key=>!auxv.get(key))) throw new Error('native loader auxv incomplete');
+  const executablePath = realpathSync('/proc/self/exe'), descriptor = openSync(executablePath,'r');
+  let interpreterPath;
+  try {
+    const readAt = (offset, length) => {
+      if (!Number.isSafeInteger(offset) || offset<0 || !Number.isSafeInteger(length) || length<1 || length>65536) {
+        throw new Error('native loader ELF bounds unsupported');
+      }
+      const bytes=Buffer.alloc(length);
+      if (readSync(descriptor,bytes,0,length,offset)!==length) throw new Error('native loader ELF truncated');
+      return bytes;
+    };
+    const header=readAt(0,64);
+    if (!header.subarray(0,6).equals(Buffer.from([127,69,76,70,2,1]))) throw new Error('native loader ELF layout unsupported');
+    const entryBytes=header.readUInt16LE(54), count=header.readUInt16LE(56), offset=Number(header.readBigUInt64LE(32));
+    if (entryBytes!==56 || BigInt(entryBytes)!==auxv.get(4n) || BigInt(count)!==auxv.get(5n)) {
+      throw new Error('native loader ELF headers differ from auxv');
+    }
+    const headers=readAt(offset,entryBytes*count);
+    for(let index=0;index<count;index++) {
+      const row=headers.subarray(index*entryBytes,(index+1)*entryBytes);
+      if (row.readUInt32LE(0)!==3) continue; // PT_INTERP
+      if (interpreterPath) throw new Error('native loader interpreter repeated');
+      const name=readAt(Number(row.readBigUInt64LE(8)),Number(row.readBigUInt64LE(32)));
+      if (name.at(-1)!==0 || name.subarray(0,-1).includes(0)) throw new Error('native loader interpreter malformed');
+      interpreterPath=realpathSync(name.subarray(0,-1).toString('utf8'));
+    }
+  } finally { closeSync(descriptor); }
+  if (!interpreterPath || !libraries.some(file=>file.path===executablePath)
+    || !libraries.some(file=>file.path===interpreterPath) || vdsoRanges.length!==1) throw new Error('native loader exec mappings incomplete');
+  const range=vdsoRanges[0], start=BigInt('0x'+range.startAddress), length=BigInt('0x'+range.endAddress)-start;
+  if (start!==auxv.get(33n) || start>BigInt(Number.MAX_SAFE_INTEGER) || length<64n || length>65536n) {
+    throw new Error('native loader vDSO bounds unsupported');
+  }
+  const memory=openSync('/proc/self/mem','r'), vdsoBytes=Buffer.alloc(Number(length));
+  try {
+    if(readSync(memory,vdsoBytes,0,vdsoBytes.length,Number(start))!==vdsoBytes.length
+      || !vdsoBytes.subarray(0,6).equals(Buffer.from([127,69,76,70,2,1]))) throw new Error('native loader vDSO incomplete');
+  } finally { closeSync(memory); }
+  return { executablePath, interpreterPath, programHeaderAddress:auxv.get(3n).toString(16),
+    programHeaderEntryBytes:Number(auxv.get(4n)), programHeaderCount:Number(auxv.get(5n)),
+    entryAddress:auxv.get(9n).toString(16), interpreterBaseAddress:auxv.get(7n).toString(16),
+    vdso:{ ...range, bytes:vdsoBytes.length, sha256:createHash('sha256').update(vdsoBytes).digest('hex'),
+      origin:'kernel-auxv-AT_SYSINFO_EHDR' } };
+}
+
 function sampleNativeRuntime(device) {
   if (process.platform !== 'linux') return undefined;
-  const beforeNs = process.hrtime.bigint().toString(), files = new Map();
+  const beforeNs = process.hrtime.bigint().toString(), files = new Map(), vdsoRanges = [];
   for (const line of readFileSync('/proc/self/maps', 'utf8').trim().split('\n')) {
     const row = line.match(/^([\da-f]+)-([\da-f]+)\s+(\S+)\s+([\da-f]+)\s+([\da-f]+:[\da-f]+)\s+(\d+)\s*(.*)$/i);
     if (!row) throw new Error('native library maps row malformed');
     const [, startAddress, endAddress, permissions, fileOffset, mappedDevice, mappedInode, file] = row;
+    if (file==='[vdso]') vdsoRanges.push({startAddress,endAddress,fileOffset,permissions});
     if (!file.startsWith('/')) continue;
     if (file.endsWith(' (deleted)')) {
       if (permissions.includes('x') || /\.so(?:\.| |$)|\.node(?: |$)/.test(file)) throw new Error('native library mapping is deleted: '+file);
@@ -97,6 +158,7 @@ function sampleNativeRuntime(device) {
   const libraries = [...files.values()].filter(file=>file.eligible).map(({ eligible, ...file }) =>
     ({ ...file, ...nativeFileFingerprint(file.path, file.mappedDevice, file.mappedInode) }));
   if (!libraries.length) throw new Error('native library mapping population missing');
+  const loaderProcess=sampleNativeLoaderProcess(libraries,vdsoRanges);
   let gpuMemory = { status: 'not-applicable' };
   if (device === 'cuda') {
     const queryBeforeNs = process.hrtime.bigint().toString();
@@ -123,7 +185,7 @@ function sampleNativeRuntime(device) {
       afterNs: process.hrtime.bigint().toString(), error: String(error) }; }
   }
   return { platform: 'linux', clock: 'node-hrtime', beforeNs, afterNs: process.hrtime.bigint().toString(),
-    libraries: libraries.sort((a,b)=>a.path.localeCompare(b.path)), gpuMemory };
+    libraries: libraries.sort((a,b)=>a.path.localeCompare(b.path)), gpuMemory, loaderProcess };
 }
 
 /** Reuse Python's standard Linux clock_gettime bindings rather than adding an

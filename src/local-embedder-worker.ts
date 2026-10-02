@@ -73,6 +73,12 @@ export interface WorkerNativeInferenceTrace extends WorkerInferenceTrace {
 
 export interface WorkerNativeRuntimeSample {
   platform: 'linux'; clock: 'node-hrtime'; beforeNs: string; afterNs: string;
+  /** Optional for historical observations. Required by complete loader closure
+   * qualification; these addresses come from this process's kernel auxv. */
+  loaderProcess?: { executablePath: string; interpreterPath: string; programHeaderAddress: string;
+    programHeaderEntryBytes: number; programHeaderCount: number; entryAddress: string; interpreterBaseAddress: string;
+    vdso: { startAddress: string; endAddress: string; fileOffset: string; permissions: string;
+      bytes: number; sha256: string; origin: 'kernel-auxv-AT_SYSINFO_EHDR' } };
   libraries: { path: string; bytes: number; sha256: string; mappedDevice: string; mappedInode: string;
     /** All segments of the selected file, including non-executable ELF headers.
      * Older saved observations lack these and cannot qualify address joins. */

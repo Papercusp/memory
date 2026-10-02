@@ -282,6 +282,16 @@ try {
             }
             expect(runtime.libraries.find((file:any)=>file.path === process.execPath)?.mappedRanges
               .some((range:any)=>!range.permissions.includes('x'))).toBe(true);
+            const loader=runtime.loaderProcess;
+            expect(loader).toMatchObject({executablePath:process.execPath,programHeaderEntryBytes:56,
+              programHeaderCount:expect.any(Number),vdso:{origin:'kernel-auxv-AT_SYSINFO_EHDR',
+                sha256:expect.stringMatching(/^[a-f0-9]{64}$/),permissions:'r-xp'}});
+            for(const [address,file] of [[loader.programHeaderAddress,loader.executablePath],
+              [loader.entryAddress,loader.executablePath],[loader.interpreterBaseAddress,loader.interpreterPath]]) {
+              expect(runtime.libraries.find((f:any)=>f.path===file).mappedRanges.some((r:any)=>
+                BigInt('0x'+r.startAddress)<=BigInt('0x'+address) && BigInt('0x'+address)<BigInt('0x'+r.endAddress))).toBe(true);
+            }
+            expect(loader.vdso.bytes).toBe(Number(BigInt('0x'+loader.vdso.endAddress)-BigInt('0x'+loader.vdso.startAddress)));
             if (event.inference.phase === 'start') expect(BigInt(runtime.afterNs)).toBeLessThanOrEqual(BigInt(event.inference.monotonicNs));
             else expect(BigInt(runtime.beforeNs)).toBeGreaterThanOrEqual(BigInt(event.inference.monotonicNs));
           }
