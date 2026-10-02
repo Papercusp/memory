@@ -20,8 +20,60 @@ import { parentPort, workerData, threadId } from 'node:worker_threads';
 import { readFileSync, readlinkSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { availableParallelism } from 'node:os';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createRequire } from 'node:module';
+import { dirname } from 'node:path';
 
 const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
+const nativeInferenceContext = new AsyncLocalStorage();
+let nativeInferenceTracePrepared = false;
+let nativeInferenceTracePreparation;
+
+/** ORT's JS handler schedules a synchronous addon Run with setImmediate. The
+ * request context follows that queue; trace the addon instance, not the outer
+ * Promise. Keep the installed constructor/prototype and native receiver. */
+async function prepareNativeInferenceTrace() {
+  if (nativeInferenceTracePrepared) return;
+  if (nativeInferenceTracePreparation) return nativeInferenceTracePreparation;
+  nativeInferenceTracePreparation = (async () => {
+  if (pipelinesByModel.size) throw new Error('native inference evidence requires a fresh worker before model construction');
+  const require = createRequire(import.meta.url);
+  const binding = workerData?.nativeBindingSpecifier
+    ? (await import(workerData.nativeBindingSpecifier)).binding
+    : require(join(dirname(require.resolve('onnxruntime-node')), 'binding.js')).binding;
+  const descriptor = Object.getOwnPropertyDescriptor(binding, 'InferenceSession');
+  const Original = binding.InferenceSession;
+  if (!descriptor?.writable || typeof Original?.prototype?.run !== 'function') throw new Error('native inference evidence binding contract mismatch');
+  function TracedInferenceSession(...args) {
+    const session = Reflect.construct(Original, args), originalRun = session.run;
+    Object.defineProperty(session, 'run', { value: function (feeds, fetches, options) {
+      const context = nativeInferenceContext.getStore();
+      if (!context) return Reflect.apply(originalRun, this, [feeds, fetches, options]);
+      const runIndex = ++context.runIndex;
+      const runTag = `pc-embed:${context.request.processId}:${context.request.workerThreadId}:${context.request.requestId}:${context.request.attempt}:${runIndex}`;
+      const emit = (phase, outcome) => parentPort.postMessage({ kind: 'embed_native_inference', id: context.request.requestId,
+        inference: { ...context.request, model: context.model, device: context.device, runIndex, runTag,
+          clock: 'node-hrtime', monotonicNs: process.hrtime.bigint().toString(), observedAt: new Date().toISOString(), phase,
+          ...(outcome ? { outcome } : {}) } });
+      emit('start');
+      let result;
+      try { result = Reflect.apply(originalRun, this, [feeds, fetches, { ...options, tag: runTag }]); }
+      catch (error) { emit('end', 'error'); throw error; }
+      if (result && typeof result.then === 'function') {
+        emit('end', 'error'); throw new Error('native inference evidence requires a synchronous native Run');
+      }
+      emit('end', 'success');
+      return result;
+    } });
+    return session;
+  }
+  Object.setPrototypeOf(TracedInferenceSession, Original);
+  TracedInferenceSession.prototype = Original.prototype;
+  binding.InferenceSession = TracedInferenceSession;
+  nativeInferenceTracePrepared = true;
+  })();
+  return nativeInferenceTracePreparation;
+}
 
 /** Host parallelism, defensively — a 0/NaN/throwing reading must degrade to the
  *  single-thread floor, never to ONNX's all-cores default. Mirrors
@@ -188,7 +240,7 @@ async function runEmbed(msg, entry, attempt = 1) {
   const pooling = msg.pooling || 'mean';
   const normalize = msg.normalize === undefined ? true : msg.normalize;
   const pipe = entry.pipe;
-  if ((msg.traceInput || msg.traceInference) && msg.tokenizerBackend !== 'rust') throw new Error('input evidence requires the explicit Rust tensor route');
+  if ((msg.traceInput || msg.traceInference || msg.traceNativeInference) && msg.tokenizerBackend !== 'rust') throw new Error('input evidence requires the explicit Rust tensor route');
   if (msg.tokenizerBackend === 'rust') {
     if (pooling !== 'cls' || msg.output) throw new Error('Rust candidate contract requires native CLS output');
     const encoding = await rustTokenize(msg.model, text);
@@ -199,7 +251,7 @@ async function runEmbed(msg, entry, attempt = 1) {
       input_ids: new t.Tensor('int64', BigInt64Array.from(ids, BigInt), shape),
       attention_mask: new t.Tensor('int64', BigInt64Array.from(encoding.getAttentionMask(), BigInt), shape),
     };
-    const request = msg.traceInput || msg.traceInference ? {
+    const request = msg.traceInput || msg.traceInference || msg.traceNativeInference ? {
       requestId: msg.id, attempt, processId: process.pid, workerThreadId: threadId,
       nativeThreadId: process.platform === 'linux' ? Number(readlinkSync('/proc/thread-self').split('/').at(-1)) : null,
     } : undefined;
@@ -219,7 +271,9 @@ async function runEmbed(msg, entry, attempt = 1) {
     emitInference('start');
     let output;
     try {
-      output = await pipe.model(inputs);
+      output = await (msg.traceNativeInference
+        ? nativeInferenceContext.run({ request, model: msg.model, device: entry.device, runIndex: 0 }, () => pipe.model(inputs))
+        : pipe.model(inputs));
     } catch (error) { emitInference('end', 'error'); throw error; }
     emitInference('end', 'success');
     if (!output.last_hidden_state) throw new Error('Rust candidate graph lacks last_hidden_state');
@@ -261,6 +315,7 @@ parentPort.on('message', async (msg) => {
   // Batch this only alongside a mask-aware last-token gather.
   const key = model || DEFAULT_MODEL;
   try {
+    if (msg.traceNativeInference) await prepareNativeInferenceTrace();
     const entry = await getPipeline(key);
     let vector;
     try {

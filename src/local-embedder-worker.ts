@@ -34,6 +34,8 @@ interface PendingRequest {
   onInputTrace?: (trace: WorkerInputTrace) => void;
   onInferenceTrace?: (trace: WorkerInferenceTrace) => void;
   inferenceTraces?: WorkerInferenceTrace[];
+  onNativeInferenceTrace?: (trace: WorkerNativeInferenceTrace) => void;
+  nativeInferenceTraces?: WorkerNativeInferenceTrace[];
   inputTraceCount?: number;
   inputTraceError?: Error;
 }
@@ -57,6 +59,12 @@ export interface WorkerInferenceTrace extends WorkerRequestIdentity {
   model: string; device: 'cpu' | 'cuda'; observedAt: string;
   clock: 'node-hrtime'; monotonicNs: string; phase: 'start' | 'end';
   outcome?: 'success' | 'error';
+}
+
+/** Boundaries around the synchronous native addon call, after its JS queue.
+ * This still requires profiler clock calibration before attributing kernels. */
+export interface WorkerNativeInferenceTrace extends WorkerInferenceTrace {
+  runIndex: number; runTag: string;
 }
 
 function validRequestIdentity(value: WorkerRequestIdentity, id: number): boolean {
@@ -469,7 +477,7 @@ function ensureWorker(): Promise<void> {
 
     let initialized = false;
     state.worker.on('message', (msg: { kind: string; id?: number; vector?: number[]; error?: string;
-      trace?: WorkerInputTrace; inference?: WorkerInferenceTrace }) => {
+      trace?: WorkerInputTrace; inference?: WorkerInferenceTrace | WorkerNativeInferenceTrace }) => {
       if (msg.kind === 'ready') {
         initialized = true;
         // EI-19464316359123796: a persistent, REF'd worker thread keeps the
@@ -502,25 +510,44 @@ function ensureWorker(): Promise<void> {
       if (typeof msg.id !== 'number') return;
       const p = state.pending.get(msg.id);
       if (!p) return;
-      if (msg.kind === 'embed_inference') {
-        if (p.onInferenceTrace) {
+      if (msg.kind === 'embed_inference' || msg.kind === 'embed_native_inference') {
+        const native = msg.kind === 'embed_native_inference';
+        const callback = native ? p.onNativeInferenceTrace : p.onInferenceTrace;
+        if (callback) {
           try {
             const trace = msg.inference;
             if (!trace || !validRequestIdentity(trace, msg.id) || !['cpu', 'cuda'].includes(trace.device)
               || typeof trace.model !== 'string' || !Number.isFinite(Date.parse(trace.observedAt))
               || trace.clock !== 'node-hrtime' || typeof trace.monotonicNs !== 'string'
               || !/^[1-9]\d*$/.test(trace.monotonicNs)) throw new Error('invalid worker inference trace');
-            const prior = p.inferenceTraces?.at(-1);
+            const traces = native ? (p.nativeInferenceTraces ??= []) : (p.inferenceTraces ??= []);
+            const prior = traces.at(-1);
+            const nativeTrace = trace as WorkerNativeInferenceTrace;
+            if (native && (!Number.isSafeInteger(nativeTrace.runIndex) || nativeTrace.runIndex < 1
+              || nativeTrace.runTag !== `pc-embed:${trace.processId}:${trace.workerThreadId}:${trace.requestId}:${trace.attempt}:${nativeTrace.runIndex}`)) {
+              throw new Error('invalid worker native inference identity');
+            }
             if (trace.phase === 'start') {
-              if (trace.outcome !== undefined || trace.attempt !== (prior?.attempt ?? 0) + 1
-                || (prior && (prior.phase !== 'end' || prior.outcome !== 'error'
+              const nextAttempt = trace.attempt === (prior?.attempt ?? 0) + 1;
+              const nextNativeRun = native && prior && trace.attempt === prior.attempt
+                && nativeTrace.runIndex === (prior as WorkerNativeInferenceTrace).runIndex + 1;
+              if (trace.outcome !== undefined || (!nextAttempt && !nextNativeRun)
+                || (native && nextAttempt && nativeTrace.runIndex !== 1)
+                || (prior && (prior.phase !== 'end' || (nextAttempt && prior.outcome !== 'error')
                   || BigInt(trace.monotonicNs) < BigInt(prior.monotonicNs)))) throw new Error('invalid worker inference trace order');
             } else if (trace.phase !== 'end' || !['success', 'error'].includes(trace.outcome ?? '') || !prior
               || prior.phase !== 'start' || ['requestId', 'attempt', 'processId', 'workerThreadId', 'nativeThreadId', 'model', 'device']
                 .some((key) => trace[key as keyof WorkerInferenceTrace] !== prior[key as keyof WorkerInferenceTrace])
+              || (native && (nativeTrace.runIndex !== (prior as WorkerNativeInferenceTrace).runIndex
+                || nativeTrace.runTag !== (prior as WorkerNativeInferenceTrace).runTag))
               || BigInt(trace.monotonicNs) < BigInt(prior.monotonicNs)) throw new Error('invalid worker inference trace order');
-            (p.inferenceTraces ??= []).push(trace);
-            p.onInferenceTrace(trace);
+            if (native) {
+              p.nativeInferenceTraces!.push(nativeTrace);
+              p.onNativeInferenceTrace!(nativeTrace);
+            } else {
+              p.inferenceTraces!.push(trace);
+              p.onInferenceTrace!(trace);
+            }
           } catch (error) { p.inputTraceError ??= error instanceof Error ? error : new Error(String(error)); }
         }
         return;
@@ -551,6 +578,9 @@ function ensureWorker(): Promise<void> {
         else if (p.onInputTrace && !p.inputTraceCount) p.reject(new Error('worker returned a vector without requested input evidence'));
         else if (p.onInferenceTrace && p.inferenceTraces?.at(-1)?.outcome !== 'success') {
           p.reject(new Error('worker returned a vector without complete requested inference evidence'));
+        }
+        else if (p.onNativeInferenceTrace && p.nativeInferenceTraces?.at(-1)?.outcome !== 'success') {
+          p.reject(new Error('worker returned a vector without complete requested native inference evidence'));
         }
         else p.resolve(msg.vector);
       } else {
@@ -640,6 +670,8 @@ export interface EmbedViaWorkerOpts {
   onInputTrace?: (trace: WorkerInputTrace) => void;
   /** Opt-in request/attempt/thread identities and graph-call clock boundaries. */
   onInferenceTrace?: (trace: WorkerInferenceTrace) => void;
+  /** Fresh-worker qualification only: synchronous native Run boundaries. */
+  onNativeInferenceTrace?: (trace: WorkerNativeInferenceTrace) => void;
 }
 
 /**
@@ -665,7 +697,7 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
   const id = state.nextId++;
   return new Promise<number[]>((resolveEmbed, rejectEmbed) => {
     state.pending.set(id, { resolve: resolveEmbed, reject: rejectEmbed, onInputTrace: opts.onInputTrace,
-      onInferenceTrace: opts.onInferenceTrace });
+      onInferenceTrace: opts.onInferenceTrace, onNativeInferenceTrace: opts.onNativeInferenceTrace });
     // Ref BEFORE posting: between the post and the reply the caller is awaiting
     // a Promise, which is not loop work — an unref'd worker would leave the loop
     // looking idle and let `beforeExit` terminate this very request (WI-37683).
@@ -681,6 +713,7 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
       tokenizerBackend: opts.tokenizerBackend,
       ...(opts.onInputTrace ? { traceInput: true } : {}),
       ...(opts.onInferenceTrace ? { traceInference: true } : {}),
+      ...(opts.onNativeInferenceTrace ? { traceNativeInference: true } : {}),
     });
   });
 }
