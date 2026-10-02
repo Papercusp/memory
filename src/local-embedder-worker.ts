@@ -85,14 +85,16 @@ export interface WorkerNativeRuntimeSample {
 export function validNativeRuntimeSample(event: WorkerNativeInferenceTrace): boolean {
   const sample = event.runtime, ns = (n: unknown): n is string => typeof n === 'string' && /^[1-9]\d*$/.test(n);
   const fp = (f: { path: string; bytes: number; sha256: string }) => f && typeof f.path === 'string' && f.path.startsWith('/')
-    && Number.isSafeInteger(f.bytes) && f.bytes > 0 && /^[a-f0-9]{64}$/.test(f.sha256);
+    && Number.isSafeInteger(f.bytes) && f.bytes > 0 && typeof f.sha256 === 'string' && /^[a-f0-9]{64}$/.test(f.sha256);
   if (!sample || event.runtimeProbeError !== undefined || sample.platform !== 'linux' || sample.clock !== 'node-hrtime'
     || !ns(event.monotonicNs) || !ns(sample.beforeNs) || !ns(sample.afterNs) || BigInt(sample.beforeNs) > BigInt(sample.afterNs)
     || (event.phase === 'start' && BigInt(sample.afterNs) > BigInt(event.monotonicNs))
     || (event.phase === 'end' && BigInt(sample.beforeNs) < BigInt(event.monotonicNs))
     || !Array.isArray(sample.libraries) || !sample.libraries.length
+    || sample.libraries.some(f=>!fp(f) || typeof f.mappedDevice !== 'string' || typeof f.mappedInode !== 'string'
+      || !/^[\da-f]+:[\da-f]+$/i.test(f.mappedDevice) || !/^[1-9]\d*$/.test(f.mappedInode))
     || new Set(sample.libraries.map(f=>f.path)).size !== sample.libraries.length
-    || sample.libraries.some(f=>!fp(f) || !/^[\da-f]+:[\da-f]+$/i.test(f.mappedDevice) || !/^[1-9]\d*$/.test(f.mappedInode))) return false;
+    ) return false;
   const gpu = sample.gpuMemory;
   if (event.device === 'cpu') return gpu?.status === 'not-applicable';
   if (!gpu || !['measured','unknown'].includes(gpu.status) || gpu.status === 'not-applicable'
@@ -101,11 +103,12 @@ export function validNativeRuntimeSample(event: WorkerNativeInferenceTrace): boo
   if (gpu.status === 'unknown') return typeof gpu.error === 'string' && !!gpu.error;
   return gpu.scope === 'all-nvidia-smi-devices' && fp(gpu.executable)
     && (gpu.cudaVisibleDevices === null || typeof gpu.cudaVisibleDevices === 'string')
-    && Array.isArray(gpu.devices) && gpu.devices.length > 0 && new Set(gpu.devices.map(d=>d.uuid)).size === gpu.devices.length
+    && Array.isArray(gpu.devices) && gpu.devices.length > 0
     && gpu.devices.every(d=>typeof d.uuid === 'string' && d.uuid.startsWith('GPU-') && typeof d.pciBusId === 'string'
       && /^[\da-f]+:[\da-f]+:[\da-f]+\.[\da-f]+$/i.test(d.pciBusId)
       && [d.totalMiB,d.usedMiB,d.freeMiB].every(Number.isFinite) && d.totalMiB > 0 && d.usedMiB >= 0 && d.freeMiB >= 0
-      && d.usedMiB <= d.totalMiB && d.freeMiB <= d.totalMiB);
+      && d.usedMiB <= d.totalMiB && d.freeMiB <= d.totalMiB)
+    && new Set(gpu.devices.map(d=>d.uuid)).size === gpu.devices.length;
 }
 
 export interface WorkerRawClockSample {

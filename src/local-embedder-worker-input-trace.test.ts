@@ -224,6 +224,14 @@ try {
               pythonVersion: expect.any(String) });
             expect(BigInt(clock.monotonicBeforeNs)).toBeGreaterThanOrEqual(BigInt(clock.nodeBeforeNs));
             expect(BigInt(clock.monotonicAfterNs)).toBeLessThanOrEqual(BigInt(clock.nodeAfterNs));
+            const runtime = event.inference.runtime;
+            expect(runtime).toMatchObject({ platform: 'linux', clock: 'node-hrtime', gpuMemory: { status: 'not-applicable' } });
+            expect(runtime.libraries.length).toBeGreaterThan(0);
+            expect(runtime.libraries.some((f: any)=>f.path.endsWith('.node'))).toBe(true);
+            for (const file of runtime.libraries) expect(file).toMatchObject({ path: expect.stringMatching(/^\//),
+              bytes: expect.any(Number), sha256: expect.stringMatching(/^[a-f0-9]{64}$/), mappedInode: expect.stringMatching(/^[1-9]\d*$/) });
+            if (event.inference.phase === 'start') expect(BigInt(runtime.afterNs)).toBeLessThanOrEqual(BigInt(event.inference.monotonicNs));
+            else expect(BigInt(runtime.beforeNs)).toBeGreaterThanOrEqual(BigInt(event.inference.monotonicNs));
           }
           expect(BigInt(events[1].inference.rawClock.rawNs)).toBeGreaterThan(BigInt(events[0].inference.rawClock.rawNs));
         }
