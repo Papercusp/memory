@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { embedViaWorker, getWorkerState, shutdownLocalEmbedder, _resetBeforeExitHookForTest,
-  type WorkerInputTrace } from './local-embedder-worker';
+  type WorkerInputTrace, type WorkerInferenceTrace } from './local-embedder-worker';
 
 const trace: WorkerInputTrace = { model: '/private/model', device: 'cpu', observedAt: '2026-10-02T00:00:00.000Z',
   inputShape: [1, 2], inputIds: [1, 2], attentionMask: [1, 1] };
@@ -85,9 +85,54 @@ describe('worker input evidence protocol', () => {
   it('does not request raw input evidence on ordinary calls', async () => {
     vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function (this: Worker, msg: any) {
       expect(msg).not.toHaveProperty('traceInput');
+      expect(msg).not.toHaveProperty('traceInference');
       setImmediate(() => this.emit('message', { kind: 'embed_ok', id: msg.id, vector: [1] }));
     });
     expect(await embedViaWorker('q')).toEqual([1]);
+  });
+  it.each(['missing', 'end-only', 'request', 'thread', 'clock', 'reverse', 'unfinished', 'callback'])
+    ('refuses a successful vector with %s graph lifecycle evidence', async (failure) => {
+      vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function (this: Worker, msg: any) {
+        expect(msg.traceInference).toBe(true);
+        setImmediate(() => {
+          const start: WorkerInferenceTrace = { requestId: msg.id, attempt: 1, processId: 123, workerThreadId: 1,
+            nativeThreadId: 456, model: trace.model, device: 'cpu', observedAt: trace.observedAt,
+            clock: 'node-hrtime', monotonicNs: '100', phase: 'start' };
+          const end: WorkerInferenceTrace = { ...start, monotonicNs: '200', phase: 'end', outcome: 'success' };
+          if (failure === 'request') start.requestId++;
+          if (failure === 'thread') end.nativeThreadId++;
+          if (failure === 'clock') start.monotonicNs = 'unknown';
+          if (failure === 'reverse') end.monotonicNs = '99';
+          if (!['missing', 'end-only'].includes(failure)) this.emit('message', { kind: 'embed_inference', id: msg.id, inference: start });
+          if (!['missing', 'unfinished'].includes(failure)) this.emit('message', { kind: 'embed_inference', id: msg.id, inference: end });
+          this.emit('message', { kind: 'embed_ok', id: msg.id, vector: [1] });
+        });
+      });
+      await expect(embedViaWorker('q', { onInferenceTrace: () => {
+        if (failure === 'callback') throw new Error('lifecycle persistence failed');
+      } })).rejects.toThrow(failure === 'callback' ? 'persistence failed'
+        : ['missing', 'unfinished'].includes(failure) ? 'without complete requested inference evidence' : 'invalid worker inference trace');
+      expect(getWorkerState().pendingCount).toBe(0);
+    });
+  it('keeps a failed CUDA attempt separate from its CPU fallback', async () => {
+    const observed: WorkerInferenceTrace[] = [];
+    vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function (this: Worker, msg: any) {
+      setImmediate(() => {
+        const identity = { requestId: msg.id, processId: 123, workerThreadId: 1, nativeThreadId: 456,
+          model: trace.model, observedAt: trace.observedAt, clock: 'node-hrtime' as const };
+        for (const [attempt, device, outcome] of [[1, 'cuda', 'error'], [2, 'cpu', 'success']] as const) {
+          for (const phase of ['start', 'end'] as const) this.emit('message', { kind: 'embed_inference', id: msg.id,
+            inference: { ...identity, attempt, device, phase, monotonicNs: String(attempt * 100 + (phase === 'end' ? 50 : 0)),
+              ...(phase === 'end' ? { outcome } : {}) } });
+        }
+        this.emit('message', { kind: 'embed_ok', id: msg.id, vector: [1] });
+      });
+    });
+    expect(await embedViaWorker('q', { onInferenceTrace: (row) => observed.push(row) })).toEqual([1]);
+    expect(observed.map(t => [t.attempt, t.device, t.phase, t.outcome])).toEqual([
+      [1, 'cuda', 'start', undefined], [1, 'cuda', 'end', 'error'],
+      [2, 'cpu', 'start', undefined], [2, 'cpu', 'end', 'success'],
+    ]);
   });
 });
 
@@ -102,9 +147,11 @@ describe('real worker submitted tensors', () => {
     writeFileSync(fake, `export const env = {};
 export class Tensor { constructor(type, data, dims) { this.type=type; this.data=data; this.dims=dims; } }
 export async function pipeline() { return { model: async inputs => {
-  if (JSON.stringify(Array.from(inputs.input_ids.data, Number)) !== '[1,2,3]') throw new Error('wrong submitted ids');
+  const ids = Array.from(inputs.input_ids.data, Number);
+  if (ids.length !== 3) throw new Error('wrong submitted ids');
+  await new Promise(resolve => setTimeout(resolve, ids[0] === 1 ? 30 : 0));
   if (${fail}) throw new Error('graph rejected exact tensors');
-  return { last_hidden_state: { slice: () => ({ normalize: () => ({ data: [1,0] }) }) } };
+  return { last_hidden_state: { slice: () => ({ normalize: () => ({ data: [ids[0],0] }) }) } };
 } }; }
 `);
     const worker = new Worker(new URL('./local-embedder-worker.script.mjs', import.meta.url), {
@@ -118,11 +165,42 @@ export async function pipeline() { return { model: async inputs => {
       const done = new Promise<any>((resolve, reject) => { worker.once('error', reject); worker.on('message', m => {
         if (m.id === 7 && ['embed_ok', 'embed_err'].includes(m.kind)) resolve(m);
       }); });
-      worker.postMessage({ kind: 'embed', id: 7, text: 'a b c d', model: dir, tokenizerBackend: 'rust', pooling: 'cls', traceInput: true });
+      worker.postMessage({ kind: 'embed', id: 7, text: 'a b c d', model: dir, tokenizerBackend: 'rust', pooling: 'cls', traceInput: true, traceInference: true });
       const result = await done, input = messages.find(m => m.kind === 'embed_input');
       expect(input).toMatchObject({ id: 7, trace: { model: dir, device: 'cpu', inputShape: [1,3], inputIds: [1,2,3], attentionMask: [1,1,1] } });
       expect(messages.indexOf(input)).toBeLessThan(messages.indexOf(result));
       expect(result).toMatchObject(fail ? { kind: 'embed_err', error: 'graph rejected exact tensors' } : { kind: 'embed_ok', vector: [1,0] });
+      const lifecycle = messages.filter(m => m.kind === 'embed_inference');
+      expect(input.trace.request).toMatchObject({ requestId: 7, attempt: 1, processId: process.pid, workerThreadId: worker.threadId });
+      if (process.platform === 'linux') expect(input.trace.request.nativeThreadId).toBeGreaterThan(0);
+      else expect(input.trace.request.nativeThreadId).toBeNull();
+      expect(lifecycle.map(m => [m.inference.phase, m.inference.outcome])).toEqual([
+        ['start', undefined], ['end', fail ? 'error' : 'success'],
+      ]);
+      expect(lifecycle[0].inference).toMatchObject({ ...input.trace.request, clock: 'node-hrtime' });
+      expect(BigInt(lifecycle[1].inference.monotonicNs)).toBeGreaterThan(BigInt(lifecycle[0].inference.monotonicNs));
+      expect(messages.indexOf(input)).toBeLessThan(messages.indexOf(lifecycle[0]));
+      expect(messages.indexOf(lifecycle[1])).toBeLessThan(messages.indexOf(result));
+      if (!fail) {
+        const concurrent = new Promise<any[]>((resolve, reject) => {
+          const results: any[] = [];
+          worker.once('error', reject); worker.on('message', m => {
+            if ([8, 9].includes(m.id) && m.kind === 'embed_ok') { results.push(m); if (results.length === 2) resolve(results); }
+          });
+        });
+        for (const [id, text] of [[8, 'a b c d'], [9, 'b a c d']]) worker.postMessage({
+          kind: 'embed', id, text, model: dir, tokenizerBackend: 'rust', pooling: 'cls', traceInput: true, traceInference: true,
+        });
+        expect((await concurrent).map(m => [m.id, m.vector])).toEqual([[9, [2,0]], [8, [1,0]]]);
+        for (const id of [8, 9]) {
+          const events = messages.filter(m => m.kind === 'embed_inference' && m.id === id);
+          expect(events.map(m => [m.inference.requestId, m.inference.phase])).toEqual([[id, 'start'], [id, 'end']]);
+        }
+        const starts = messages.filter(m => m.kind === 'embed_inference' && [8, 9].includes(m.id) && m.inference.phase === 'start');
+        const firstEnd = messages.find(m => m.kind === 'embed_inference' && [8, 9].includes(m.id) && m.inference.phase === 'end');
+        expect(starts).toHaveLength(2);
+        expect(BigInt(starts[1].inference.monotonicNs)).toBeLessThan(BigInt(firstEnd.inference.monotonicNs));
+      }
     } finally { await worker.terminate(); rmSync(dir, { recursive: true, force: true }); }
   });
 });

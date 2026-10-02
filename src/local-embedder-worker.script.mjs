@@ -16,8 +16,8 @@
  * Next.js's TypeScript transform.
  */
 
-import { parentPort, workerData } from 'node:worker_threads';
-import { readFileSync } from 'node:fs';
+import { parentPort, workerData, threadId } from 'node:worker_threads';
+import { readFileSync, readlinkSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { availableParallelism } from 'node:os';
 
@@ -183,12 +183,12 @@ async function rustTokenize(model, text) {
   return tokenizer.encode(text);
 }
 
-async function runEmbed(msg, entry) {
+async function runEmbed(msg, entry, attempt = 1) {
   const { text } = msg;
   const pooling = msg.pooling || 'mean';
   const normalize = msg.normalize === undefined ? true : msg.normalize;
   const pipe = entry.pipe;
-  if (msg.traceInput && msg.tokenizerBackend !== 'rust') throw new Error('input evidence requires the explicit Rust tensor route');
+  if ((msg.traceInput || msg.traceInference) && msg.tokenizerBackend !== 'rust') throw new Error('input evidence requires the explicit Rust tensor route');
   if (msg.tokenizerBackend === 'rust') {
     if (pooling !== 'cls' || msg.output) throw new Error('Rust candidate contract requires native CLS output');
     const encoding = await rustTokenize(msg.model, text);
@@ -199,12 +199,29 @@ async function runEmbed(msg, entry) {
       input_ids: new t.Tensor('int64', BigInt64Array.from(ids, BigInt), shape),
       attention_mask: new t.Tensor('int64', BigInt64Array.from(encoding.getAttentionMask(), BigInt), shape),
     };
+    const request = msg.traceInput || msg.traceInference ? {
+      requestId: msg.id, attempt, processId: process.pid, workerThreadId: threadId,
+      nativeThreadId: process.platform === 'linux' ? Number(readlinkSync('/proc/thread-self').split('/').at(-1)) : null,
+    } : undefined;
     if (msg.traceInput) parentPort.postMessage({ kind: 'embed_input', id: msg.id, trace: {
       model: msg.model, device: entry.device, observedAt: new Date().toISOString(),
+      request,
       inputShape: [...inputs.input_ids.dims], inputIds: Array.from(inputs.input_ids.data, Number),
       attentionMask: Array.from(inputs.attention_mask.data, Number),
     } });
-    const output = await pipe.model(inputs);
+    const emitInference = (phase, outcome) => {
+      if (msg.traceInference) parentPort.postMessage({ kind: 'embed_inference', id: msg.id, inference: {
+        ...request, model: msg.model, device: entry.device, observedAt: new Date().toISOString(),
+        clock: 'node-hrtime', monotonicNs: process.hrtime.bigint().toString(), phase,
+        ...(outcome ? { outcome } : {}),
+      } });
+    };
+    emitInference('start');
+    let output;
+    try {
+      output = await pipe.model(inputs);
+    } catch (error) { emitInference('end', 'error'); throw error; }
+    emitInference('end', 'success');
     if (!output.last_hidden_state) throw new Error('Rust candidate graph lacks last_hidden_state');
     const cls = output.last_hidden_state.slice(null, 0);
     return Array.from((normalize ? cls.normalize(2, -1) : cls).data);
@@ -266,7 +283,7 @@ parentPort.on('message', async (msg) => {
         device: 'cpu',
         demotion: demotion ?? { from: 'cuda', stage: 'inference', cause: errorMessage(err) },
       });
-      vector = await runEmbed(msg, cpuEntry);
+      vector = await runEmbed(msg, cpuEntry, 2);
     }
     parentPort.postMessage({ kind: 'embed_ok', id, vector });
   } catch (err) {

@@ -32,6 +32,8 @@ interface PendingRequest {
   resolve: (v: number[]) => void;
   reject: (err: Error) => void;
   onInputTrace?: (trace: WorkerInputTrace) => void;
+  onInferenceTrace?: (trace: WorkerInferenceTrace) => void;
+  inferenceTraces?: WorkerInferenceTrace[];
   inputTraceCount?: number;
   inputTraceError?: Error;
 }
@@ -40,6 +42,27 @@ interface PendingRequest {
 export interface WorkerInputTrace {
   model: string; device: 'cpu' | 'cuda'; observedAt: string;
   inputShape: number[]; inputIds: number[]; attentionMask: number[];
+  request?: WorkerRequestIdentity;
+}
+
+export interface WorkerRequestIdentity {
+  requestId: number; attempt: number; processId: number; workerThreadId: number;
+  /** Linux OS TID, distinct from Node's workerThreadId; unavailable elsewhere. */
+  nativeThreadId: number | null;
+}
+
+/** Graph-call boundaries, not proof that a CUDA kernel belongs to this request.
+ * node-hrtime must be calibrated to the profiler's clock before joining. */
+export interface WorkerInferenceTrace extends WorkerRequestIdentity {
+  model: string; device: 'cpu' | 'cuda'; observedAt: string;
+  clock: 'node-hrtime'; monotonicNs: string; phase: 'start' | 'end';
+  outcome?: 'success' | 'error';
+}
+
+function validRequestIdentity(value: WorkerRequestIdentity, id: number): boolean {
+  return value.requestId === id && [value.requestId, value.attempt, value.processId, value.workerThreadId]
+    .every((n) => Number.isSafeInteger(n) && n > 0)
+    && (value.nativeThreadId === null || (Number.isSafeInteger(value.nativeThreadId) && value.nativeThreadId > 0));
 }
 
 interface WorkerState {
@@ -444,7 +467,8 @@ function ensureWorker(): Promise<void> {
     }
 
     let initialized = false;
-    state.worker.on('message', (msg: { kind: string; id?: number; vector?: number[]; error?: string; trace?: WorkerInputTrace }) => {
+    state.worker.on('message', (msg: { kind: string; id?: number; vector?: number[]; error?: string;
+      trace?: WorkerInputTrace; inference?: WorkerInferenceTrace }) => {
       if (msg.kind === 'ready') {
         initialized = true;
         // EI-19464316359123796: a persistent, REF'd worker thread keeps the
@@ -477,6 +501,27 @@ function ensureWorker(): Promise<void> {
       if (typeof msg.id !== 'number') return;
       const p = state.pending.get(msg.id);
       if (!p) return;
+      if (msg.kind === 'embed_inference') {
+        if (p.onInferenceTrace) {
+          try {
+            const trace = msg.inference;
+            if (!trace || !validRequestIdentity(trace, msg.id) || !['cpu', 'cuda'].includes(trace.device)
+              || typeof trace.model !== 'string' || !Number.isFinite(Date.parse(trace.observedAt))
+              || trace.clock !== 'node-hrtime' || !/^[1-9]\d*$/.test(trace.monotonicNs)) throw new Error('invalid worker inference trace');
+            const prior = p.inferenceTraces?.at(-1);
+            if (trace.phase === 'start') {
+              if (trace.outcome !== undefined || trace.attempt !== (prior?.attempt ?? 0) + 1
+                || (prior && (prior.phase !== 'end' || prior.outcome !== 'error'))) throw new Error('invalid worker inference trace order');
+            } else if (trace.phase !== 'end' || !['success', 'error'].includes(trace.outcome ?? '') || !prior
+              || prior.phase !== 'start' || ['requestId', 'attempt', 'processId', 'workerThreadId', 'nativeThreadId', 'model', 'device']
+                .some((key) => trace[key as keyof WorkerInferenceTrace] !== prior[key as keyof WorkerInferenceTrace])
+              || BigInt(trace.monotonicNs) < BigInt(prior.monotonicNs)) throw new Error('invalid worker inference trace order');
+            p.onInferenceTrace(trace);
+            (p.inferenceTraces ??= []).push(trace);
+          } catch (error) { p.inputTraceError = error instanceof Error ? error : new Error(String(error)); }
+        }
+        return;
+      }
       if (msg.kind === 'embed_input') {
         if (p.onInputTrace) {
           try {
@@ -484,6 +529,7 @@ function ensureWorker(): Promise<void> {
             if (!trace || !['cpu', 'cuda'].includes(trace.device) || typeof trace.model !== 'string'
               || !Number.isFinite(Date.parse(trace.observedAt)) || !Array.isArray(trace.inputIds) || !trace.inputIds.length
               || trace.inputIds.some((n) => !Number.isSafeInteger(n) || n < 0)
+              || (trace.request !== undefined && !validRequestIdentity(trace.request, msg.id))
               || JSON.stringify(trace.inputShape) !== JSON.stringify([1, trace.inputIds.length])
               || !Array.isArray(trace.attentionMask) || trace.attentionMask.length !== trace.inputIds.length
               || trace.attentionMask.some((n) => n !== 0 && n !== 1)) throw new Error('invalid worker input trace');
@@ -500,6 +546,9 @@ function ensureWorker(): Promise<void> {
       if (msg.kind === 'embed_ok' && Array.isArray(msg.vector)) {
         if (p.inputTraceError) p.reject(p.inputTraceError);
         else if (p.onInputTrace && !p.inputTraceCount) p.reject(new Error('worker returned a vector without requested input evidence'));
+        else if (p.onInferenceTrace && p.inferenceTraces?.at(-1)?.outcome !== 'success') {
+          p.reject(new Error('worker returned a vector without complete requested inference evidence'));
+        }
         else p.resolve(msg.vector);
       } else {
         p.reject(new Error(msg.error ?? 'worker error'));
@@ -586,6 +635,8 @@ export interface EmbedViaWorkerOpts {
   tokenizerBackend?: 'rust';
   /** Opt-in raw tensor evidence for private qualification; normal calls emit none. */
   onInputTrace?: (trace: WorkerInputTrace) => void;
+  /** Opt-in request/attempt/thread identities and graph-call clock boundaries. */
+  onInferenceTrace?: (trace: WorkerInferenceTrace) => void;
 }
 
 /**
@@ -610,7 +661,8 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
 
   const id = state.nextId++;
   return new Promise<number[]>((resolveEmbed, rejectEmbed) => {
-    state.pending.set(id, { resolve: resolveEmbed, reject: rejectEmbed, onInputTrace: opts.onInputTrace });
+    state.pending.set(id, { resolve: resolveEmbed, reject: rejectEmbed, onInputTrace: opts.onInputTrace,
+      onInferenceTrace: opts.onInferenceTrace });
     // Ref BEFORE posting: between the post and the reply the caller is awaiting
     // a Promise, which is not loop work — an unref'd worker would leave the loop
     // looking idle and let `beforeExit` terminate this very request (WI-37683).
@@ -625,6 +677,7 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
       output: opts.output,
       tokenizerBackend: opts.tokenizerBackend,
       ...(opts.onInputTrace ? { traceInput: true } : {}),
+      ...(opts.onInferenceTrace ? { traceInference: true } : {}),
     });
   });
 }

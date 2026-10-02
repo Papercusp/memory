@@ -1,7 +1,7 @@
 /** Pinned local ONNX candidate. Availability does not select a production model. */
 import fs from 'node:fs';
 import path from 'node:path';
-import { embedViaWorker, type WorkerInputTrace } from './local-embedder-worker';
+import { embedViaWorker, type WorkerInputTrace, type WorkerInferenceTrace } from './local-embedder-worker';
 import { CANDIDATE_DIM_SPECS } from './embedder-dims';
 
 export const MDENSEON_MODEL = 'lightonai/mDenseOn';
@@ -46,12 +46,14 @@ export function readMdenseOnExport(model: string): MdenseOnExportManifest {
 
 /** Reuses the shipped worker and its thread/device policy. No inline fallback:
  * sidecar validation must fail if inference would move onto the main loop. */
-export function buildMdenseOnEmbedder(opts: { kind: MdenseOnKind; model: string; onInputTrace?: (trace: WorkerInputTrace) => void }): (text: string) => Promise<number[]> {
+export function buildMdenseOnEmbedder(opts: { kind: MdenseOnKind; model: string; onInputTrace?: (trace: WorkerInputTrace) => void;
+  onInferenceTrace?: (trace: WorkerInferenceTrace) => void }): (text: string) => Promise<number[]> {
   readMdenseOnExport(opts.model);
   return async (text) => {
     const vector = await embedViaWorker(mdenseOnPrompt(opts.kind, text), {
       model: opts.model, pooling: 'cls', normalize: true, tokenizerBackend: 'rust',
       ...(opts.onInputTrace ? { onInputTrace: opts.onInputTrace } : {}),
+      ...(opts.onInferenceTrace ? { onInferenceTrace: opts.onInferenceTrace } : {}),
     });
     const norm = Math.sqrt(vector.reduce((sum, x) => sum + x * x, 0));
     if (vector.length !== MDENSEON_NATIVE_DIMS || vector.some((x) => !Number.isFinite(x)) || Math.abs(norm - 1) > 0.001) {
