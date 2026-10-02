@@ -135,7 +135,7 @@ describe('worker input evidence protocol', () => {
       [2, 'cpu', 'start', undefined], [2, 'cpu', 'end', 'success'],
     ]);
   });
-  it.each(['valid', 'missing', 'tag', 'run-index', 'thread', 'unfinished'])
+  it.each(['valid', 'missing', 'tag', 'run-index', 'thread', 'unfinished', 'runtime-files', 'runtime-order', 'runtime-error'])
     ('checks %s native-call evidence independently of the outer graph interval', async (failure) => {
       const seen: any[] = [];
       vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function (this: Worker, msg: any) {
@@ -148,6 +148,11 @@ describe('worker input evidence protocol', () => {
           if (failure === 'tag') start.runTag = 'another-request';
           if (failure === 'run-index') end.runIndex++;
           if (failure === 'thread') end.nativeThreadId++;
+          if (failure === 'runtime-files' || failure === 'runtime-order') (start as any).runtime = { platform: 'linux', clock: 'node-hrtime',
+            beforeNs: '10', afterNs: failure === 'runtime-order' ? '101' : '90',
+            libraries: failure === 'runtime-files' ? [] : [{ path: '/runtime/ort.node', bytes: 10, sha256: 'a'.repeat(64), mappedDevice: '08:01', mappedInode: '123' }],
+            gpuMemory: { status: 'not-applicable' } };
+          if (failure === 'runtime-error') (start as any).runtimeProbeError = 'invalid worker runtime sampler';
           if (failure !== 'missing') this.emit('message', { kind: 'embed_native_inference', id: msg.id, inference: start });
           if (!['missing', 'unfinished'].includes(failure)) this.emit('message', { kind: 'embed_native_inference', id: msg.id, inference: end });
           this.emit('message', { kind: 'embed_ok', id: msg.id, vector: [1] });
@@ -161,6 +166,36 @@ describe('worker input evidence protocol', () => {
 });
 
 describe('real worker submitted tensors', () => {
+  it.each(['valid','invalid'])('retains %s capacity output through the real native-call sampler with a model-free query fixture', async (outcome) => {
+    const dir = mkdtempSync(join(tmpdir(), 'worker-native-capacity-'));
+    const fake = join(dir,'transformers.mjs'), native = join(dir,'native.mjs'), query = join(dir,'nvidia-query.mjs');
+    writeFileSync(join(dir,'tokenizer_config.json'),JSON.stringify({model_max_length:3}));
+    writeFileSync(join(dir,'tokenizer.json'),JSON.stringify({version:'1.0',truncation:null,padding:null,added_tokens:[],normalizer:null,
+      pre_tokenizer:{type:'Whitespace'},post_processor:null,decoder:null,
+      model:{type:'WordLevel',vocab:{'[UNK]':0,fixture:1},unk_token:'[UNK]'}}));
+    writeFileSync(query, '#!/usr/bin/env node\n'
+      + 'if(process.argv[2]!=="--query-gpu=uuid,pci.bus_id,memory.total,memory.used,memory.free" || process.argv[3]!=="--format=csv,noheader,nounits")process.exit(2);\n'
+      + `console.log(${JSON.stringify(outcome==='valid' ? 'GPU-fixture, 00000000:01:00.0, 100, 20, 70' : 'GPU-fixture, 00000000:01:00.0, N/A, 20, 70')});\n`, { mode: 0o700 });
+    writeFileSync(native, 'class Session { run() { return { last_hidden_state: { slice:()=>({normalize:()=>({data:[1,0]})}) } }; } }\nexport const binding={InferenceSession:Session};\n');
+    writeFileSync(fake, `import {binding} from ${JSON.stringify(pathToFileURL(native).href)};\nexport const env={};\nexport class Tensor{constructor(type,data,dims){this.type=type;this.data=data;this.dims=dims;}}\nexport async function pipeline(){const s=new binding.InferenceSession();return {model:async inputs=>s.run(inputs,{},{})};}\n`);
+    const worker = new Worker(new URL('./local-embedder-worker.script.mjs',import.meta.url), { execArgv:[], workerData:{ device:'cuda',
+      transformersSpecifier:pathToFileURL(fake).href, nativeBindingSpecifier:pathToFileURL(native).href, nativeGpuQueryExecutable:query } });
+    const messages:any[]=[];
+    try {
+      const ready=new Promise<void>((resolve,reject)=>{worker.once('error',reject);worker.on('message',m=>{messages.push(m);if(m.kind==='ready')resolve();});});
+      await ready;
+      const finished=new Promise<any>((resolve,reject)=>{worker.once('error',reject);worker.on('message',m=>{if(['embed_ok','embed_err'].includes(m.kind))resolve(m);});});
+      worker.postMessage({kind:'embed',id:0,text:'fixture',model:dir,tokenizerBackend:'rust',pooling:'cls',traceNativeInference:true});
+      expect(await finished).toMatchObject({kind:'embed_ok',vector:[1,0]});
+      const events=messages.filter(m=>m.kind==='embed_native_inference');expect(events.map(m=>m.inference.phase)).toEqual(['start','end']);
+      for(const event of events){
+        const gpu=event.inference.runtime.gpuMemory;
+        if(outcome==='valid')expect(gpu).toMatchObject({status:'measured',scope:'all-nvidia-smi-devices',executable:{path:query,sha256:expect.stringMatching(/^[a-f0-9]{64}$/)},
+          devices:[{uuid:'GPU-fixture',pciBusId:'00000000:01:00.0',totalMiB:100,usedMiB:20,freeMiB:70}]});
+        else expect(gpu).toMatchObject({status:'unknown',error:expect.stringContaining('invalid GPU capacity values')});
+      }
+    } finally {await worker.terminate();rmSync(dir,{recursive:true,force:true});}
+  });
   it('traces the actual ORT native receiver and queued calls in an isolated CPU process', () => {
     const dir = mkdtempSync(join(tmpdir(), 'worker-native-run-'));
     const fake = join(dir, 'cpu-native-transformers.mjs');

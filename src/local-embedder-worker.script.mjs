@@ -82,7 +82,7 @@ function sampleNativeRuntime(device) {
   if (device === 'cuda') {
     const queryBeforeNs = process.hrtime.bigint().toString();
     try {
-      const executable = realpathSync('/usr/bin/nvidia-smi');
+      const executable = realpathSync(workerData?.nativeGpuQueryExecutable ?? '/usr/bin/nvidia-smi');
       const result = spawnSync(executable, ['--query-gpu=uuid,pci.bus_id,memory.total,memory.used,memory.free', '--format=csv,noheader,nounits'],
         { encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
       if (result.status !== 0) throw new Error(result.error?.message ?? result.stderr ?? String(result.signal));
