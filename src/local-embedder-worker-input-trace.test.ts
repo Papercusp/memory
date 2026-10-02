@@ -175,12 +175,13 @@ describe('real worker submitted tensors', () => {
       model:{type:'WordLevel',vocab:{'[UNK]':0,fixture:1},unk_token:'[UNK]'}}));
     writeFileSync(query, '#!/usr/bin/env node\n'
       + 'if(process.argv[2]!=="--query-gpu=uuid,pci.bus_id,memory.total,memory.used,memory.free" || process.argv[3]!=="--format=csv,noheader,nounits")process.exit(2);\n'
+      + 'if(process.env.LD_DEBUG!==undefined || process.env.LD_DEBUG_OUTPUT!==undefined)process.exit(3);\n'
       + `console.log(${JSON.stringify(outcome==='valid' ? 'GPU-fixture, 00000000:01:00.0, 100, 20, 70' : 'GPU-fixture, 00000000:01:00.0, N/A, 20, 70')});\n`, { mode: 0o700 });
     writeFileSync(native, 'class Session { run() { return { last_hidden_state: { slice:()=>({normalize:()=>({data:[1,0]})}) } }; } }\nexport const binding={InferenceSession:Session};\n');
     writeFileSync(fake, `import {binding} from ${JSON.stringify(pathToFileURL(native).href)};\nexport const env={};\nexport class Tensor{constructor(type,data,dims){this.type=type;this.data=data;this.dims=dims;}}\nexport async function pipeline(){const s=new binding.InferenceSession();return {model:async inputs=>s.run(inputs,{},{})};}\n`);
     const worker = new Worker(new URL('./local-embedder-worker.script.mjs',import.meta.url), { execArgv:[], workerData:{ device:'cuda',
       transformersSpecifier:pathToFileURL(fake).href, nativeBindingSpecifier:pathToFileURL(native).href, nativeGpuQueryExecutable:query },
-      ...(outcome==='separate-loader-output' ? {env:{...process.env,LD_DEBUG:'files',LD_DEBUG_OUTPUT:join(dir,'loader')}} : {}) });
+      env:{...process.env,LD_DEBUG:'files',...(outcome==='separate-loader-output' ? {LD_DEBUG_OUTPUT:join(dir,'loader')} : {})} });
     const messages:any[]=[];
     try {
       const ready=new Promise<void>((resolve,reject)=>{worker.once('error',reject);worker.on('message',m=>{messages.push(m);if(m.kind==='ready')resolve();});});
@@ -244,7 +245,13 @@ try {
 } finally {await worker.terminate();}
 `;
     try {
-      const env: NodeJS.ProcessEnv={...process.env,LD_DEBUG:'files'}; delete env.LD_DEBUG_OUTPUT;
+      // Loader file/library/version diagnostics exceed the clock child's
+      // 4KiB stderr budget unless the
+      // target-only loader diagnostics are scrubbed from observation children.
+      const control=spawnSync('/usr/bin/python3',['-I','-S','-c','import json,time,sys; print(json.dumps([str(time.clock_gettime_ns(time.CLOCK_MONOTONIC)),sys.version.split()[0]]))'],{
+        env:{...process.env,LD_DEBUG:'files,libs,versions'},encoding:'utf8',timeout:10000,maxBuffer:4096});
+      expect((control.error as NodeJS.ErrnoException | undefined)?.code).toBe('ENOBUFS');
+      const env: NodeJS.ProcessEnv={...process.env,LD_DEBUG:'files,libs,versions'}; delete env.LD_DEBUG_OUTPUT;
       const parent=join(dir,'native-fixture-parent.mjs');writeFileSync(parent,program);
       const child = spawnSync(process.execPath, [parent], { env, encoding: 'utf8', timeout: 20000, maxBuffer: 4*1024*1024 });
       expect(child.status, child.stderr).toBe(0);

@@ -33,6 +33,16 @@ let nativeInferenceTracePreparation;
 let nativeClockExecutable;
 const nativeFileFingerprints = new Map();
 
+/** Loader diagnostics describe the model process. Clock/capacity children
+ * return bounded machine-readable observations; inherited loader stderr can
+ * overflow their buffers under profiler injection before they return data. */
+function nativeObservationChildEnv() {
+  const env = { ...process.env };
+  delete env.LD_DEBUG;
+  delete env.LD_DEBUG_OUTPUT;
+  return env;
+}
+
 /** Use glibc's maintained loader log, on the same stderr descriptor as these
  * synchronous markers. A separate LD_DEBUG_OUTPUT loses the ordering relation.
  * Ordinary calls and diagnostic calls without LD_DEBUG=files remain silent. */
@@ -165,7 +175,7 @@ function sampleNativeRuntime(device) {
     try {
       const executable = realpathSync(workerData?.nativeGpuQueryExecutable ?? '/usr/bin/nvidia-smi');
       const result = spawnSync(executable, ['--query-gpu=uuid,pci.bus_id,memory.total,memory.used,memory.free', '--format=csv,noheader,nounits'],
-        { encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
+        { env: nativeObservationChildEnv(), encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
       if (result.status !== 0) throw new Error(result.error?.message ?? result.stderr ?? String(result.signal));
       const devices = result.stdout.trim().split('\n').map(line => {
         const columns = line.split(',').map(x=>x.trim());
@@ -200,7 +210,7 @@ function sampleNativeRawClock() {
   const nodeBeforeNs = process.hrtime.bigint().toString();
   const result = spawnSync(nativeClockExecutable.path, ['-I', '-S', '-c',
     'import json,time,sys; before=time.clock_gettime_ns(time.CLOCK_MONOTONIC); raw=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW); after=time.clock_gettime_ns(time.CLOCK_MONOTONIC); print(json.dumps([str(before),str(raw),str(after),sys.version.split()[0]]))'],
-    { encoding: 'utf8', timeout: 10000, maxBuffer: 4096 });
+    { env: nativeObservationChildEnv(), encoding: 'utf8', timeout: 10000, maxBuffer: 4096 });
   const nodeAfterNs = process.hrtime.bigint().toString();
   if (result.status !== 0) throw new Error(`native RAW clock probe failed: ${result.error?.message ?? result.stderr ?? result.signal}`);
   const [monotonicBeforeNs, rawNs, monotonicAfterNs, pythonVersion] = JSON.parse(result.stdout);
