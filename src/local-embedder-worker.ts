@@ -73,7 +73,10 @@ export interface WorkerNativeInferenceTrace extends WorkerInferenceTrace {
 
 export interface WorkerNativeRuntimeSample {
   platform: 'linux'; clock: 'node-hrtime'; beforeNs: string; afterNs: string;
-  libraries: { path: string; bytes: number; sha256: string; mappedDevice: string; mappedInode: string }[];
+  libraries: { path: string; bytes: number; sha256: string; mappedDevice: string; mappedInode: string;
+    /** All segments of the selected file, including non-executable ELF headers.
+     * Older saved observations lack these and cannot qualify address joins. */
+    mappedRanges?: { startAddress: string; endAddress: string; fileOffset: string; permissions: string }[] }[];
   gpuMemory: { status: 'not-applicable' } | { status: 'unknown'; beforeNs: string; afterNs: string; error: string }
     | { status: 'measured'; scope: 'all-nvidia-smi-devices'; beforeNs: string; afterNs: string;
       executable: { path: string; bytes: number; sha256: string }; cudaVisibleDevices: string | null;
@@ -95,6 +98,19 @@ export function validNativeRuntimeSample(event: WorkerNativeInferenceTrace): boo
       || !/^[\da-f]+:[\da-f]+$/i.test(f.mappedDevice) || !/^[1-9]\d*$/.test(f.mappedInode))
     || new Set(sample.libraries.map(f=>f.path)).size !== sample.libraries.length
     ) return false;
+  for (const file of sample.libraries) {
+    if (file.mappedRanges === undefined) continue;
+    if (!Array.isArray(file.mappedRanges) || !file.mappedRanges.length) return false;
+    let previousEnd = 0n;
+    for (const range of file.mappedRanges) {
+      if (!range || ![range.startAddress, range.endAddress, range.fileOffset].every(value =>
+        typeof value === 'string' && /^[\da-f]+$/i.test(value))
+        || typeof range.permissions !== 'string' || !/^[r-][w-][x-][ps]$/.test(range.permissions)) return false;
+      const start = BigInt('0x'+range.startAddress), end = BigInt('0x'+range.endAddress);
+      if (start < previousEnd || start >= end) return false;
+      previousEnd = end;
+    }
+  }
   const gpu = sample.gpuMemory;
   if (event.device === 'cpu') return gpu?.status === 'not-applicable';
   if (!gpu || !['measured','unknown'].includes(gpu.status) || gpu.status === 'not-applicable'

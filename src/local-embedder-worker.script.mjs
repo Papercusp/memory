@@ -79,16 +79,21 @@ function sampleNativeRuntime(device) {
   if (process.platform !== 'linux') return undefined;
   const beforeNs = process.hrtime.bigint().toString(), files = new Map();
   for (const line of readFileSync('/proc/self/maps', 'utf8').trim().split('\n')) {
-    const row = line.match(/^[\da-f]+-[\da-f]+\s+(\S+)\s+[\da-f]+\s+([\da-f]+:[\da-f]+)\s+(\d+)\s*(.*)$/i);
+    const row = line.match(/^([\da-f]+)-([\da-f]+)\s+(\S+)\s+([\da-f]+)\s+([\da-f]+:[\da-f]+)\s+(\d+)\s*(.*)$/i);
     if (!row) throw new Error('native library maps row malformed');
-    const [, permissions, mappedDevice, mappedInode, file] = row;
-    if (!file.startsWith('/') || (!permissions.includes('x') && !/\.so(?:\.|$)|\.node(?:$| )/.test(file))) continue;
+    const [, startAddress, endAddress, permissions, fileOffset, mappedDevice, mappedInode, file] = row;
+    if (!file.startsWith('/')) continue;
     if (file.endsWith(' (deleted)')) throw new Error('native library mapping is deleted: '+file);
     const prior = files.get(file);
     if (prior && (prior.mappedDevice !== mappedDevice || prior.mappedInode !== mappedInode)) throw new Error('ambiguous native library mapping: '+file);
-    files.set(file, { ...nativeFileFingerprint(file, mappedDevice, mappedInode), mappedDevice, mappedInode });
+    const observation = prior ?? { path: file, mappedDevice, mappedInode, mappedRanges: [], eligible: false };
+    observation.eligible ||= permissions.includes('x') || /\.so(?:\.|$)|\.node$/.test(file);
+    observation.mappedRanges.push({ startAddress, endAddress, fileOffset, permissions });
+    files.set(file, observation);
   }
-  if (!files.size) throw new Error('native library mapping population missing');
+  const libraries = [...files.values()].filter(file=>file.eligible).map(({ eligible, ...file }) =>
+    ({ ...file, ...nativeFileFingerprint(file.path, file.mappedDevice, file.mappedInode) }));
+  if (!libraries.length) throw new Error('native library mapping population missing');
   let gpuMemory = { status: 'not-applicable' };
   if (device === 'cuda') {
     const queryBeforeNs = process.hrtime.bigint().toString();
@@ -115,7 +120,7 @@ function sampleNativeRuntime(device) {
       afterNs: process.hrtime.bigint().toString(), error: String(error) }; }
   }
   return { platform: 'linux', clock: 'node-hrtime', beforeNs, afterNs: process.hrtime.bigint().toString(),
-    libraries: [...files.values()].sort((a,b)=>a.path.localeCompare(b.path)), gpuMemory };
+    libraries: libraries.sort((a,b)=>a.path.localeCompare(b.path)), gpuMemory };
 }
 
 /** Reuse Python's standard Linux clock_gettime bindings rather than adding an

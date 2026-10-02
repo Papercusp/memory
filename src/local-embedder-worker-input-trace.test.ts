@@ -271,8 +271,17 @@ try {
             expect(runtime).toMatchObject({ platform: 'linux', clock: 'node-hrtime', gpuMemory: { status: 'not-applicable' } });
             expect(runtime.libraries.length).toBeGreaterThan(0);
             expect(runtime.libraries.some((f: any)=>f.path.endsWith('.node'))).toBe(true);
-            for (const file of runtime.libraries) expect(file).toMatchObject({ path: expect.stringMatching(/^\//),
-              bytes: expect.any(Number), sha256: expect.stringMatching(/^[a-f0-9]{64}$/), mappedInode: expect.stringMatching(/^[1-9]\d*$/) });
+            for (const file of runtime.libraries) {
+              expect(file).toMatchObject({ path: expect.stringMatching(/^\//),
+                bytes: expect.any(Number), sha256: expect.stringMatching(/^[a-f0-9]{64}$/), mappedInode: expect.stringMatching(/^[1-9]\d*$/) });
+              expect(file.mappedRanges.length).toBeGreaterThan(0);
+              for (const range of file.mappedRanges) {
+                expect(BigInt('0x'+range.startAddress)).toBeLessThan(BigInt('0x'+range.endAddress));
+                expect(range.permissions).toMatch(/^[r-][w-][x-][ps]$/);
+              }
+            }
+            expect(runtime.libraries.find((file:any)=>file.path === process.execPath)?.mappedRanges
+              .some((range:any)=>!range.permissions.includes('x'))).toBe(true);
             if (event.inference.phase === 'start') expect(BigInt(runtime.afterNs)).toBeLessThanOrEqual(BigInt(event.inference.monotonicNs));
             else expect(BigInt(runtime.beforeNs)).toBeGreaterThanOrEqual(BigInt(event.inference.monotonicNs));
           }
