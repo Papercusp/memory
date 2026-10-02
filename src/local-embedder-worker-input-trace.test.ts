@@ -216,6 +216,17 @@ try {
         expect(events[0].inference.runIndex).toBe(1);
         expect(events[0].inference.runTag).toContain(`:${id}:1:1`);
         expect(BigInt(events[1].inference.monotonicNs)).toBeGreaterThan(BigInt(events[0].inference.monotonicNs));
+        if (process.platform === 'linux') {
+          for (const event of events) {
+            const clock = event.inference.rawClock;
+            expect(clock).toMatchObject({ clock: 'linux-clock-monotonic-raw',
+              executable: { path: expect.stringContaining('python3'), sha256: expect.stringMatching(/^[a-f0-9]{64}$/) },
+              pythonVersion: expect.any(String) });
+            expect(BigInt(clock.monotonicBeforeNs)).toBeGreaterThanOrEqual(BigInt(clock.nodeBeforeNs));
+            expect(BigInt(clock.monotonicAfterNs)).toBeLessThanOrEqual(BigInt(clock.nodeAfterNs));
+          }
+          expect(BigInt(events[1].inference.rawClock.rawNs)).toBeGreaterThan(BigInt(events[0].inference.rawClock.rawNs));
+        }
       }
       expect(observed.native).toHaveLength(6);
       for (let i = 2; i < observed.native.length; i += 2) {
