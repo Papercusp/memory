@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { bindNativeLoaderClosure } from '../../../../packages/operator-core/lib/memory/bench/measurement-manifest';
 import { embedViaWorker, getWorkerState, shutdownLocalEmbedder, _resetBeforeExitHookForTest,
   type WorkerInputTrace, type WorkerInferenceTrace } from './local-embedder-worker';
 
@@ -245,7 +247,8 @@ try {
 `;
     try {
       const env: NodeJS.ProcessEnv={...process.env,LD_DEBUG:'files'}; delete env.LD_DEBUG_OUTPUT;
-      const child = spawnSync(process.execPath, ['--input-type=module'], { input: program, env, encoding: 'utf8', timeout: 20000, maxBuffer: 4*1024*1024 });
+      const parent=join(dir,'native-fixture-parent.mjs');writeFileSync(parent,program);
+      const child = spawnSync(process.execPath, [parent], { env, encoding: 'utf8', timeout: 20000, maxBuffer: 4*1024*1024 });
       expect(child.status, child.stderr).toBe(0);
       const observed = JSON.parse(child.stdout.trim());
       expect(observed.results.find((r: any) => r.id === 1)).toMatchObject({ kind: 'embed_ok', vector: [1,0] });
@@ -303,6 +306,17 @@ try {
         .map(line=>JSON.parse(line.slice('PC_NATIVE_RUN\t'.length)));
       expect(markers).toEqual(observed.native.map((event:any)=>({runTag:event.inference.runTag,phase:event.inference.phase,
         monotonicNs:event.inference.monotonicNs,processId:event.inference.processId,nativeThreadId:event.inference.nativeThreadId})));
+      const starts=observed.native.filter((event:any)=>event.inference.phase==='start').map((event:any)=>event.inference);
+      const windows=starts.map((start:any)=>({runTag:start.runTag,processId:start.processId,nativeThreadId:start.nativeThreadId,
+        startMonotonicNs:start.monotonicNs,endMonotonicNs:observed.native.find((event:any)=>
+          event.inference.runTag===start.runTag && event.inference.phase==='end').inference.monotonicNs}));
+      const stderr=Buffer.from(child.stderr),closure=bindNativeLoaderClosure(stderr,windows,starts[0],{
+        source:'spawn-pipe',captureStartedBeforeExec:true,eof:true,processId:starts[0].processId,exitCode:child.status!,
+        signal:child.signal,bytes:stderr.length,sha256:createHash('sha256').update(stderr).digest('hex')});
+      expect(closure.completeBeforeInferenceClosureVerified).toBe(true);
+      expect(closure.unjoinedMappedFiles).toEqual([]);
+      expect(closure.runTag).toBe(starts[0].runTag);
+      expect(closure.objectMapJoins.some(join=>join.file.path.endsWith('.node'))).toBe(true);
       for (let i = 2; i < observed.native.length; i += 2) {
         expect(BigInt(observed.native[i].inference.monotonicNs)).toBeGreaterThan(BigInt(observed.native[i-1].inference.monotonicNs));
       }
