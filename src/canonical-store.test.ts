@@ -14,8 +14,10 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import {
+  CANONICAL_STORE_IDLE_TIMEOUT_MS,
   CanonicalVectorStore,
   LEXICAL_QUERY_CONCURRENCY,
+  canonicalStorePoolOptions,
   isLowQualityCompoundEntity,
   lexicalTokens,
   splitTemporalControls,
@@ -1042,5 +1044,42 @@ describe('CanonicalVectorStore HNSW iterative scan', () => {
     await expect(store.search(VEC, 12, { user_id: 'harness:papercusp' })).rejects.toThrow('boom');
     expect(seen.some((s) => /^ROLLBACK/i.test(s))).toBe(true);
     expect(released).toBe(true);
+  });
+});
+
+// WI-10005234: node-postgres's 10 s idle default made this store reconnect ~22x/min,
+// and with no application_name the churn could not be attributed to anyone.
+describe('CanonicalVectorStore pool options (WI-10005234)', () => {
+  const base: CanonicalStoreConfig = {
+    host: 'localhost', port: 5432, user: 'u', password: 'p', dbname: 'db',
+    schema: 'harness_shared', vecTable: 'memory_vec_local',
+    embeddingModelDims: EMBEDDER_DIM_SPECS.local.targetDims,
+    embeddingProfile: EMBEDDER_DIM_SPECS.local,
+    storageProfile: MEMORY_VECTOR_STORAGE_PROFILES.local,
+  };
+
+  it('defaults to a long idle timeout and a named, per-process application_name', () => {
+    const o = canonicalStorePoolOptions(base);
+    expect(CANONICAL_STORE_IDLE_TIMEOUT_MS).toBeGreaterThanOrEqual(60_000);
+    expect(o.idleTimeoutMillis).toBe(CANONICAL_STORE_IDLE_TIMEOUT_MS);
+    expect(o.application_name).toBe(`memory-canonical-store:p${process.pid}`);
+    expect(o).toMatchObject({ host: 'localhost', port: 5432, user: 'u', database: 'db', max: 5 });
+  });
+
+  it('honours host overrides', () => {
+    const o = canonicalStorePoolOptions({ ...base, applicationName: 'host:mem:p1', idleTimeoutMs: 30_000 });
+    expect(o.application_name).toBe('host:mem:p1');
+    expect(o.idleTimeoutMillis).toBe(30_000);
+  });
+
+  it('the lazily-built pg Pool actually carries those options', async () => {
+    const store = new CanonicalVectorStore(base);
+    const pool = await (store as unknown as { getClient(): Promise<{ options: Record<string, unknown>; end(): Promise<void> }> }).getClient();
+    try {
+      expect(pool.options.idleTimeoutMillis).toBe(CANONICAL_STORE_IDLE_TIMEOUT_MS);
+      expect(pool.options.application_name).toBe(`memory-canonical-store:p${process.pid}`);
+    } finally {
+      await pool.end();
+    }
   });
 });

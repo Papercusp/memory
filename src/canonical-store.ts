@@ -88,6 +88,34 @@ export interface CanonicalStoreConfig {
   embeddingProfile: EmbedderProfileSpec;
   /** Independently declared physical table/index contract. */
   storageProfile: MemoryVectorStorageProfile;
+  /** Postgres `application_name` for this store's pool, so its connections are
+   *  attributable in pg_stat_activity. Default: `memory-canonical-store:p<pid>`. */
+  applicationName?: string;
+  /** How long an idle pooled connection is kept open. Default {@link CANONICAL_STORE_IDLE_TIMEOUT_MS}. */
+  idleTimeoutMs?: number;
+}
+
+/**
+ * node-postgres closes an idle pooled connection after 10 s by default. This store is
+ * queried every few seconds, so that default made it reconnect ~22 times a minute
+ * (a PG backend fork + auth each time) with no application_name to say who it was
+ * (WI-10005234). Two minutes keeps the pool warm between bursts and still lets an
+ * idle process release its connections.
+ */
+export const CANONICAL_STORE_IDLE_TIMEOUT_MS = 120_000;
+
+/** The pool options a store opens with — exported so the defaults are testable. */
+export function canonicalStorePoolOptions(cfg: CanonicalStoreConfig) {
+  return {
+    host: cfg.host,
+    port: cfg.port,
+    user: cfg.user,
+    password: cfg.password,
+    database: cfg.dbname,
+    max: 5,
+    idleTimeoutMillis: cfg.idleTimeoutMs ?? CANONICAL_STORE_IDLE_TIMEOUT_MS,
+    application_name: cfg.applicationName ?? `memory-canonical-store:p${process.pid}`,
+  };
 }
 
 function safeKey(k: string): string {
@@ -522,14 +550,7 @@ export class CanonicalVectorStore {
 
   private async getClient(): Promise<PgPool> {
     if (!this.pool) {
-      this.pool = new PgPool({
-        host: this.cfg.host,
-        port: this.cfg.port,
-        user: this.cfg.user,
-        password: this.cfg.password,
-        database: this.cfg.dbname,
-        max: 5,
-      });
+      this.pool = new PgPool(canonicalStorePoolOptions(this.cfg));
       // Don't let a dropped idle connection crash the process — the pool
       // replaces it on the next query.
       this.pool.on('error', () => {});
