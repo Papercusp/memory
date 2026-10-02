@@ -237,7 +237,8 @@ try {
 } finally {await worker.terminate();}
 `;
     try {
-      const child = spawnSync(process.execPath, ['--input-type=module'], { input: program, encoding: 'utf8', timeout: 20000 });
+      const env={...process.env,LD_DEBUG:'files'}; delete env.LD_DEBUG_OUTPUT;
+      const child = spawnSync(process.execPath, ['--input-type=module'], { input: program, env, encoding: 'utf8', timeout: 20000, maxBuffer: 4*1024*1024 });
       expect(child.status, child.stderr).toBe(0);
       const observed = JSON.parse(child.stdout.trim());
       expect(observed.results.find((r: any) => r.id === 1)).toMatchObject({ kind: 'embed_ok', vector: [1,0] });
@@ -272,6 +273,10 @@ try {
         }
       }
       expect(observed.native).toHaveLength(6);
+      const markers = child.stderr.split('\n').filter(line=>line.startsWith('PC_NATIVE_RUN\t'))
+        .map(line=>JSON.parse(line.slice('PC_NATIVE_RUN\t'.length)));
+      expect(markers).toEqual(observed.native.map((event:any)=>({runTag:event.inference.runTag,phase:event.inference.phase,
+        monotonicNs:event.inference.monotonicNs,processId:event.inference.processId,nativeThreadId:event.inference.nativeThreadId})));
       for (let i = 2; i < observed.native.length; i += 2) {
         expect(BigInt(observed.native[i].inference.monotonicNs)).toBeGreaterThan(BigInt(observed.native[i-1].inference.monotonicNs));
       }

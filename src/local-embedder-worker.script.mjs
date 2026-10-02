@@ -17,7 +17,7 @@
  */
 
 import { parentPort, workerData, threadId } from 'node:worker_threads';
-import { readFileSync, readlinkSync, realpathSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
+import { readFileSync, readlinkSync, realpathSync, openSync, readSync, writeSync, closeSync, fstatSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { availableParallelism } from 'node:os';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -32,6 +32,17 @@ let nativeInferenceTracePrepared = false;
 let nativeInferenceTracePreparation;
 let nativeClockExecutable;
 const nativeFileFingerprints = new Map();
+
+/** Use glibc's maintained loader log, on the same stderr descriptor as these
+ * synchronous markers. A separate LD_DEBUG_OUTPUT loses the ordering relation.
+ * Ordinary calls and diagnostic calls without LD_DEBUG=files remain silent. */
+function markNativeLoaderRun(context, runTag, phase, monotonicNs) {
+  if (!process.env.LD_DEBUG?.split(/[:,\s]+/).some(x => x === 'files' || x === 'all')) return;
+  if (process.env.LD_DEBUG_OUTPUT !== undefined) throw new Error('native loader evidence requires shared stderr; unset LD_DEBUG_OUTPUT');
+  const record = Buffer.from('PC_NATIVE_RUN\t'+JSON.stringify({ runTag, phase, monotonicNs,
+    processId: context.request.processId, nativeThreadId: context.request.nativeThreadId })+'\n');
+  if (writeSync(2, record) !== record.length) throw new Error('native loader marker was not completely written');
+}
 
 /** Stream mapped ELF/addon bytes without a second model-sized buffer. Check
  * the mapped inode/device, so replacing an on-disk library cannot silently
@@ -159,13 +170,16 @@ async function prepareNativeInferenceTrace() {
           ...(runtime ? { runtime } : {}), ...(runtimeProbeError ? { runtimeProbeError } : {}),
           ...(outcome ? { outcome } : {}) } });
       const beforeRuntime = sampleNativeRuntime(context.device), beforeClock = sampleNativeRawClock();
-      emit('start', undefined, process.hrtime.bigint().toString(), new Date().toISOString(), beforeClock, undefined, beforeRuntime);
+      const startNs = process.hrtime.bigint().toString();
+      markNativeLoaderRun(context, runTag, 'start', startNs);
+      emit('start', undefined, startNs, new Date().toISOString(), beforeClock, undefined, beforeRuntime);
       let result, nativeError;
       try {
         result = Reflect.apply(originalRun, this, [feeds, fetches, { ...options, tag: runTag }]);
         if (result && typeof result.then === 'function') throw new Error('native inference evidence requires a synchronous native Run');
       } catch (error) { nativeError = error; }
       const endNs = process.hrtime.bigint().toString(), endedAt = new Date().toISOString();
+      markNativeLoaderRun(context, runTag, 'end', endNs);
       let afterClock, clockProbeError, afterRuntime, runtimeProbeError;
       try { afterClock = sampleNativeRawClock(); } catch (error) { clockProbeError = String(error); }
       try { afterRuntime = sampleNativeRuntime(context.device); } catch (error) { runtimeProbeError = String(error); }
