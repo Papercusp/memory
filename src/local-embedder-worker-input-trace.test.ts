@@ -4,12 +4,42 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { embedViaWorker, getWorkerState, shutdownLocalEmbedder, _resetBeforeExitHookForTest,
   type WorkerInputTrace } from './local-embedder-worker';
 
 const trace: WorkerInputTrace = { model: '/private/model', device: 'cpu', observedAt: '2026-10-02T00:00:00.000Z',
   inputShape: [1, 2], inputIds: [1, 2], attentionMask: [1, 1] };
 afterEach(async () => { vi.restoreAllMocks(); await shutdownLocalEmbedder(); _resetBeforeExitHookForTest(); });
+
+describe('file worker boot from a stdin parent', () => {
+  it.each([['--input-type=module'], ['--input-type', 'module']])('does not inherit stdin-only flags %j', (...inputArgs) => {
+    const moduleUrl = new URL('./local-embedder-worker.ts', import.meta.url).href;
+    const scriptUrl = new URL('./local-embedder-worker.script.mjs', import.meta.url).href;
+    const program = `
+import { Worker } from 'node:worker_threads';
+const control = new Worker(new URL(${JSON.stringify(scriptUrl)}), { workerData: { device: 'cpu' } });
+const controlCode = await new Promise(resolve => control.once('error', error => resolve(error.code)));
+await control.terminate();
+if (controlCode !== 'ERR_INPUT_TYPE_NOT_ALLOWED') throw new Error('stdin flag control did not distinguish file-worker boot');
+const imported = await import(${JSON.stringify(moduleUrl)}), bridge = imported.default ?? imported;
+Worker.prototype.postMessage = function (msg) {
+  setImmediate(() => this.emit('message', { kind: 'embed_ok', id: msg.id, vector: [1, 0] }));
+};
+try {
+  const vector = await bridge.embedViaWorker('worker boot only; no model request is forwarded');
+  if (!bridge.getWorkerState().alive) throw new Error('shipped file worker did not become ready');
+  console.log(JSON.stringify({ controlCode, vector, ready: true, modelRequestForwarded: false }));
+} finally { await bridge.shutdownLocalEmbedder(); bridge._resetBeforeExitHookForTest(); }
+`;
+    const child = spawnSync(process.execPath, ['--import', import.meta.resolve('tsx/esm'), ...inputArgs], {
+      input: program, encoding: 'utf8', timeout: 20000,
+      env: { ...process.env, PAPERCUSP_EMBED_DEVICE: 'cpu', PAPERCUSP_FORBID_REAL_PG: '1' },
+    });
+    expect(child.status, child.stderr).toBe(0);
+    expect(JSON.parse(child.stdout.trim())).toEqual({ controlCode: 'ERR_INPUT_TYPE_NOT_ALLOWED', vector: [1, 0], ready: true, modelRequestForwarded: false });
+  });
+});
 
 describe('worker input evidence protocol', () => {
   it('delivers evidence without settling or draining the in-flight vector request', async () => {

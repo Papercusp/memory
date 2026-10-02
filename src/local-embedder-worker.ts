@@ -427,8 +427,9 @@ function ensureWorker(): Promise<void> {
       // before it can ever exit holding the last reference to it).
       pinOnnxRuntimeBinding(scriptPath);
       state.worker = new Worker(scriptPath, {
-        // execArgv passthrough is fine — the script is plain JS,
-        // no ts-node loader needed.
+        // The plain JS file needs no parent loader or entry-point flags.
+        // A stdin parent's --input-type is invalid for this file worker.
+        execArgv: [],
         //
         // The DEVICE is decided here, not in the worker (which is copied into
         // bundles as one file and cannot import embed-device.ts). A respawn
