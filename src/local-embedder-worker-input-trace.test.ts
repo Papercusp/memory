@@ -100,7 +100,7 @@ describe('worker input evidence protocol', () => {
             clock: 'node-hrtime', monotonicNs: '100', phase: 'start' };
           const end: WorkerInferenceTrace = { ...start, monotonicNs: '200', phase: 'end', outcome: 'success' };
           if (failure === 'request') start.requestId++;
-          if (failure === 'thread') end.nativeThreadId++;
+          if (failure === 'thread') end.nativeThreadId = 457;
           if (failure === 'clock') start.monotonicNs = 'unknown';
           if (failure === 'reverse') end.monotonicNs = '99';
           if (!['missing', 'end-only'].includes(failure)) this.emit('message', { kind: 'embed_inference', id: msg.id, inference: start });

@@ -59,10 +59,10 @@ describe('pinned mDenseOn worker contract', () => {
     expect(worker.embed).toHaveBeenCalledOnce();
   });
   it('passes explicit input-evidence collection through the pinned worker route', async () => {
-    const model = artifact(), onInputTrace = vi.fn();
+    const model = artifact(), onInputTrace = vi.fn(), onInferenceTrace = vi.fn();
     worker.embed.mockResolvedValue(new Array(768).fill(1 / Math.sqrt(768)));
-    await buildMdenseOnEmbedder({ model, kind: 'query', onInputTrace })('q');
+    await buildMdenseOnEmbedder({ model, kind: 'query', onInputTrace, onInferenceTrace })('q');
     expect(worker.embed).toHaveBeenCalledWith('query: q', { model, pooling: 'cls', normalize: true,
-      tokenizerBackend: 'rust', onInputTrace });
+      tokenizerBackend: 'rust', onInputTrace, onInferenceTrace });
   });
 });

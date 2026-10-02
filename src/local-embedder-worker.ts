@@ -60,7 +60,8 @@ export interface WorkerInferenceTrace extends WorkerRequestIdentity {
 }
 
 function validRequestIdentity(value: WorkerRequestIdentity, id: number): boolean {
-  return value.requestId === id && [value.requestId, value.attempt, value.processId, value.workerThreadId]
+  return value.requestId === id && Number.isSafeInteger(value.requestId) && value.requestId >= 0
+    && [value.attempt, value.processId, value.workerThreadId]
     .every((n) => Number.isSafeInteger(n) && n > 0)
     && (value.nativeThreadId === null || (Number.isSafeInteger(value.nativeThreadId) && value.nativeThreadId > 0));
 }
@@ -507,18 +508,20 @@ function ensureWorker(): Promise<void> {
             const trace = msg.inference;
             if (!trace || !validRequestIdentity(trace, msg.id) || !['cpu', 'cuda'].includes(trace.device)
               || typeof trace.model !== 'string' || !Number.isFinite(Date.parse(trace.observedAt))
-              || trace.clock !== 'node-hrtime' || !/^[1-9]\d*$/.test(trace.monotonicNs)) throw new Error('invalid worker inference trace');
+              || trace.clock !== 'node-hrtime' || typeof trace.monotonicNs !== 'string'
+              || !/^[1-9]\d*$/.test(trace.monotonicNs)) throw new Error('invalid worker inference trace');
             const prior = p.inferenceTraces?.at(-1);
             if (trace.phase === 'start') {
               if (trace.outcome !== undefined || trace.attempt !== (prior?.attempt ?? 0) + 1
-                || (prior && (prior.phase !== 'end' || prior.outcome !== 'error'))) throw new Error('invalid worker inference trace order');
+                || (prior && (prior.phase !== 'end' || prior.outcome !== 'error'
+                  || BigInt(trace.monotonicNs) < BigInt(prior.monotonicNs)))) throw new Error('invalid worker inference trace order');
             } else if (trace.phase !== 'end' || !['success', 'error'].includes(trace.outcome ?? '') || !prior
               || prior.phase !== 'start' || ['requestId', 'attempt', 'processId', 'workerThreadId', 'nativeThreadId', 'model', 'device']
                 .some((key) => trace[key as keyof WorkerInferenceTrace] !== prior[key as keyof WorkerInferenceTrace])
               || BigInt(trace.monotonicNs) < BigInt(prior.monotonicNs)) throw new Error('invalid worker inference trace order');
-            p.onInferenceTrace(trace);
             (p.inferenceTraces ??= []).push(trace);
-          } catch (error) { p.inputTraceError = error instanceof Error ? error : new Error(String(error)); }
+            p.onInferenceTrace(trace);
+          } catch (error) { p.inputTraceError ??= error instanceof Error ? error : new Error(String(error)); }
         }
         return;
       }
@@ -535,7 +538,7 @@ function ensureWorker(): Promise<void> {
               || trace.attentionMask.some((n) => n !== 0 && n !== 1)) throw new Error('invalid worker input trace');
             p.onInputTrace(trace);
             p.inputTraceCount = (p.inputTraceCount ?? 0) + 1;
-          } catch (error) { p.inputTraceError = error instanceof Error ? error : new Error(String(error)); }
+          } catch (error) { p.inputTraceError ??= error instanceof Error ? error : new Error(String(error)); }
         }
         return;
       }
