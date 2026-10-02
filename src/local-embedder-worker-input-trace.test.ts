@@ -166,7 +166,7 @@ describe('worker input evidence protocol', () => {
 });
 
 describe('real worker submitted tensors', () => {
-  it.each(['valid','invalid'])('retains %s capacity output through the real native-call sampler with a model-free query fixture', async (outcome) => {
+  it.each(['valid','invalid','separate-loader-output'])('retains %s capacity output through the real native-call sampler with a model-free query fixture', async (outcome) => {
     const dir = mkdtempSync(join(tmpdir(), 'worker-native-capacity-'));
     const fake = join(dir,'transformers.mjs'), native = join(dir,'native.mjs'), query = join(dir,'nvidia-query.mjs');
     writeFileSync(join(dir,'tokenizer_config.json'),JSON.stringify({model_max_length:3}));
@@ -179,14 +179,21 @@ describe('real worker submitted tensors', () => {
     writeFileSync(native, 'class Session { run() { return { last_hidden_state: { slice:()=>({normalize:()=>({data:[1,0]})}) } }; } }\nexport const binding={InferenceSession:Session};\n');
     writeFileSync(fake, `import {binding} from ${JSON.stringify(pathToFileURL(native).href)};\nexport const env={};\nexport class Tensor{constructor(type,data,dims){this.type=type;this.data=data;this.dims=dims;}}\nexport async function pipeline(){const s=new binding.InferenceSession();return {model:async inputs=>s.run(inputs,{},{})};}\n`);
     const worker = new Worker(new URL('./local-embedder-worker.script.mjs',import.meta.url), { execArgv:[], workerData:{ device:'cuda',
-      transformersSpecifier:pathToFileURL(fake).href, nativeBindingSpecifier:pathToFileURL(native).href, nativeGpuQueryExecutable:query } });
+      transformersSpecifier:pathToFileURL(fake).href, nativeBindingSpecifier:pathToFileURL(native).href, nativeGpuQueryExecutable:query },
+      ...(outcome==='separate-loader-output' ? {env:{...process.env,LD_DEBUG:'files',LD_DEBUG_OUTPUT:join(dir,'loader')}} : {}) });
     const messages:any[]=[];
     try {
       const ready=new Promise<void>((resolve,reject)=>{worker.once('error',reject);worker.on('message',m=>{messages.push(m);if(m.kind==='ready')resolve();});});
       await ready;
       const finished=new Promise<any>((resolve,reject)=>{worker.once('error',reject);worker.on('message',m=>{if(['embed_ok','embed_err'].includes(m.kind))resolve(m);});});
       worker.postMessage({kind:'embed',id:0,text:'fixture',model:dir,tokenizerBackend:'rust',pooling:'cls',traceNativeInference:true});
-      expect(await finished).toMatchObject({kind:'embed_ok',vector:[1,0]});
+      const result=await finished;
+      if(outcome==='separate-loader-output') {
+        expect(result).toMatchObject({kind:'embed_err',error:expect.stringContaining('requires shared stderr')});
+        expect(messages.filter(m=>m.kind==='embed_native_inference')).toEqual([]);
+        return;
+      }
+      expect(result).toMatchObject({kind:'embed_ok',vector:[1,0]});
       const events=messages.filter(m=>m.kind==='embed_native_inference');expect(events.map(m=>m.inference.phase)).toEqual(['start','end']);
       for(const event of events){
         const gpu=event.inference.runtime.gpuMemory;
@@ -237,7 +244,7 @@ try {
 } finally {await worker.terminate();}
 `;
     try {
-      const env={...process.env,LD_DEBUG:'files'}; delete env.LD_DEBUG_OUTPUT;
+      const env: NodeJS.ProcessEnv={...process.env,LD_DEBUG:'files'}; delete env.LD_DEBUG_OUTPUT;
       const child = spawnSync(process.execPath, ['--input-type=module'], { input: program, env, encoding: 'utf8', timeout: 20000, maxBuffer: 4*1024*1024 });
       expect(child.status, child.stderr).toBe(0);
       const observed = JSON.parse(child.stdout.trim());
