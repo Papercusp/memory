@@ -31,6 +31,15 @@ import { applyWorkerDeviceReport, constructEmbedPipeline, currentEmbedDeviceDeci
 interface PendingRequest {
   resolve: (v: number[]) => void;
   reject: (err: Error) => void;
+  onInputTrace?: (trace: WorkerInputTrace) => void;
+  inputTraceCount?: number;
+  inputTraceError?: Error;
+}
+
+/** Explicit qualification evidence, emitted before the graph executes. */
+export interface WorkerInputTrace {
+  model: string; device: 'cpu' | 'cuda'; observedAt: string;
+  inputShape: number[]; inputIds: number[]; attentionMask: number[];
 }
 
 interface WorkerState {
@@ -434,7 +443,7 @@ function ensureWorker(): Promise<void> {
     }
 
     let initialized = false;
-    state.worker.on('message', (msg: { kind: string; id?: number; vector?: number[]; error?: string }) => {
+    state.worker.on('message', (msg: { kind: string; id?: number; vector?: number[]; error?: string; trace?: WorkerInputTrace }) => {
       if (msg.kind === 'ready') {
         initialized = true;
         // EI-19464316359123796: a persistent, REF'd worker thread keeps the
@@ -467,12 +476,30 @@ function ensureWorker(): Promise<void> {
       if (typeof msg.id !== 'number') return;
       const p = state.pending.get(msg.id);
       if (!p) return;
+      if (msg.kind === 'embed_input') {
+        if (p.onInputTrace) {
+          try {
+            const trace = msg.trace;
+            if (!trace || !['cpu', 'cuda'].includes(trace.device) || typeof trace.model !== 'string'
+              || !Number.isFinite(Date.parse(trace.observedAt)) || !Array.isArray(trace.inputIds) || !trace.inputIds.length
+              || trace.inputIds.some((n) => !Number.isSafeInteger(n) || n < 0)
+              || JSON.stringify(trace.inputShape) !== JSON.stringify([1, trace.inputIds.length])
+              || !Array.isArray(trace.attentionMask) || trace.attentionMask.length !== trace.inputIds.length
+              || trace.attentionMask.some((n) => n !== 0 && n !== 1)) throw new Error('invalid worker input trace');
+            p.onInputTrace(trace);
+            p.inputTraceCount = (p.inputTraceCount ?? 0) + 1;
+          } catch (error) { p.inputTraceError = error instanceof Error ? error : new Error(String(error)); }
+        }
+        return;
+      }
       state.pending.delete(msg.id);
       // Release the loop as soon as the LAST request lands, so a one-off script
       // still exits on its own (WI-37683 — the other half of syncWorkerRef).
       syncWorkerRef();
       if (msg.kind === 'embed_ok' && Array.isArray(msg.vector)) {
-        p.resolve(msg.vector);
+        if (p.inputTraceError) p.reject(p.inputTraceError);
+        else if (p.onInputTrace && !p.inputTraceCount) p.reject(new Error('worker returned a vector without requested input evidence'));
+        else p.resolve(msg.vector);
       } else {
         p.reject(new Error(msg.error ?? 'worker error'));
       }
@@ -556,6 +583,8 @@ export interface EmbedViaWorkerOpts {
   output?: string;
   /** Explicit candidate contract; the default retains the SDK tokenizer. */
   tokenizerBackend?: 'rust';
+  /** Opt-in raw tensor evidence for private qualification; normal calls emit none. */
+  onInputTrace?: (trace: WorkerInputTrace) => void;
 }
 
 /**
@@ -580,7 +609,7 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
 
   const id = state.nextId++;
   return new Promise<number[]>((resolveEmbed, rejectEmbed) => {
-    state.pending.set(id, { resolve: resolveEmbed, reject: rejectEmbed });
+    state.pending.set(id, { resolve: resolveEmbed, reject: rejectEmbed, onInputTrace: opts.onInputTrace });
     // Ref BEFORE posting: between the post and the reply the caller is awaiting
     // a Promise, which is not loop work — an unref'd worker would leave the loop
     // looking idle and let `beforeExit` terminate this very request (WI-37683).
@@ -594,6 +623,7 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
       normalize: opts.normalize,
       output: opts.output,
       tokenizerBackend: opts.tokenizerBackend,
+      ...(opts.onInputTrace ? { traceInput: true } : {}),
     });
   });
 }

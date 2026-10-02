@@ -188,6 +188,7 @@ async function runEmbed(msg, entry) {
   const pooling = msg.pooling || 'mean';
   const normalize = msg.normalize === undefined ? true : msg.normalize;
   const pipe = entry.pipe;
+  if (msg.traceInput && msg.tokenizerBackend !== 'rust') throw new Error('input evidence requires the explicit Rust tensor route');
   if (msg.tokenizerBackend === 'rust') {
     if (pooling !== 'cls' || msg.output) throw new Error('Rust candidate contract requires native CLS output');
     const encoding = await rustTokenize(msg.model, text);
@@ -198,6 +199,11 @@ async function runEmbed(msg, entry) {
       input_ids: new t.Tensor('int64', BigInt64Array.from(ids, BigInt), shape),
       attention_mask: new t.Tensor('int64', BigInt64Array.from(encoding.getAttentionMask(), BigInt), shape),
     };
+    if (msg.traceInput) parentPort.postMessage({ kind: 'embed_input', id: msg.id, trace: {
+      model: msg.model, device: entry.device, observedAt: new Date().toISOString(),
+      inputShape: [...inputs.input_ids.dims], inputIds: Array.from(inputs.input_ids.data, Number),
+      attentionMask: Array.from(inputs.attention_mask.data, Number),
+    } });
     const output = await pipe.model(inputs);
     if (!output.last_hidden_state) throw new Error('Rust candidate graph lacks last_hidden_state');
     const cls = output.last_hidden_state.slice(null, 0);
