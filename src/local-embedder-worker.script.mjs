@@ -17,17 +17,43 @@
  */
 
 import { parentPort, workerData, threadId } from 'node:worker_threads';
-import { readFileSync, readlinkSync } from 'node:fs';
+import { readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { availableParallelism } from 'node:os';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRequire } from 'node:module';
 import { dirname } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 const DEFAULT_MODEL = 'Xenova/bge-small-en-v1.5';
 const nativeInferenceContext = new AsyncLocalStorage();
 let nativeInferenceTracePrepared = false;
 let nativeInferenceTracePreparation;
+let nativeClockExecutable;
+
+/** Reuse Python's standard Linux clock_gettime bindings rather than adding an
+ * FFI addon. CLOCK_MONOTONIC samples are bracketed by Node's same clock. RAW
+ * samples bound the native call without estimating an offset or drift model. */
+function sampleNativeRawClock() {
+  if (process.platform !== 'linux') return undefined;
+  if (!nativeClockExecutable) {
+    const path = realpathSync('/usr/bin/python3'), bytes = readFileSync(path);
+    nativeClockExecutable = { path, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
+  }
+  const nodeBeforeNs = process.hrtime.bigint().toString();
+  const result = spawnSync(nativeClockExecutable.path, ['-I', '-S', '-c',
+    'import json,time,sys; before=time.clock_gettime_ns(time.CLOCK_MONOTONIC); raw=time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW); after=time.clock_gettime_ns(time.CLOCK_MONOTONIC); print(json.dumps([str(before),str(raw),str(after),sys.version.split()[0]]))'],
+    { encoding: 'utf8', timeout: 10000, maxBuffer: 4096 });
+  const nodeAfterNs = process.hrtime.bigint().toString();
+  if (result.status !== 0) throw new Error(`native RAW clock probe failed: ${result.error?.message ?? result.stderr ?? result.signal}`);
+  const [monotonicBeforeNs, rawNs, monotonicAfterNs, pythonVersion] = JSON.parse(result.stdout);
+  if ([monotonicBeforeNs, rawNs, monotonicAfterNs].some(n => typeof n !== 'string' || !/^[1-9]\d*$/.test(n))
+    || BigInt(nodeBeforeNs) > BigInt(monotonicBeforeNs) || BigInt(monotonicBeforeNs) > BigInt(monotonicAfterNs)
+    || BigInt(monotonicAfterNs) > BigInt(nodeAfterNs)) throw new Error('native RAW clock probe does not match Node monotonic clock');
+  return { clock: 'linux-clock-monotonic-raw', rawNs, monotonicBeforeNs, monotonicAfterNs,
+    nodeBeforeNs, nodeAfterNs, executable: nativeClockExecutable, pythonVersion };
+}
 
 /** ORT's JS handler schedules a synchronous addon Run with setImmediate. The
  * request context follows that queue; trace the addon instance, not the outer
@@ -51,18 +77,24 @@ async function prepareNativeInferenceTrace() {
       if (!context) return Reflect.apply(originalRun, this, [feeds, fetches, options]);
       const runIndex = ++context.runIndex;
       const runTag = `pc-embed:${context.request.processId}:${context.request.workerThreadId}:${context.request.requestId}:${context.request.attempt}:${runIndex}`;
-      const emit = (phase, outcome) => parentPort.postMessage({ kind: 'embed_native_inference', id: context.request.requestId,
+      const emit = (phase, outcome, monotonicNs, observedAt, rawClock, clockProbeError) => parentPort.postMessage({ kind: 'embed_native_inference', id: context.request.requestId,
         inference: { ...context.request, model: context.model, device: context.device, runIndex, runTag,
-          clock: 'node-hrtime', monotonicNs: process.hrtime.bigint().toString(), observedAt: new Date().toISOString(), phase,
+          clock: 'node-hrtime', monotonicNs, observedAt, phase,
+          ...(rawClock ? { rawClock } : {}), ...(clockProbeError ? { clockProbeError } : {}),
           ...(outcome ? { outcome } : {}) } });
-      emit('start');
-      let result;
-      try { result = Reflect.apply(originalRun, this, [feeds, fetches, { ...options, tag: runTag }]); }
-      catch (error) { emit('end', 'error'); throw error; }
-      if (result && typeof result.then === 'function') {
-        emit('end', 'error'); throw new Error('native inference evidence requires a synchronous native Run');
-      }
-      emit('end', 'success');
+      const beforeClock = sampleNativeRawClock();
+      emit('start', undefined, process.hrtime.bigint().toString(), new Date().toISOString(), beforeClock);
+      let result, nativeError;
+      try {
+        result = Reflect.apply(originalRun, this, [feeds, fetches, { ...options, tag: runTag }]);
+        if (result && typeof result.then === 'function') throw new Error('native inference evidence requires a synchronous native Run');
+      } catch (error) { nativeError = error; }
+      const endNs = process.hrtime.bigint().toString(), endedAt = new Date().toISOString();
+      let afterClock, clockProbeError;
+      try { afterClock = sampleNativeRawClock(); } catch (error) { clockProbeError = String(error); }
+      emit('end', nativeError || clockProbeError ? 'error' : 'success', endNs, endedAt, afterClock, clockProbeError);
+      if (nativeError) throw nativeError;
+      if (clockProbeError) throw new Error(clockProbeError);
       return result;
     } });
     return session;

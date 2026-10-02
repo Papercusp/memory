@@ -65,6 +65,15 @@ export interface WorkerInferenceTrace extends WorkerRequestIdentity {
  * This still requires profiler clock calibration before attributing kernels. */
 export interface WorkerNativeInferenceTrace extends WorkerInferenceTrace {
   runIndex: number; runTag: string;
+  rawClock?: WorkerRawClockSample;
+  clockProbeError?: string;
+}
+
+export interface WorkerRawClockSample {
+  clock: 'linux-clock-monotonic-raw'; rawNs: string;
+  monotonicBeforeNs: string; monotonicAfterNs: string;
+  nodeBeforeNs: string; nodeAfterNs: string;
+  executable: { path: string; bytes: number; sha256: string }; pythonVersion: string;
 }
 
 function validRequestIdentity(value: WorkerRequestIdentity, id: number): boolean {
@@ -526,6 +535,23 @@ function ensureWorker(): Promise<void> {
             if (native && (!Number.isSafeInteger(nativeTrace.runIndex) || nativeTrace.runIndex < 1
               || nativeTrace.runTag !== `pc-embed:${trace.processId}:${trace.workerThreadId}:${trace.requestId}:${trace.attempt}:${nativeTrace.runIndex}`)) {
               throw new Error('invalid worker native inference identity');
+            }
+            if (native && nativeTrace.clockProbeError !== undefined) throw new Error(nativeTrace.clockProbeError);
+            if (native && nativeTrace.rawClock !== undefined) {
+              const clock = nativeTrace.rawClock;
+              if (clock.clock !== 'linux-clock-monotonic-raw'
+                || [clock.rawNs, clock.monotonicBeforeNs, clock.monotonicAfterNs, clock.nodeBeforeNs, clock.nodeAfterNs]
+                  .some((n) => typeof n !== 'string' || !/^[1-9]\d*$/.test(n))
+                || BigInt(clock.nodeBeforeNs) > BigInt(clock.monotonicBeforeNs)
+                || BigInt(clock.monotonicBeforeNs) > BigInt(clock.monotonicAfterNs)
+                || BigInt(clock.monotonicAfterNs) > BigInt(clock.nodeAfterNs)
+                || !clock.executable || typeof clock.executable.path !== 'string' || !Number.isSafeInteger(clock.executable.bytes)
+                || clock.executable.bytes < 1 || !/^[a-f0-9]{64}$/.test(clock.executable.sha256)
+                || typeof clock.pythonVersion !== 'string' || !clock.pythonVersion) throw new Error('invalid worker native clock evidence');
+              if ((trace.phase === 'start' && BigInt(clock.nodeAfterNs) > BigInt(trace.monotonicNs))
+                || (trace.phase === 'end' && BigInt(clock.nodeBeforeNs) < BigInt(trace.monotonicNs))) {
+                throw new Error('invalid worker native clock order');
+              }
             }
             if (trace.phase === 'start') {
               const nextAttempt = trace.attempt === (prior?.attempt ?? 0) + 1;
