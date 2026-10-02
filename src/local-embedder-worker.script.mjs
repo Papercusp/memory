@@ -83,7 +83,10 @@ function sampleNativeRuntime(device) {
     if (!row) throw new Error('native library maps row malformed');
     const [, startAddress, endAddress, permissions, fileOffset, mappedDevice, mappedInode, file] = row;
     if (!file.startsWith('/')) continue;
-    if (file.endsWith(' (deleted)')) throw new Error('native library mapping is deleted: '+file);
+    if (file.endsWith(' (deleted)')) {
+      if (permissions.includes('x') || /\.so(?:\.| |$)|\.node(?: |$)/.test(file)) throw new Error('native library mapping is deleted: '+file);
+      continue;
+    }
     const prior = files.get(file);
     if (prior && (prior.mappedDevice !== mappedDevice || prior.mappedInode !== mappedInode)) throw new Error('ambiguous native library mapping: '+file);
     const observation = prior ?? { path: file, mappedDevice, mappedInode, mappedRanges: [], eligible: false };
