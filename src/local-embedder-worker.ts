@@ -75,7 +75,7 @@ export interface WorkerNativeRuntimeSample {
   platform: 'linux'; clock: 'node-hrtime'; beforeNs: string; afterNs: string;
   /** Optional for historical observations. Required by complete loader closure
    * qualification; these addresses come from this process's kernel auxv. */
-  loaderProcess?: { executablePath: string; interpreterPath: string; programHeaderAddress: string;
+  loaderProcess?: { executablePath: string; interpreterPath: string; nodeModuleVersion?: string; programHeaderAddress: string;
     programHeaderEntryBytes: number; programHeaderCount: number; entryAddress: string; interpreterBaseAddress: string;
     vdso: { startAddress: string; endAddress: string; fileOffset: string; permissions: string;
       bytes: number; sha256: string; origin: 'kernel-auxv-AT_SYSINFO_EHDR' } };

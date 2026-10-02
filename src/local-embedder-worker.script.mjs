@@ -128,7 +128,7 @@ function sampleNativeLoaderProcess(libraries, vdsoRanges) {
     if(readSync(memory,vdsoBytes,0,vdsoBytes.length,Number(start))!==vdsoBytes.length
       || !vdsoBytes.subarray(0,6).equals(Buffer.from([127,69,76,70,2,1]))) throw new Error('native loader vDSO incomplete');
   } finally { closeSync(memory); }
-  return { executablePath, interpreterPath, programHeaderAddress:auxv.get(3n).toString(16),
+  return { executablePath, interpreterPath, nodeModuleVersion:process.versions.modules, programHeaderAddress:auxv.get(3n).toString(16),
     programHeaderEntryBytes:Number(auxv.get(4n)), programHeaderCount:Number(auxv.get(5n)),
     entryAddress:auxv.get(9n).toString(16), interpreterBaseAddress:auxv.get(7n).toString(16),
     vdso:{ ...range, bytes:vdsoBytes.length, sha256:createHash('sha256').update(vdsoBytes).digest('hex'),
