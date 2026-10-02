@@ -17,7 +17,7 @@
  */
 
 import { parentPort, workerData, threadId } from 'node:worker_threads';
-import { readFileSync, readlinkSync, realpathSync } from 'node:fs';
+import { readFileSync, readlinkSync, realpathSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { availableParallelism } from 'node:os';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -31,6 +31,81 @@ const nativeInferenceContext = new AsyncLocalStorage();
 let nativeInferenceTracePrepared = false;
 let nativeInferenceTracePreparation;
 let nativeClockExecutable;
+const nativeFileFingerprints = new Map();
+
+/** Stream mapped ELF/addon bytes without a second model-sized buffer. Check
+ * the mapped inode/device, so replacing an on-disk library cannot silently
+ * fingerprint different bytes than those loaded in this process. */
+function nativeFileFingerprint(file, mappedDevice, mappedInode) {
+  const descriptor = openSync(file, 'r');
+  try {
+    const stat = fstatSync(descriptor, { bigint: true });
+    const major = ((stat.dev >> 8n) & 0xfffn) | ((stat.dev >> 32n) & 0xfffff000n);
+    const minor = (stat.dev & 0xffn) | ((stat.dev >> 12n) & 0xffffff00n);
+    if (mappedInode !== undefined && (stat.ino !== BigInt(mappedInode)
+      || major !== BigInt('0x'+mappedDevice.split(':')[0]) || minor !== BigInt('0x'+mappedDevice.split(':')[1]))) {
+      throw new Error('mapped native library differs from on-disk file: '+file);
+    }
+    if (!stat.isFile() || stat.size < 1n || stat.size > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('invalid native library file: '+file);
+    const key = `${file}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    let fingerprint = nativeFileFingerprints.get(key);
+    if (!fingerprint) {
+      const hash = createHash('sha256'), buffer = Buffer.allocUnsafe(1024*1024);
+      let bytes = 0, length;
+      while ((length = readSync(descriptor, buffer, 0, buffer.length, null)) > 0) { hash.update(buffer.subarray(0,length)); bytes += length; }
+      const after = fstatSync(descriptor, { bigint: true });
+      if (BigInt(bytes) !== stat.size || after.ino !== stat.ino || after.dev !== stat.dev
+        || after.size !== stat.size || after.mtimeNs !== stat.mtimeNs || after.ctimeNs !== stat.ctimeNs) {
+        throw new Error('native library changed while fingerprinting: '+file);
+      }
+      fingerprint = { path: file, bytes, sha256: hash.digest('hex') }; nativeFileFingerprints.set(key, fingerprint);
+    }
+    return fingerprint;
+  } finally { closeSync(descriptor); }
+}
+
+function sampleNativeRuntime(device) {
+  if (process.platform !== 'linux') return undefined;
+  const beforeNs = process.hrtime.bigint().toString(), files = new Map();
+  for (const line of readFileSync('/proc/self/maps', 'utf8').trim().split('\n')) {
+    const row = line.match(/^[\da-f]+-[\da-f]+\s+(\S+)\s+[\da-f]+\s+([\da-f]+:[\da-f]+)\s+(\d+)\s*(.*)$/i);
+    if (!row) throw new Error('native library maps row malformed');
+    const [, permissions, mappedDevice, mappedInode, file] = row;
+    if (!file.startsWith('/') || (!permissions.includes('x') && !/\.so(?:\.|$)|\.node(?:$| )/.test(file))) continue;
+    if (file.endsWith(' (deleted)')) throw new Error('native library mapping is deleted: '+file);
+    const prior = files.get(file);
+    if (prior && (prior.mappedDevice !== mappedDevice || prior.mappedInode !== mappedInode)) throw new Error('ambiguous native library mapping: '+file);
+    files.set(file, { ...nativeFileFingerprint(file, mappedDevice, mappedInode), mappedDevice, mappedInode });
+  }
+  if (!files.size) throw new Error('native library mapping population missing');
+  let gpuMemory = { status: 'not-applicable' };
+  if (device === 'cuda') {
+    const queryBeforeNs = process.hrtime.bigint().toString();
+    try {
+      const executable = realpathSync('/usr/bin/nvidia-smi');
+      const result = spawnSync(executable, ['--query-gpu=uuid,pci.bus_id,memory.total,memory.used,memory.free', '--format=csv,noheader,nounits'],
+        { encoding: 'utf8', timeout: 10000, maxBuffer: 65536 });
+      if (result.status !== 0) throw new Error(result.error?.message ?? result.stderr ?? String(result.signal));
+      const devices = result.stdout.trim().split('\n').map(line => {
+        const columns = line.split(',').map(x=>x.trim());
+        if (columns.length !== 5) throw new Error('invalid GPU capacity columns');
+        const [uuid, pciBusId] = columns, [totalMiB, usedMiB, freeMiB] = columns.slice(2).map(Number);
+        if (!uuid.startsWith('GPU-') || !/^[\da-f]+:[\da-f]+:[\da-f]+\.[\da-f]+$/i.test(pciBusId)
+          || !columns.slice(2).every(x=>/^\d+(?:\.\d+)?$/.test(x))
+          || ![totalMiB, usedMiB, freeMiB].every(Number.isFinite) || totalMiB <= 0 || usedMiB < 0 || freeMiB < 0
+          || usedMiB > totalMiB || freeMiB > totalMiB) throw new Error('invalid GPU capacity values');
+        return { uuid, pciBusId, totalMiB, usedMiB, freeMiB };
+      });
+      if (!devices.length || new Set(devices.map(x=>x.uuid)).size !== devices.length) throw new Error('invalid GPU capacity population');
+      gpuMemory = { status: 'measured', scope: 'all-nvidia-smi-devices', beforeNs: queryBeforeNs,
+        afterNs: process.hrtime.bigint().toString(), executable: nativeFileFingerprint(executable), devices,
+        cudaVisibleDevices: process.env.CUDA_VISIBLE_DEVICES ?? null };
+    } catch (error) { gpuMemory = { status: 'unknown', beforeNs: queryBeforeNs,
+      afterNs: process.hrtime.bigint().toString(), error: String(error) }; }
+  }
+  return { platform: 'linux', clock: 'node-hrtime', beforeNs, afterNs: process.hrtime.bigint().toString(),
+    libraries: [...files.values()].sort((a,b)=>a.path.localeCompare(b.path)), gpuMemory };
+}
 
 /** Reuse Python's standard Linux clock_gettime bindings rather than adding an
  * FFI addon. CLOCK_MONOTONIC samples are bracketed by Node's same clock. RAW
@@ -77,24 +152,27 @@ async function prepareNativeInferenceTrace() {
       if (!context) return Reflect.apply(originalRun, this, [feeds, fetches, options]);
       const runIndex = ++context.runIndex;
       const runTag = `pc-embed:${context.request.processId}:${context.request.workerThreadId}:${context.request.requestId}:${context.request.attempt}:${runIndex}`;
-      const emit = (phase, outcome, monotonicNs, observedAt, rawClock, clockProbeError) => parentPort.postMessage({ kind: 'embed_native_inference', id: context.request.requestId,
+      const emit = (phase, outcome, monotonicNs, observedAt, rawClock, clockProbeError, runtime, runtimeProbeError) => parentPort.postMessage({ kind: 'embed_native_inference', id: context.request.requestId,
         inference: { ...context.request, model: context.model, device: context.device, runIndex, runTag,
           clock: 'node-hrtime', monotonicNs, observedAt, phase,
           ...(rawClock ? { rawClock } : {}), ...(clockProbeError ? { clockProbeError } : {}),
+          ...(runtime ? { runtime } : {}), ...(runtimeProbeError ? { runtimeProbeError } : {}),
           ...(outcome ? { outcome } : {}) } });
-      const beforeClock = sampleNativeRawClock();
-      emit('start', undefined, process.hrtime.bigint().toString(), new Date().toISOString(), beforeClock);
+      const beforeRuntime = sampleNativeRuntime(context.device), beforeClock = sampleNativeRawClock();
+      emit('start', undefined, process.hrtime.bigint().toString(), new Date().toISOString(), beforeClock, undefined, beforeRuntime);
       let result, nativeError;
       try {
         result = Reflect.apply(originalRun, this, [feeds, fetches, { ...options, tag: runTag }]);
         if (result && typeof result.then === 'function') throw new Error('native inference evidence requires a synchronous native Run');
       } catch (error) { nativeError = error; }
       const endNs = process.hrtime.bigint().toString(), endedAt = new Date().toISOString();
-      let afterClock, clockProbeError;
+      let afterClock, clockProbeError, afterRuntime, runtimeProbeError;
       try { afterClock = sampleNativeRawClock(); } catch (error) { clockProbeError = String(error); }
-      emit('end', nativeError || clockProbeError ? 'error' : 'success', endNs, endedAt, afterClock, clockProbeError);
+      try { afterRuntime = sampleNativeRuntime(context.device); } catch (error) { runtimeProbeError = String(error); }
+      emit('end', nativeError || clockProbeError || runtimeProbeError ? 'error' : 'success', endNs, endedAt, afterClock, clockProbeError, afterRuntime, runtimeProbeError);
       if (nativeError) throw nativeError;
       if (clockProbeError) throw new Error(clockProbeError);
+      if (runtimeProbeError) throw new Error(runtimeProbeError);
       return result;
     } });
     return session;

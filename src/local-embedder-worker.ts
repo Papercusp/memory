@@ -67,6 +67,45 @@ export interface WorkerNativeInferenceTrace extends WorkerInferenceTrace {
   runIndex: number; runTag: string;
   rawClock?: WorkerRawClockSample;
   clockProbeError?: string;
+  runtime?: WorkerNativeRuntimeSample;
+  runtimeProbeError?: string;
+}
+
+export interface WorkerNativeRuntimeSample {
+  platform: 'linux'; clock: 'node-hrtime'; beforeNs: string; afterNs: string;
+  libraries: { path: string; bytes: number; sha256: string; mappedDevice: string; mappedInode: string }[];
+  gpuMemory: { status: 'not-applicable' } | { status: 'unknown'; beforeNs: string; afterNs: string; error: string }
+    | { status: 'measured'; scope: 'all-nvidia-smi-devices'; beforeNs: string; afterNs: string;
+      executable: { path: string; bytes: number; sha256: string }; cudaVisibleDevices: string | null;
+      devices: { uuid: string; pciBusId: string; totalMiB: number; usedMiB: number; freeMiB: number }[] };
+}
+
+/** Validate the observation, separately from proving a complete library
+ * closure or binding one of the sampled GPUs to the model's actual device. */
+export function validNativeRuntimeSample(event: WorkerNativeInferenceTrace): boolean {
+  const sample = event.runtime, ns = (n: unknown): n is string => typeof n === 'string' && /^[1-9]\d*$/.test(n);
+  const fp = (f: { path: string; bytes: number; sha256: string }) => f && typeof f.path === 'string' && f.path.startsWith('/')
+    && Number.isSafeInteger(f.bytes) && f.bytes > 0 && /^[a-f0-9]{64}$/.test(f.sha256);
+  if (!sample || event.runtimeProbeError !== undefined || sample.platform !== 'linux' || sample.clock !== 'node-hrtime'
+    || !ns(event.monotonicNs) || !ns(sample.beforeNs) || !ns(sample.afterNs) || BigInt(sample.beforeNs) > BigInt(sample.afterNs)
+    || (event.phase === 'start' && BigInt(sample.afterNs) > BigInt(event.monotonicNs))
+    || (event.phase === 'end' && BigInt(sample.beforeNs) < BigInt(event.monotonicNs))
+    || !Array.isArray(sample.libraries) || !sample.libraries.length
+    || new Set(sample.libraries.map(f=>f.path)).size !== sample.libraries.length
+    || sample.libraries.some(f=>!fp(f) || !/^[\da-f]+:[\da-f]+$/i.test(f.mappedDevice) || !/^[1-9]\d*$/.test(f.mappedInode))) return false;
+  const gpu = sample.gpuMemory;
+  if (event.device === 'cpu') return gpu?.status === 'not-applicable';
+  if (!gpu || !['measured','unknown'].includes(gpu.status) || gpu.status === 'not-applicable'
+    || !ns(gpu.beforeNs) || !ns(gpu.afterNs) || BigInt(gpu.beforeNs) < BigInt(sample.beforeNs)
+    || BigInt(gpu.beforeNs) > BigInt(gpu.afterNs) || BigInt(gpu.afterNs) > BigInt(sample.afterNs)) return false;
+  if (gpu.status === 'unknown') return typeof gpu.error === 'string' && !!gpu.error;
+  return gpu.scope === 'all-nvidia-smi-devices' && fp(gpu.executable)
+    && (gpu.cudaVisibleDevices === null || typeof gpu.cudaVisibleDevices === 'string')
+    && Array.isArray(gpu.devices) && gpu.devices.length > 0 && new Set(gpu.devices.map(d=>d.uuid)).size === gpu.devices.length
+    && gpu.devices.every(d=>typeof d.uuid === 'string' && d.uuid.startsWith('GPU-') && typeof d.pciBusId === 'string'
+      && /^[\da-f]+:[\da-f]+:[\da-f]+\.[\da-f]+$/i.test(d.pciBusId)
+      && [d.totalMiB,d.usedMiB,d.freeMiB].every(Number.isFinite) && d.totalMiB > 0 && d.usedMiB >= 0 && d.freeMiB >= 0
+      && d.usedMiB <= d.totalMiB && d.freeMiB <= d.totalMiB);
 }
 
 export interface WorkerRawClockSample {
@@ -537,6 +576,10 @@ function ensureWorker(): Promise<void> {
               throw new Error('invalid worker native inference identity');
             }
             if (native && nativeTrace.clockProbeError !== undefined) throw new Error(nativeTrace.clockProbeError);
+            if (native && nativeTrace.runtimeProbeError !== undefined) throw new Error(nativeTrace.runtimeProbeError);
+            if (native && nativeTrace.runtime !== undefined && !validNativeRuntimeSample(nativeTrace)) {
+              throw new Error('invalid worker native runtime evidence');
+            }
             if (native && nativeTrace.rawClock !== undefined) {
               const clock = nativeTrace.rawClock;
               if (clock.clock !== 'linux-clock-monotonic-raw'
