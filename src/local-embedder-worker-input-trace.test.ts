@@ -86,6 +86,7 @@ describe('worker input evidence protocol', () => {
     vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function (this: Worker, msg: any) {
       expect(msg).not.toHaveProperty('traceInput');
       expect(msg).not.toHaveProperty('traceInference');
+      expect(msg).not.toHaveProperty('traceNativeInference');
       setImmediate(() => this.emit('message', { kind: 'embed_ok', id: msg.id, vector: [1] }));
     });
     expect(await embedViaWorker('q')).toEqual([1]);
@@ -134,28 +135,127 @@ describe('worker input evidence protocol', () => {
       [2, 'cpu', 'start', undefined], [2, 'cpu', 'end', 'success'],
     ]);
   });
+  it.each(['valid', 'missing', 'tag', 'run-index', 'thread', 'unfinished'])
+    ('checks %s native-call evidence independently of the outer graph interval', async (failure) => {
+      const seen: any[] = [];
+      vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function (this: Worker, msg: any) {
+        expect(msg.traceNativeInference).toBe(true);
+        setImmediate(() => {
+          const start = { requestId: msg.id, attempt: 1, processId: 123, workerThreadId: 1, nativeThreadId: 456,
+            model: trace.model, device: 'cpu', observedAt: trace.observedAt, clock: 'node-hrtime', monotonicNs: '100',
+            phase: 'start', runIndex: 1, runTag: `pc-embed:123:1:${msg.id}:1:1` };
+          const end = { ...start, monotonicNs: '200', phase: 'end', outcome: 'success' };
+          if (failure === 'tag') start.runTag = 'another-request';
+          if (failure === 'run-index') end.runIndex++;
+          if (failure === 'thread') end.nativeThreadId++;
+          if (failure !== 'missing') this.emit('message', { kind: 'embed_native_inference', id: msg.id, inference: start });
+          if (!['missing', 'unfinished'].includes(failure)) this.emit('message', { kind: 'embed_native_inference', id: msg.id, inference: end });
+          this.emit('message', { kind: 'embed_ok', id: msg.id, vector: [1] });
+        });
+      });
+      const result = embedViaWorker('q', { onNativeInferenceTrace: (event) => seen.push(event) });
+      if (failure === 'valid') { expect(await result).toEqual([1]); expect(seen.map(e => e.phase)).toEqual(['start', 'end']); }
+      else await expect(result).rejects.toThrow(['missing', 'unfinished'].includes(failure)
+        ? 'without complete requested native inference evidence' : 'invalid worker');
+    });
 });
 
 describe('real worker submitted tensors', () => {
+  it('traces the actual ORT native receiver and queued calls in an isolated CPU process', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'worker-native-run-'));
+    const fake = join(dir, 'cpu-native-transformers.mjs');
+    const ortUrl = import.meta.resolve('onnxruntime-node');
+    // Upstream ORT v1.24.3 testdata/mul_1.onnx (MIT), 130 bytes,
+    // sha256 71f431c4e9321ec6fbeb158d02ed240459a7dcc98673fa79a4f439ce42efaf10.
+    const graph = 'CAMSBmNoZW50YTpwChUKAVgKAVcSAVkaBW11bF8xIgNNdWwSCG11bCB0ZXN0KiMIAwgCEAEiGAAAgD8AAABAAABAQAAAgEAAAKBAAADAQEIBV1oTCgFYEg4KDAgBEggKAggDCgIIAmITCgFZEg4KDAgBEggKAggDCgIIAkIECgAQBw==';
+    writeFileSync(join(dir, 'tokenizer_config.json'), JSON.stringify({ model_max_length: 3 }));
+    writeFileSync(join(dir, 'tokenizer.json'), JSON.stringify({ version: '1.0', truncation: null, padding: null,
+      added_tokens: [], normalizer: null, pre_tokenizer: { type: 'Whitespace' }, post_processor: null, decoder: null,
+      model: { type: 'WordLevel', vocab: { '[UNK]': 0, a: 1, b: 2, c: 3 }, unk_token: '[UNK]' } }));
+    writeFileSync(fake, `import ort from ${JSON.stringify(ortUrl)};
+export const env = {};
+export class Tensor { constructor(type, data, dims) { this.type=type; this.data=data; this.dims=dims; } }
+export async function pipeline() {
+  const session = await ort.InferenceSession.create(Buffer.from(${JSON.stringify(graph)}, 'base64'),
+    { executionProviders: ['cpu'], intraOpNumThreads: 1, interOpNumThreads: 1 });
+  return { model: async inputs => {
+    const first = Number(inputs.input_ids.data[0]);
+    const output = await session.run({ X: new ort.Tensor('float32', Float32Array.from([first,1,1,1,1,1]), first === 3 ? [2,3] : [3,2]) });
+    return { last_hidden_state: { slice: () => ({ normalize: () => ({ data: [output.Y.data[0],0] }) }) } };
+  } };
+}
+`);
+    const program = `import { Worker } from 'node:worker_threads';
+const worker = new Worker(new URL(${JSON.stringify(new URL('./local-embedder-worker.script.mjs', import.meta.url).href)}),
+ { workerData: { device:'cpu', transformersSpecifier:${JSON.stringify(pathToFileURL(fake).href)} }, execArgv:[] });
+const messages=[];
+try {
+ await new Promise((resolve,reject)=>{worker.once('error',reject);worker.on('message',m=>{messages.push(m);if(m.kind==='ready')resolve();});});
+ const finished=new Promise((resolve,reject)=>{const rows=[];worker.once('error',reject);worker.on('message',m=>{
+  if(['embed_ok','embed_err'].includes(m.kind)){rows.push(m);if(rows.length===3)resolve(rows);}
+ });});
+ for(const [id,text] of [[1,'a b c'],[2,'b a c'],[3,'c a b']])worker.postMessage({kind:'embed',id,text,
+  model:${JSON.stringify(dir)},tokenizerBackend:'rust',pooling:'cls',traceInput:true,traceInference:true,traceNativeInference:true});
+ const results=await finished;
+ console.log(JSON.stringify({results,native:messages.filter(m=>m.kind==='embed_native_inference'),
+  graph:messages.filter(m=>m.kind==='embed_inference')}));
+} finally {await worker.terminate();}
+`;
+    try {
+      const child = spawnSync(process.execPath, ['--input-type=module'], { input: program, encoding: 'utf8', timeout: 20000 });
+      expect(child.status, child.stderr).toBe(0);
+      const observed = JSON.parse(child.stdout.trim());
+      expect(observed.results.find((r: any) => r.id === 1)).toMatchObject({ kind: 'embed_ok', vector: [1,0] });
+      expect(observed.results.find((r: any) => r.id === 2)).toMatchObject({ kind: 'embed_ok', vector: [2,0] });
+      expect(observed.results.find((r: any) => r.id === 3)).toMatchObject({ kind: 'embed_err', error: expect.stringContaining('invalid dimensions') });
+      for (const id of [1, 2, 3]) {
+        const events = observed.native.filter((e: any) => e.id === id);
+        expect(events.map((e: any) => [e.inference.phase, e.inference.outcome])).toEqual([
+          ['start', undefined], ['end', id === 3 ? 'error' : 'success'],
+        ]);
+        expect(events[0].inference.runIndex).toBe(1);
+        expect(events[0].inference.runTag).toContain(`:${id}:1:1`);
+        expect(BigInt(events[1].inference.monotonicNs)).toBeGreaterThan(BigInt(events[0].inference.monotonicNs));
+      }
+      expect(observed.native).toHaveLength(6);
+      for (let i = 2; i < observed.native.length; i += 2) {
+        expect(BigInt(observed.native[i].inference.monotonicNs)).toBeGreaterThan(BigInt(observed.native[i-1].inference.monotonicNs));
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it.each([false, true])('emits exact truncated tensors before graph success/failure=%s', async (fail) => {
     const dir = mkdtempSync(join(tmpdir(), 'worker-input-evidence-'));
     const fake = join(dir, 'fake-transformers.mjs');
+    const native = join(dir, 'fake-native-binding.mjs');
     writeFileSync(join(dir, 'tokenizer_config.json'), JSON.stringify({ model_max_length: 3 }));
     writeFileSync(join(dir, 'tokenizer.json'), JSON.stringify({ version: '1.0', truncation: null, padding: null,
       added_tokens: [], normalizer: null, pre_tokenizer: { type: 'Whitespace' }, post_processor: null, decoder: null,
       model: { type: 'WordLevel', vocab: { '[UNK]': 0, a: 1, b: 2, c: 3, d: 4 }, unk_token: '[UNK]' } }));
-    writeFileSync(fake, `export const env = {};
+    writeFileSync(native, `class Session {
+  run(inputs, fetches, options) {
+    if (!(this instanceof Session) || !options.tag.startsWith('pc-embed:')) throw new Error('native receiver/tag mismatch');
+    const ids = Array.from(inputs.input_ids.data, Number);
+    if (${fail}) throw new Error('graph rejected exact tensors');
+    return { last_hidden_state: { slice: () => ({ normalize: () => ({ data: [ids[0],0] }) }) } };
+  }
+}
+Object.defineProperty(Session.prototype, 'run', { writable: false, configurable: false });
+export const binding = { InferenceSession: Session };
+`);
+    writeFileSync(fake, `import { binding } from ${JSON.stringify(pathToFileURL(native).href)};
+export const env = {};
 export class Tensor { constructor(type, data, dims) { this.type=type; this.data=data; this.dims=dims; } }
-export async function pipeline() { return { model: async inputs => {
+export async function pipeline() { const session = new binding.InferenceSession(); return { model: async inputs => {
   const ids = Array.from(inputs.input_ids.data, Number);
   if (ids.length !== 3) throw new Error('wrong submitted ids');
   await new Promise(resolve => setTimeout(resolve, ids[0] === 1 ? 30 : 0));
-  if (${fail}) throw new Error('graph rejected exact tensors');
-  return { last_hidden_state: { slice: () => ({ normalize: () => ({ data: [ids[0],0] }) }) } };
+  return new Promise((resolve, reject) => setImmediate(() => {
+    try { resolve(session.run(inputs, null, {})); } catch (error) { reject(error); }
+  }));
 } }; }
 `);
     const worker = new Worker(new URL('./local-embedder-worker.script.mjs', import.meta.url), {
-      workerData: { device: 'cpu', transformersSpecifier: pathToFileURL(fake).href },
+      workerData: { device: 'cpu', transformersSpecifier: pathToFileURL(fake).href, nativeBindingSpecifier: pathToFileURL(native).href },
     });
     const messages: any[] = [];
     try {
@@ -165,7 +265,7 @@ export async function pipeline() { return { model: async inputs => {
       const done = new Promise<any>((resolve, reject) => { worker.once('error', reject); worker.on('message', m => {
         if (m.id === 7 && ['embed_ok', 'embed_err'].includes(m.kind)) resolve(m);
       }); });
-      worker.postMessage({ kind: 'embed', id: 7, text: 'a b c d', model: dir, tokenizerBackend: 'rust', pooling: 'cls', traceInput: true, traceInference: true });
+      worker.postMessage({ kind: 'embed', id: 7, text: 'a b c d', model: dir, tokenizerBackend: 'rust', pooling: 'cls', traceInput: true, traceInference: true, traceNativeInference: true });
       const result = await done, input = messages.find(m => m.kind === 'embed_input');
       expect(input).toMatchObject({ id: 7, trace: { model: dir, device: 'cpu', inputShape: [1,3], inputIds: [1,2,3], attentionMask: [1,1,1] } });
       expect(messages.indexOf(input)).toBeLessThan(messages.indexOf(result));
@@ -181,6 +281,14 @@ export async function pipeline() { return { model: async inputs => {
       expect(BigInt(lifecycle[1].inference.monotonicNs)).toBeGreaterThan(BigInt(lifecycle[0].inference.monotonicNs));
       expect(messages.indexOf(input)).toBeLessThan(messages.indexOf(lifecycle[0]));
       expect(messages.indexOf(lifecycle[1])).toBeLessThan(messages.indexOf(result));
+      const nativeEvents = messages.filter(m => m.kind === 'embed_native_inference');
+      expect(nativeEvents.map(m => [m.inference.phase, m.inference.outcome])).toEqual([
+        ['start', undefined], ['end', fail ? 'error' : 'success'],
+      ]);
+      expect(nativeEvents[0].inference).toMatchObject({ ...input.trace.request, runIndex: 1,
+        runTag: `pc-embed:${process.pid}:${worker.threadId}:7:1:1` });
+      expect(BigInt(nativeEvents[0].inference.monotonicNs)).toBeGreaterThan(BigInt(lifecycle[0].inference.monotonicNs));
+      expect(BigInt(nativeEvents[1].inference.monotonicNs)).toBeLessThan(BigInt(lifecycle[1].inference.monotonicNs));
       if (!fail) {
         const concurrent = new Promise<any[]>((resolve, reject) => {
           const results: any[] = [];
@@ -189,7 +297,7 @@ export async function pipeline() { return { model: async inputs => {
           });
         });
         for (const [id, text] of [[8, 'a b c d'], [9, 'b a c d']]) worker.postMessage({
-          kind: 'embed', id, text, model: dir, tokenizerBackend: 'rust', pooling: 'cls', traceInput: true, traceInference: true,
+          kind: 'embed', id, text, model: dir, tokenizerBackend: 'rust', pooling: 'cls', traceInput: true, traceInference: true, traceNativeInference: true,
         });
         expect((await concurrent).map(m => [m.id, m.vector])).toEqual([[9, [2,0]], [8, [1,0]]]);
         for (const id of [8, 9]) {
@@ -200,6 +308,9 @@ export async function pipeline() { return { model: async inputs => {
         const firstEnd = messages.find(m => m.kind === 'embed_inference' && [8, 9].includes(m.id) && m.inference.phase === 'end');
         expect(starts).toHaveLength(2);
         expect(BigInt(starts[1].inference.monotonicNs)).toBeLessThan(BigInt(firstEnd.inference.monotonicNs));
+        const nativeGroup = messages.filter(m => m.kind === 'embed_native_inference' && [8, 9].includes(m.id));
+        expect(nativeGroup.map(m => [m.id, m.inference.phase])).toEqual([[9, 'start'], [9, 'end'], [8, 'start'], [8, 'end']]);
+        expect(BigInt(nativeGroup[1].inference.monotonicNs)).toBeLessThan(BigInt(nativeGroup[2].inference.monotonicNs));
       }
     } finally { await worker.terminate(); rmSync(dir, { recursive: true, force: true }); }
   });
