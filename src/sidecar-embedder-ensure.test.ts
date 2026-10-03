@@ -115,7 +115,8 @@ describe('buildSidecarFirstEmbedder ensure hook (P-531)', () => {
 
 describe('settleSidecarEnsureWithin', () => {
   it('resolves when the work settles in time', async () => {
-    await expect(settleSidecarEnsureWithin(Promise.resolve('ok'), 1_000)).resolves.toBeUndefined();
+    // P-530: the settle passes the ensure's value through (it may be the URL).
+    await expect(settleSidecarEnsureWithin(Promise.resolve('ok'), 1_000)).resolves.toBe('ok');
   });
 
   it('rejects with sidecar_ensure_timeout when the work outlives the bound', async () => {
@@ -145,5 +146,90 @@ describe('settleSidecarEnsureWithin', () => {
     const pending = settleSidecarEnsureWithin(new Promise(() => {}), 10_000, ac.signal);
     ac.abort(new Error('caller gave up'));
     await expect(pending).rejects.toThrow(/caller gave up/);
+  });
+});
+
+/**
+ * WI-10005932: a sidecar this process is configured to spawn whose first start
+ * timed out has no URL yet. Before the fix the client took a null url as "no
+ * sidecar" and built the in-process model in the main Server, which then held
+ * a second copy next to the sidecar for good (P-532d pct3: +1.8 GB anon, 150
+ * .onnx maps in the main process). With an ensure hook the client must stay
+ * sidecar-only and take the address from a later ensure.
+ */
+describe('buildSidecarFirstEmbedder with a null url and an ensure hook (WI-10005932)', () => {
+  it('never builds the fallback and uses the URL a later ensure reports', async () => {
+    const events: string[] = [];
+    let ensures = 0;
+    const embed = buildSidecarFirstEmbedder({
+      model: 'gemma',
+      kind: 'document',
+      url: null,
+      fallback: noFallback,
+      sleepFn: async () => {},
+      onTransition: (state) => events.push(`transition:${state}`),
+      ensure: async () => {
+        ensures++;
+        return ensures >= 2 ? 'http://127.0.0.1:41223/' : null;
+      },
+      fetchFn: (async (input: string | URL | Request) => {
+        events.push(`fetch:${String(input)}`);
+        return okResponse();
+      }) as typeof fetch,
+    });
+
+    await expect(embed('hello')).resolves.toEqual(VECTOR);
+    expect(ensures).toBe(2);
+    expect(events).toEqual(['transition:down', 'fetch:http://127.0.0.1:41223/embed', 'transition:up']);
+  });
+
+  it('keeps the reported URL for later calls', async () => {
+    const fetched: string[] = [];
+    const embed = buildSidecarFirstEmbedder({
+      model: 'gemma',
+      kind: 'query',
+      url: null,
+      fallback: noFallback,
+      sleepFn: async () => {},
+      onTransition: () => {},
+      // Reports the address once, then (like an already-running sidecar) nothing new.
+      ensure: (() => {
+        let first = true;
+        return async () => {
+          const out = first ? 'http://127.0.0.1:41224' : undefined;
+          first = false;
+          return out;
+        };
+      })(),
+      fetchFn: (async (input: string | URL | Request) => {
+        fetched.push(String(input));
+        return okResponse();
+      }) as typeof fetch,
+    });
+
+    await embed('a');
+    await embed('b');
+    expect(fetched).toEqual(['http://127.0.0.1:41224/embed', 'http://127.0.0.1:41224/embed']);
+  });
+
+  it('fails within the budget when no address ever arrives, without fetching or loading a model', async () => {
+    let fetches = 0;
+    const embed = buildSidecarFirstEmbedder({
+      model: 'gemma',
+      kind: 'document',
+      url: null,
+      fallback: noFallback,
+      sleepFn: async () => {},
+      maxAttempts: 3,
+      onTransition: () => {},
+      ensure: async () => null,
+      fetchFn: (async () => {
+        fetches++;
+        return okResponse();
+      }) as typeof fetch,
+    });
+
+    await expect(embed('hello')).rejects.toThrow(/sidecar_required_unavailable: sidecar_not_ready/);
+    expect(fetches).toBe(0);
   });
 });

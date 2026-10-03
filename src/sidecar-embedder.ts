@@ -203,11 +203,12 @@ export interface SidecarFirstEmbedderOpts {
   /** Asymmetric task side — the sidecar owns the actual prompt text (D-004). */
   kind: GemmaEmbedKind;
   /** Lazy builder for the in-process embedder — used ONLY when no sidecar is
-   *  configured (url null), where it is the sole engine. When a url is set it
-   *  is never built: the sidecar is required (WI-4021, D-003 retired). */
+   *  configured (url null AND no ensure hook), where it is the sole engine.
+   *  When a url or an ensure hook is set it is never built: the sidecar is
+   *  required (WI-4021, D-003 retired). */
   fallback: () => EmbedFn | Promise<EmbedFn>;
   /** Sidecar base URL; defaults to resolveEmbedSidecarUrl(). null/absent ⇒
-   *  pure in-process. */
+   *  pure in-process, unless `ensure` is set (see there). */
   url?: string | null;
   /** TOTAL budget per embed across every attempt (default 15s). */
   timeoutMs?: number;
@@ -230,7 +231,12 @@ export interface SidecarFirstEmbedderOpts {
    *  attempt fails and the ensure keeps running, so a later call finds the
    *  sidecar warming or ready. Leave unset for a sidecar another process owns.
    *  It may resolve to the sidecar's current base URL; the client then sends
-   *  this and later attempts there (see nextSidecarUrl). */
+   *  this and later attempts there (see nextSidecarUrl).
+   *  With `url` null, the ensure hook is the ONLY source of the address: a
+   *  sidecar this process is configured to spawn that is not up yet (its first
+   *  start timed out). The client stays sidecar-only and fails the attempt
+   *  until an ensure reports a URL. It never loads the model in-process, which
+   *  would keep a second copy in this process for good (WI-10005932). */
   ensure?: () => Promise<unknown>;
 }
 
@@ -238,7 +244,9 @@ export interface SidecarFirstEmbedderOpts {
  *  sidecar this process spawns on an ephemeral port comes back on a different
  *  port after an idle exit, so the client must follow it. Anything that is not
  *  a non-empty string keeps the URL it already has. */
-export function nextSidecarUrl(current: string, ensured: unknown): string {
+export function nextSidecarUrl(current: string, ensured: unknown): string;
+export function nextSidecarUrl(current: string | null, ensured: unknown): string | null;
+export function nextSidecarUrl(current: string | null, ensured: unknown): string | null {
   return typeof ensured === 'string' && ensured.trim() ? ensured.trim().replace(/\/$/, '') : current;
 }
 
@@ -291,7 +299,7 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
     ((state: 'down' | 'up' | 'rejected', detail: string) =>
       console.warn(`[sidecar-embedder] ${opts.model}:${opts.kind} sidecar ${state}: ${detail}`));
 
-  if (!url) {
+  if (!url && !opts.ensure) {
     // No sidecar configured: the plain in-process embedder is the sole engine
     // (desktop installs, tests, bench rigs) with zero per-call overhead. A
     // failed build is not memoized — the next embed retries it.
@@ -319,7 +327,8 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
   // P-530: shared by every call of this embedder, so once an ensure reports a
   // new address (a re-launched sidecar on a fresh ephemeral port) later calls
   // start there too.
-  let currentUrl = url;
+  // WI-10005932: null until an ensure reports where a spawned sidecar listens.
+  let currentUrl: string | null = url || null;
 
   return async (text: string, signal?: AbortSignal): Promise<number[]> => {
     const deadline = now() + timeoutMs;
@@ -334,6 +343,7 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
           left = deadline - now();
           if (left <= 0) throw new Error('sidecar_ensure_timeout: budget spent re-establishing the sidecar');
         }
+        if (currentUrl === null) throw new Error('sidecar_not_ready: no sidecar address reported yet');
         const res = await sidecarEmbedBatch(currentUrl, {
           model: opts.model,
           kind: opts.kind,
