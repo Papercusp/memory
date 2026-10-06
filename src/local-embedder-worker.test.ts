@@ -70,6 +70,9 @@ describe('local-embedder-worker (protocol contract)', () => {
       second = await import('./local-embedder-worker');
       expect(second.embedViaWorker).not.toBe(first.embedViaWorker);
       expect(second.getWorkerState()).toEqual(first.getWorkerState());
+      // Restore delivery before shutting down: a worker that owes an answer is
+      // retired, not killed (WI-10006567), and the retire request must reach it.
+      post.mockRestore();
       await second.shutdownLocalEmbedder();
       expect(await pending).toBeInstanceOf(Error);
       expect(first.getWorkerState()).toMatchObject({ alive: false, pendingCount: 0 });
@@ -383,8 +386,15 @@ describe('local-embedder-worker (WI-37683: holds the loop while a request is in 
     // promise settled NEVER — which is what turned this defect into a process
     // that exited 0 having produced neither a vector nor an error. A silent
     // non-settlement has nothing to observe; a rejection does.
+    //
+    // Attach the expectation BEFORE the teardown, the way a real caller is
+    // already awaiting its request. `_resetWorker` rejects pending work at once
+    // and then waits (across macrotasks) for the old worker to retire
+    // (WI-10006567), so a handler attached only after it resolves leaves the
+    // rejection unhandled for that window and Vitest fails the whole run.
+    const rejected = expect(inflight).rejects.toThrow(/in flight/);
     await mod._resetWorker();
-    await expect(inflight).rejects.toThrow(/in flight/);
+    await rejected;
     expect(mod.getWorkerState().pendingCount).toBe(0);
   }, 30_000);
 

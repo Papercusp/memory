@@ -163,7 +163,11 @@ function cachedBgeSmall(): boolean {
   }
 }
 
-const IN_FLIGHT = 16;
+const IN_FLIGHT = 48;
+/** The module under test. Overridable so the same child can be pointed at a
+ *  pre-fix copy outside the tree as the control (must abort), without ever
+ *  mutating the shared checkout. */
+const SUBJECT = process.env.EMBED_RETIRE_TEST_SUBJECT ?? resolve(__dirname, 'local-embedder-worker.ts');
 
 /** The child: warm, idle reset (control), reset with native inference running, recover. */
 function childScript(modulePath: string): string {
@@ -175,22 +179,22 @@ console.log('CHILD_WARM dims=' + ref.length);
 await mod.shutdownLocalEmbedder();
 console.log('CHILD_IDLE_RESET_OK');
 await mod.embedViaWorker('reload the model in a fresh worker');
-const cpu0 = process.cpuUsage();
+// Reset the moment the FIRST of a large batch answers: inference has then
+// demonstrably run, and the rest of the batch is queued on or running in
+// onnxruntime's pool. (A CPU-time gate was tried first and was timing-fragile:
+// on a fast run all requests finished before it tripped, a vacuous pass.)
+let firstAnswered = () => {};
+const first = new Promise((r) => { firstAnswered = r; });
+let answeredBeforeReset = 0;
 const flights = Array.from({ length: ${IN_FLIGHT} }, () =>
-  mod.embedViaWorker(long).then(() => 'answered', (e) => 'rejected: ' + e.message));
-// Reset only once native inference is demonstrably running: onnxruntime's
-// threads belong to this process, so its CPU time climbs once runs start.
-const t0 = Date.now();
-while (Date.now() - t0 < 10000) {
-  const u = process.cpuUsage(cpu0);
-  if (u.user + u.system > 250000) break;
-  await new Promise((r) => setTimeout(r, 1));
-}
-const busy = process.cpuUsage(cpu0);
+  mod.embedViaWorker(long).then(() => { answeredBeforeReset++; firstAnswered(); return 'answered'; },
+    (e) => 'rejected: ' + e.message));
+await Promise.race([first, new Promise((r) => setTimeout(r, 60000))]);
 const pendingAtReset = mod.getWorkerState().pendingCount;
+const answeredAtReset = answeredBeforeReset;
 await mod.shutdownLocalEmbedder();
 const outcomes = await Promise.all(flights);
-console.log('CHILD_RESET ' + JSON.stringify({ pendingAtReset, busyUs: busy.user + busy.system,
+console.log('CHILD_RESET ' + JSON.stringify({ pendingAtReset, answeredAtReset,
   rejected: outcomes.filter((o) => o.startsWith('rejected: embedder worker was shut down')).length,
   answered: outcomes.filter((o) => o === 'answered').length, other: outcomes.filter((o) => o !== 'answered' && !o.startsWith('rejected: embedder worker was shut down')) }));
 const after = await mod.embedViaWorker(long);
@@ -206,7 +210,7 @@ describe('local-embedder-worker retirement with the real ONNX binding (WI-100065
     const dir = mkdtempSync(join(tmpdir(), 'embedder-retire-'));
     try {
       const child = join(dir, 'retire-host.mts');
-      writeFileSync(child, childScript(resolve(__dirname, 'local-embedder-worker.ts')));
+      writeFileSync(child, childScript(SUBJECT));
       const run = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }>((done) => {
         execFile('npx', ['tsx', child], { cwd: resolve(__dirname, '..'), timeout: 180_000, maxBuffer: 8 << 20 },
           (err, stdout, stderr) => {
@@ -223,10 +227,11 @@ describe('local-embedder-worker retirement with the real ONNX binding (WI-100065
       expect(run.stderr, evidence).not.toMatch(/Napi::Error|terminate called/);
       expect({ code: run.code, signal: run.signal }, evidence).toEqual({ code: 0, signal: null });
       const reset = JSON.parse(run.stdout.match(/CHILD_RESET (.*)/)![1]) as
-        { pendingAtReset: number; busyUs: number; rejected: number; answered: number; other: string[] };
-      // Non-vacuity: the reset found requests in flight and inference had begun.
+        { pendingAtReset: number; answeredAtReset: number; rejected: number; answered: number; other: string[] };
+      // Non-vacuity: inference had run (one answer arrived) and the reset still
+      // found requests in flight. Both must hold or the reset proved nothing.
+      expect(reset.answeredAtReset, evidence).toBeGreaterThan(0);
       expect(reset.pendingAtReset, evidence).toBeGreaterThan(0);
-      expect(reset.busyUs, evidence).toBeGreaterThan(250_000);
       // Every cut-off caller got the classified shutdown rejection, nothing else.
       expect(reset.other, evidence).toEqual([]);
       expect(reset.rejected + reset.answered, evidence).toBe(IN_FLIGHT);

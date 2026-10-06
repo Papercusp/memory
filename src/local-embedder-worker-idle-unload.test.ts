@@ -48,9 +48,14 @@ function setIdleMs(value: string | undefined): void {
 
 /** Answer every embed request from the worker side without touching the model. */
 function stubWorkerReplies(opts: { reply: boolean }) {
+  const realPost = Worker.prototype.postMessage;
   return vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function (this: Worker, msg: unknown) {
     const m = msg as { kind?: string; id?: number };
-    if (!opts.reply || m.kind !== 'embed' || typeof m.id !== 'number') return;
+    // Only embed requests are faked. Everything else reaches the real worker,
+    // notably the shutdown's `retire` request (WI-10006567): swallowing it
+    // leaves a reset with a request owed waiting out the whole drain bound.
+    if (m.kind !== 'embed') return realPost.call(this, msg);
+    if (!opts.reply || typeof m.id !== 'number') return;
     const id = m.id;
     setImmediate(() => this.emit('message', { kind: 'embed_ok', id, vector: [0.25, 0.5] }));
   });
