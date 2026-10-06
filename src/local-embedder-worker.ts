@@ -197,7 +197,30 @@ interface WorkerState {
   idleTimer?: ReturnType<typeof setTimeout> | null;
   /** How many times the idle unload has released the worker in this process. */
   idleUnloads?: number;
+  /**
+   * Workers `_resetWorker` detached while they still owed answers (WI-10006567):
+   * each is finishing the native inference already running in it and is
+   * terminated once it reports `retired`. Keyed by the Worker so its own
+   * handlers find their record. Optional for the same older-record reason as
+   * `onnxBindingPin`.
+   */
+  retiring?: Map<Worker, RetiringWorker>;
 }
+
+type RetireOutcome = 'retired' | 'exited' | 'errored' | 'timed-out';
+interface RetiringWorker {
+  /** Resolves once the worker is terminated (or had already exited). */
+  done: Promise<void>;
+  settle: (outcome: RetireOutcome) => void;
+}
+
+/**
+ * Upper bound on how long `_resetWorker` waits for a retiring worker to finish
+ * its in-flight inference before terminating it anyway (WI-10006567). A shutdown
+ * must never hang on a wedged worker, and the sidecar's SIGTERM path awaits
+ * this before `process.exit` inside systemd's 90 s stop window.
+ */
+export const EMBED_WORKER_RETIRE_DRAIN_MS = 30_000;
 
 /** What `pinOnnxRuntimeBinding` achieved. Never thrown — reported. */
 export type OnnxBindingPin =
@@ -544,12 +567,13 @@ function ensureWorker(): Promise<void> {
   if (state.workerReady) return state.workerReady;
 
   state.workerReady = new Promise<void>((resolveReady, rejectReady) => {
+    let spawned: Worker;
     try {
       const scriptPath = workerPath();
       // WI-10005090: before the first worker can load the ONNX binding (and so
       // before it can ever exit holding the last reference to it).
       pinOnnxRuntimeBinding(scriptPath);
-      state.worker = new Worker(scriptPath, {
+      spawned = new Worker(scriptPath, {
         // The plain JS file needs no parent loader or entry-point flags.
         // A stdin parent's --input-type is invalid for this file worker.
         execArgv: [],
@@ -565,10 +589,24 @@ function ensureWorker(): Promise<void> {
       rejectReady(err as Error);
       return;
     }
+    // WI-10006567: every handler below is scoped to THIS worker. `_resetWorker`
+    // detaches a worker that still owes answers and lets it finish before
+    // terminating it, while a replacement serves new requests. Request ids
+    // restart at 0, so a retired worker's late `embed_ok` reaching
+    // `state.pending` would resolve the REPLACEMENT's request with the wrong
+    // vector, and its late `exit` would null the live handle. A retired worker's
+    // messages therefore only ever feed its own retirement record.
+    const w = spawned;
+    state.worker = w;
 
     let initialized = false;
-    state.worker.on('message', (msg: { kind: string; id?: number; vector?: number[]; error?: string;
+    w.on('message', (msg: { kind: string; id?: number; vector?: number[]; error?: string;
       trace?: WorkerInputTrace; inference?: WorkerInferenceTrace | WorkerNativeInferenceTrace }) => {
+      if (state.worker !== w) {
+        if (msg.kind === 'retired') state.retiring?.get(w)?.settle('retired');
+        else if (msg.kind === 'ready') rejectReady(new Error('embedder worker was shut down before it became ready'));
+        return;
+      }
       if (msg.kind === 'ready') {
         initialized = true;
         // EI-19464316359123796: a persistent, REF'd worker thread keeps the
@@ -702,7 +740,10 @@ function ensureWorker(): Promise<void> {
       // WI-10005070: the last request landed, so start the idle window.
       if (state.pending.size === 0) armIdleUnload();
     });
-    state.worker.on('error', (err) => {
+    w.on('error', (err) => {
+      if (!initialized) rejectReady(err);
+      // A retired worker dying mid-drain ends its retirement; it owes nobody now.
+      if (state.worker !== w) { state.retiring?.get(w)?.settle('errored'); return; }
       // Reject every pending request — the worker crashed.
       for (const [, p] of state.pending) p.reject(err);
       state.pending.clear();
@@ -723,12 +764,12 @@ function ensureWorker(): Promise<void> {
       state.workerReady = null;
       state.refd = false;
       cancelIdleUnload();
-      if (!initialized) rejectReady(err);
     });
-    state.worker.on('exit', (code) => {
+    w.on('exit', (code) => {
       if (code !== 0 && !initialized) {
         rejectReady(new Error(`worker exited with code ${code} before ready`));
       }
+      if (state.worker !== w) { state.retiring?.get(w)?.settle('exited'); return; }
       // WI-37683: a worker that exits with requests still pending must REJECT
       // them. Dropping them silently is what turned the old unref bug into a
       // process that exited 0 with neither a vector nor an error — the caller's
@@ -834,18 +875,18 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
  *  implementation `_resetWorker` for backward compatibility (tests import it
  *  directly); {@link shutdownLocalEmbedder} is the same function under a
  *  discoverable public name — see its doc for why both exist. */
-export async function _resetWorker(): Promise<void> {
+export async function _resetWorker(opts: { drainMs?: number } = {}): Promise<void> {
   cancelIdleUnload();
-  if (state.worker) {
-    try { await state.worker.terminate(); } catch { /* noop */ }
-  }
+  const old = state.worker;
+  const owed = state.pending.size;
+  // Detach first: from here the old worker's handlers see `state.worker !== w`
+  // and never touch module state again (WI-10006567), and the next embed spawns
+  // a replacement immediately instead of waiting out the drain below.
   state.worker = null;
   state.workerReady = null;
   state.workerDisabled = false;
-  // WI-37683: reject, never silently drop. `terminate()` normally fires the
-  // `exit` handler above (which rejects), but that is not guaranteed to have
-  // run by the time we get here, and a `state.pending.clear()` on its own is exactly
-  // how a stranded caller ends up awaiting a promise that settles never.
+  // WI-37683: reject, never silently drop — a `state.pending.clear()` on its own
+  // is exactly how a stranded caller ends up awaiting a promise that settles never.
   if (state.pending.size > 0) {
     const err = new Error(`embedder worker was shut down while ${state.pending.size} request(s) were in flight`);
     for (const [, p] of state.pending) p.reject(err);
@@ -854,6 +895,62 @@ export async function _resetWorker(): Promise<void> {
   notifyIfDrained();
   state.refd = false;
   state.nextId = 0;
+  if (old) {
+    // Owing nothing means no inference is running in it, so it is safe to
+    // terminate now; a worker that owed answers may be mid-run, and terminating
+    // THAT one aborts the process (WI-10006567).
+    // `opts?.`: this is exported as `shutdownLocalEmbedder` and handed around as
+    // a callback, so a `.then(shutdownLocalEmbedder)` can pass null here.
+    if (owed > 0) void retireWorker(old, opts?.drainMs ?? EMBED_WORKER_RETIRE_DRAIN_MS);
+    else { try { await old.terminate(); } catch { /* already gone */ } }
+  }
+  // The contract callers rely on (the sidecar's SIGTERM path, every bench before
+  // `process.exit`): once this resolves, no worker of this module is alive —
+  // including one an EARLIER reset is still retiring.
+  await Promise.all([...(state.retiring?.values() ?? [])].map((r) => r.done));
+}
+
+/**
+ * Terminate a detached worker only once no ONNX inference is running in it
+ * (WI-10006567).
+ *
+ * `Worker#terminate()` while an onnxruntime-node session is mid-run destroys the
+ * worker's environment under the native call; when the run completes it throws a
+ * `Napi::Error` nothing can catch, and the whole PROCESS aborts (SIGABRT, exit
+ * 134). Measured 2026-10-06 in the P-007 real-weight robustness run, and
+ * reproduced on BGE-small by `local-embedder-worker-retire.test.ts`; an idle
+ * terminate is fine.
+ *
+ * So the worker is asked to retire: it starts no new inference, finishes the runs
+ * already started, then answers `{kind:'retired'}`, and only then is terminated.
+ * The wait is bounded by `drainMs`: past it the worker is terminated anyway with a
+ * loud warning, because a shutdown must never hang on a wedged worker.
+ */
+function retireWorker(w: Worker, drainMs: number): Promise<void> {
+  const retiring = (state.retiring ??= new Map());
+  const existing = retiring.get(w);
+  if (existing) return existing.done;
+  let settle: (outcome: RetireOutcome) => void = () => {};
+  const outcome = new Promise<RetireOutcome>((resolve) => { settle = resolve; });
+  const timer = setTimeout(() => settle('timed-out'), drainMs);
+  timer.unref?.();
+  const done = outcome.then(async (how) => {
+    clearTimeout(timer);
+    if (how === 'timed-out') {
+      console.warn(`[embed-worker] retiring worker did not report retired within ${drainMs}ms; terminating it anyway `
+        + '(WI-10006567: terminating during a native run can abort the process)');
+    }
+    if (how !== 'exited') {
+      try { await w.terminate(); } catch { /* already gone */ }
+    }
+    retiring.delete(w);
+  });
+  retiring.set(w, { done, settle });
+  // Hold the loop while it drains: a host that went idle now would exit with
+  // the native run still in flight, which aborts the same way.
+  try { w.ref(); } catch { /* exiting already; its exit handler settles */ }
+  try { w.postMessage({ kind: 'retire' }); } catch { settle('errored'); }
+  return done;
 }
 
 /**
