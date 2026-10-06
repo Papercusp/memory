@@ -38,7 +38,7 @@
  * shared space, and adoption means a full re-embed.
  */
 
-import { embedViaWorker, getWorkerState, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
+import { embedViaWorker, getWorkerState, isEmbedWorkerShutdownError, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
 import { mrlTruncate } from './gemma-embedder';
 import { CANDIDATE_DIM_SPECS } from './embedder-dims';
 import { dynamicImport } from './dynamic-import';
@@ -98,6 +98,7 @@ export function buildQwen3Embedder(opts: {
         });
         return mrlTruncate(full, dims);
       } catch (err) {
+        if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
         warnEmbedFallback('qwen3', err);
       }
     }

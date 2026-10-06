@@ -398,6 +398,29 @@ describe('local-embedder-worker (WI-37683: holds the loop while a request is in 
     expect(mod.getWorkerState().pendingCount).toBe(0);
   }, 30_000);
 
+  it('buildLocalEmbedder re-throws the shutdown rejection instead of rescuing it inline (WI-10006602)', async () => {
+    const mod = await import('./local-embedder-worker');
+    await mod.embedViaWorker('warm').catch(() => { /* */ });
+    const embed = await mod.buildLocalEmbedder();
+
+    // Same never-answered request as the test above, but issued through the
+    // builder: the request reaches the worker and stays pending.
+    const { Worker } = await import('node:worker_threads');
+    const postSpy = vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(() => {});
+    const inflight = embed('doomed');
+    for (let i = 0; i < 200 && mod.getWorkerState().pendingCount === 0; i++) await Promise.resolve();
+    expect(mod.getWorkerState().pendingCount).toBe(1);
+    postSpy.mockRestore();
+
+    // Pre-fix the builder caught the teardown rejection and ran the request
+    // inline on the main thread, so this settled with a vector (or an inline
+    // load error) instead of the shutdown. Attached before the teardown.
+    const outcome = inflight.then(() => 'resolved-inline', (err: unknown) => err);
+    await mod._resetWorker();
+    const settled = await outcome;
+    expect(mod.isEmbedWorkerShutdownError(settled)).toBe(true);
+  }, 30_000);
+
   it('a transient runtime crash does not latch — the next call respawns instead of going inline (EI-20012631851693581)', async () => {
     const mod = await import('./local-embedder-worker');
     const { Worker } = await import('node:worker_threads');

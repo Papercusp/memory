@@ -887,8 +887,9 @@ export async function _resetWorker(opts: { drainMs?: number } = {}): Promise<voi
   state.workerDisabled = false;
   // WI-37683: reject, never silently drop — a `state.pending.clear()` on its own
   // is exactly how a stranded caller ends up awaiting a promise that settles never.
+  // WI-10006602: typed, so builders re-throw it instead of rescuing it inline.
   if (state.pending.size > 0) {
-    const err = new Error(`embedder worker was shut down while ${state.pending.size} request(s) were in flight`);
+    const err = new EmbedWorkerShutdownError(state.pending.size);
     for (const [, p] of state.pending) p.reject(err);
   }
   state.pending.clear();
@@ -1082,6 +1083,31 @@ export function getWorkerState(): {
 }
 
 /**
+ * Code on the rejection `_resetWorker` / `shutdownLocalEmbedder` hands every
+ * request still in flight (WI-10006602). A builder with an inline fallback MUST
+ * NOT rescue such a request on the main thread: the host asked for the embedder
+ * to stop, and rescuing it loads a whole model inline instead — measured
+ * 2026-10-06 in the P-007 real-weight robustness run as a ~10s event-loop block
+ * on gemma (2 failed /healthz probes; interrupted requests settled 8-18s late)
+ * where mdenseon, which has no inline path, answered fast classified 500s.
+ * Matched by `code`, not `instanceof`, so a split module record still agrees.
+ */
+export const EMBED_WORKER_SHUTDOWN_CODE = 'EMBED_WORKER_SHUTDOWN';
+
+export class EmbedWorkerShutdownError extends Error {
+  readonly code = EMBED_WORKER_SHUTDOWN_CODE;
+  constructor(inFlight: number) {
+    super(`embedder worker was shut down while ${inFlight} request(s) were in flight`);
+    this.name = 'EmbedWorkerShutdownError';
+  }
+}
+
+/** True for the deliberate-shutdown rejection — the one worker-path failure a builder must re-throw rather than fall back on. */
+export function isEmbedWorkerShutdownError(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === EMBED_WORKER_SHUTDOWN_CODE;
+}
+
+/**
  * Rate-limited warning for a builder (gemma/harrier/local) falling back to
  * inline (main-thread-blocking) embedding for ONE call (EI-16184). Every
  * embedViaWorker() failure used to permanently stick that embedder CLOSURE
@@ -1234,6 +1260,7 @@ export async function buildLocalEmbedder(): Promise<(text: string) => Promise<nu
       try {
         return await embedViaWorker(text);
       } catch (err) {
+        if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
         warnEmbedFallback('local', err);
       }
     }

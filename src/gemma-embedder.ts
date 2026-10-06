@@ -68,6 +68,7 @@ import {
   applyTransformersRuntimePolicy,
   embedViaWorker,
   getWorkerState,
+  isEmbedWorkerShutdownError,
   ORT_SESSION_OPTIONS,
   warnEmbedFallback,
 } from './local-embedder-worker';
@@ -169,6 +170,7 @@ export function buildGemmaEmbedder(opts: {
         const full = await embedViaWorker(prompted, { model: GEMMA_MODEL, normalize: false });
         return mrlTruncate(full, dims);
       } catch (err) {
+        if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
         warnEmbedFallback('gemma', err);
       }
     }

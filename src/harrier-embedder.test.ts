@@ -113,6 +113,7 @@ describe('buildHarrierEmbedder — non-sticky worker fallback (EI-16184)', () =>
       embedViaWorker,
       getWorkerState,
       warnEmbedFallback,
+      isEmbedWorkerShutdownError: () => false,
       ORT_SESSION_OPTIONS: {},
     }));
 
@@ -137,6 +138,7 @@ describe('buildHarrierEmbedder — non-sticky worker fallback (EI-16184)', () =>
       embedViaWorker,
       getWorkerState,
       warnEmbedFallback,
+      isEmbedWorkerShutdownError: () => false,
       ORT_SESSION_OPTIONS: {},
     }));
 

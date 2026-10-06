@@ -119,6 +119,7 @@ describe('buildGemmaEmbedder — non-sticky worker fallback (EI-16184)', () => {
       embedViaWorker,
       getWorkerState,
       warnEmbedFallback,
+      isEmbedWorkerShutdownError: () => false,
       ORT_SESSION_OPTIONS: {},
     }));
 
@@ -147,6 +148,7 @@ describe('buildGemmaEmbedder — non-sticky worker fallback (EI-16184)', () => {
       embedViaWorker,
       getWorkerState,
       warnEmbedFallback,
+      isEmbedWorkerShutdownError: () => false,
       ORT_SESSION_OPTIONS: {},
     }));
 

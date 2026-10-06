@@ -37,6 +37,7 @@ import {
   applyTransformersRuntimePolicy,
   embedViaWorker,
   getWorkerState,
+  isEmbedWorkerShutdownError,
   ORT_SESSION_OPTIONS,
   warnEmbedFallback,
 } from './local-embedder-worker';
@@ -132,6 +133,7 @@ export function buildHarrierEmbedder(opts: {
         });
         return mrlTruncate(assertNativeDims(full), dims);
       } catch (err) {
+        if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
         warnEmbedFallback('harrier', err);
       }
     }

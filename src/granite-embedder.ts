@@ -50,7 +50,7 @@
  * incomparable cosine. Adoption means a full re-embed, never a mixed table.
  */
 
-import { embedViaWorker, getWorkerState, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
+import { embedViaWorker, getWorkerState, isEmbedWorkerShutdownError, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
 import { mrlTruncate } from './gemma-embedder';
 import { CANDIDATE_DIM_SPECS } from './embedder-dims';
 import { dynamicImport } from './dynamic-import';
@@ -118,6 +118,7 @@ export function buildGraniteEmbedder(opts: {
         const full = await embedViaWorker(text, { model, pooling: 'cls', normalize: false });
         return mrlTruncate(full, dims);
       } catch (err) {
+        if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
         warnEmbedFallback(`granite-${variant}`, err);
       }
     }
