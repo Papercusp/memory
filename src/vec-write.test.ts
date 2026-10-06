@@ -164,3 +164,49 @@ describe('embedAndUpsertVector — best-effort guards (never throw)', () => {
     }).problems).toEqual([expect.stringContaining('resolved width')]);
   });
 });
+
+describe('candidate storage (benchmark-only acceptance seam)', () => {
+  const candidateProfile = { ...EMBEDDER_DIM_SPECS.gemma, profileId: 'candidate-mdenseon-768@v1' as const };
+  const candidate: Exclude<ResolvedEmbedder, { mode: 'disabled' }> = {
+    mode: 'gemma', dims: candidateProfile.targetDims, profile: candidateProfile, embed: async () => [],
+  };
+  const production: Exclude<ResolvedEmbedder, { mode: 'disabled' }> = {
+    mode: 'gemma', dims: EMBEDDER_DIM_SPECS.gemma.targetDims, profile: EMBEDDER_DIM_SPECS.gemma, embed: async () => [],
+  };
+  const host = (schema: string, candidateStorage?: MemoryHost['candidateStorage']): MemoryHost =>
+    ({ ...hostWith(candidate), schema, ...(candidateStorage ? { candidateStorage } : {}) });
+
+  it('binds a candidate profile ONLY inside the declared isolated schema, replacing (not widening) acceptance', () => {
+    configureMemory(host('bench_memory_42', { schema: 'bench_memory_42', acceptedProfileIds: { gemma: [candidateProfile.profileId] } }));
+    const bound = resolveMemoryVectorBinding(candidate);
+    expect(bound.problems).toEqual([]);
+    expect(bound.binding?.storage.table).toBe(MEMORY_VECTOR_STORAGE_PROFILES.gemma.table);
+    expect(bound.binding?.storage.acceptedProfileIds).toEqual([candidateProfile.profileId]);
+    // Replacement: the production profile no longer binds to this schema's table.
+    expect(resolveMemoryVectorBinding(production).binding).toBeUndefined();
+    // Modes without an override keep their declared production acceptance.
+    expect(resolveMemoryVectorBinding({ mode: 'harrier', dims: EMBEDDER_DIM_SPECS.harrier.targetDims,
+      profile: EMBEDDER_DIM_SPECS.harrier, embed: async () => [] }).problems).toEqual([]);
+  });
+
+  it('fails closed on a shared/default schema or a schema mismatch — never falls back to production', () => {
+    for (const schema of ['harness_shared', 'public']) {
+      configureMemory(host(schema, { schema, acceptedProfileIds: { gemma: [candidateProfile.profileId] } }));
+      const refused = resolveMemoryVectorBinding(candidate);
+      expect(refused.binding).toBeUndefined();
+      expect(refused.problems).toEqual([expect.stringContaining('refused on shared schema')]);
+      // Even the production profile is refused while a shared-schema override is declared.
+      expect(resolveMemoryVectorBinding(production).binding).toBeUndefined();
+    }
+    configureMemory(host('harness_shared', { schema: 'bench_memory_42', acceptedProfileIds: { gemma: [candidateProfile.profileId] } }));
+    expect(resolveMemoryVectorBinding(candidate).problems).toEqual([expect.stringContaining('active memory schema is harness_shared')]);
+    configureMemory(host('bench_memory_42', { schema: 'bench_memory_42', acceptedProfileIds: { gemma: [] } }));
+    expect(resolveMemoryVectorBinding(candidate).problems).toEqual([expect.stringContaining('accepts no profile')]);
+  });
+
+  it('without an override the production acceptance is unchanged (candidate refused, production bound)', () => {
+    configureMemory(host('bench_memory_42'));
+    expect(resolveMemoryVectorBinding(candidate).binding).toBeUndefined();
+    expect(resolveMemoryVectorBinding(production).problems).toEqual([]);
+  });
+});

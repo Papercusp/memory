@@ -23,7 +23,7 @@
  * canonical text untouched.
  */
 
-import { memoryHost, memorySchema, type ResolvedEmbedder } from './config';
+import { isMemoryConfigured, memoryHost, memorySchema, type ResolvedEmbedder } from './config';
 import {
   pgvectorMetricSpec,
   type EmbedderProfileSpec,
@@ -218,7 +218,8 @@ export function candidateStorageFor(mode: ResolvedVecMode): {
   acceptedProfileIds?: readonly EmbeddingProfileId[];
   problem?: string;
 } {
-  const candidate = memoryHost().candidateStorage;
+  // Unconfigured (pure resolution in tests/diagnostics) ⇒ no override exists.
+  const candidate = isMemoryConfigured() ? memoryHost().candidateStorage : undefined;
   if (!candidate) return {};
   const accepted = candidate.acceptedProfileIds[mode as keyof typeof candidate.acceptedProfileIds];
   if (!accepted) return {};
