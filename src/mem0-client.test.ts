@@ -2,6 +2,7 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { satisfies } from '../../../../scripts/check-peer-dep-conflicts.mjs';
 import { patchEmbedderFactory, _setCurrentEmbedFnForTest } from './mem0-client';
 import { Mem0Backend } from './mem0-backend';
@@ -36,6 +37,39 @@ describe('installed mem0 peer compatibility', () => {
       expect(manifest.peerDependenciesMeta[name]?.optional).toBe(true);
     }
     expect(manifest.peerDependencies['@types/jest']).toBeUndefined();
+  });
+
+  it('resolves the host SDK using the tested mem0-specific compatibility override', () => {
+    const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
+    const host = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
+    const installed = JSON.parse(readFileSync(
+      resolve(dirname(require.resolve('@anthropic-ai/sdk')), 'package.json'), 'utf8',
+    ));
+    expect(satisfies(installed.version, host.overrides.mem0ai['@anthropic-ai/sdk'])).toBe(true);
+  });
+
+  it.each(['ESM', 'CommonJS'] as const)('runs the real mem0 %s Anthropic adapter with the host SDK', async (format) => {
+    // mem0's optional SDK peer predates the host's Agent SDK requirement. Prove
+    // its messages.create contract before widening that one package's edge.
+    const oss = format === 'ESM' ? await import('mem0ai/oss') : require('mem0ai/oss');
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      id: 'msg_mem0_sdk', type: 'message', role: 'assistant', model: 'claude-test',
+      content: [{ type: 'text', text: 'compatible' }], stop_reason: 'end_turn',
+      stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    const llm = oss.LLMFactory.create('anthropic', {
+      apiKey: 'test-key', baseURL: 'http://sdk-patch.test', model: 'claude-test', maxTokens: 8,
+    });
+    await expect(llm.generateResponse([
+      { role: 'system', content: 'Remember this.' }, { role: 'user', content: 'hello' },
+    ])).resolves.toBe('compatible');
+    expect(fetch).toHaveBeenCalledOnce();
+    const [url, init] = fetch.mock.calls[0];
+    expect(String(url)).toContain('/v1/messages');
+    expect(JSON.parse(String(init?.body))).toMatchObject({
+      model: 'claude-test', max_tokens: 8, system: 'Remember this.',
+      messages: [{ role: 'user', content: 'hello' }],
+    });
   });
 });
 
