@@ -370,6 +370,7 @@ describe('local-embedder-worker.script.mjs — the hot path falls back too', () 
         '  }',
         '  const pipe = async (text) => {',
         "    if (opts.device === 'cuda' && model === 'fail-inference') throw new Error('CUDA failure 2: out of memory');",
+        "    if (opts.device === 'cuda' && model === 'fail-ort-allocation') throw new Error('Failed to allocate memory for requested buffer of size 3221225472');",
         "    if (text === 'bad-input') throw new Error('input rejected');",
         // [device code, dtype passed?, text length]
         "    return { data: Float32Array.from([opts.device === 'cuda' ? 1 : 2, 'dtype' in opts ? 1 : 0, text.length]) };",
@@ -448,6 +449,25 @@ describe('local-embedder-worker.script.mjs — the hot path falls back too', () 
       device: 'cpu',
       demotion: { from: 'cuda', stage: 'inference', cause: 'CUDA failure 2: out of memory' },
     });
+  });
+
+  it('an ORT buffer-allocation failure without CUDA wording is retried on cpu and keeps the worker demoted', async () => {
+    const { results, devices } = await drive('cuda', [
+      { model: 'fail-ort-allocation', text: 'hello' },
+      { model: 'ok', text: 'hi' },
+    ]);
+    expect(results[0]).toMatchObject({ kind: 'embed_ok', vector: [2, 0, 5] });
+    expect(devices.filter((event) => event.model === 'fail-ort-allocation').at(-1)).toMatchObject({
+      model: 'fail-ort-allocation',
+      device: 'cpu',
+      demotion: {
+        from: 'cuda',
+        stage: 'inference',
+        cause: 'Failed to allocate memory for requested buffer of size 3221225472',
+      },
+    });
+    expect(results[1]).toMatchObject({ kind: 'embed_ok', vector: [2, 0, 2] });
+    expect(devices.filter((event) => event.model === 'ok').at(-1)).toMatchObject({ model: 'ok', device: 'cpu', demotion: null });
   });
 
   it('an input error on the GPU is the request’s own — no demotion', async () => {
