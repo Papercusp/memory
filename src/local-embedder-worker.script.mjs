@@ -348,7 +348,7 @@ const TRANSFORMERS_SPECIFIER =
   '@huggingface/transformers';
 
 /** An error that means the GPU itself failed, not the input. */
-const GPU_FAILURE_PATTERN = /\b(cuda|cudnn|cublas|curand|cufft|gpu|tensorrt)\b|out of memory/i;
+const GPU_FAILURE_PATTERN = /\b(cuda|cudnn|cublas|curand|cufft|gpu|tensorrt)\b|out of memory|failed to allocate memory for requested buffer/i;
 
 function errorMessage(err) {
   return err && err.message ? err.message : String(err);
