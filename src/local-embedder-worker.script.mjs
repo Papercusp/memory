@@ -501,10 +501,40 @@ async function runEmbed(msg, entry, attempt = 1) {
   return Array.from(result.data);
 }
 
+// WI-10006567: retirement. `Worker#terminate()` while an onnxruntime-node run
+// is in flight destroys this thread's environment under the native call; when
+// the run completes it throws a Napi::Error nothing can catch and the WHOLE
+// PROCESS aborts (SIGABRT). So the host never terminates a worker that owes
+// answers: it sends {kind:'retire'}, this thread starts no new inference,
+// finishes the runs already started, and answers {kind:'retired'} once none is
+// left. Only then does the host terminate it.
+let retired = false;
+let retiredAnnounced = false;
+let inFlight = 0;
+function announceRetiredIfIdle() {
+  if (!retired || inFlight > 0 || retiredAnnounced) return;
+  retiredAnnounced = true;
+  parentPort.postMessage({ kind: 'retired' });
+}
+
 parentPort.on('message', async (msg) => {
   if (!msg || typeof msg !== 'object') return;
+  if (msg.kind === 'retire') {
+    retired = true;
+    announceRetiredIfIdle();
+    return;
+  }
   if (msg.kind !== 'embed') return;
+  inFlight++;
+  try {
+    await handleEmbed(msg);
+  } finally {
+    inFlight--;
+    announceRetiredIfIdle();
+  }
+});
 
+async function handleEmbed(msg) {
   const { id, model } = msg;
   // BGE-small defaults (mean pooling, normalized) when unspecified; Gemma passes
   // normalize:false and truncate-then-normalizes in the caller (MRL).
@@ -521,6 +551,9 @@ parentPort.on('message', async (msg) => {
   try {
     if (msg.traceNativeInference) await prepareNativeInferenceTrace();
     const entry = await getPipeline(key);
+    // A retiring worker's caller was already rejected by the host: starting the
+    // run now would only lengthen the drain before it can be terminated.
+    if (retired) throw new Error('embedder worker retired before this request reached inference');
     let vector;
     try {
       vector = await runEmbed(msg, entry);
@@ -529,7 +562,7 @@ parentPort.on('message', async (msg) => {
       // error) is a device failure, not a bad input: rebuild this model on the
       // CPU and retry once, so the GPU stays opportunistic and never becomes a
       // way for embeds to fail. Any other error is the request's own.
-      if (entry.device === 'cpu' || !GPU_FAILURE_PATTERN.test(errorMessage(err))) throw err;
+      if (retired || entry.device === 'cpu' || !GPU_FAILURE_PATTERN.test(errorMessage(err))) throw err;
       const demotion = device === 'cpu' ? null : demote('inference', err);
       pipelinesByModel.delete(key);
       const t = await loadTransformers();
@@ -552,7 +585,7 @@ parentPort.on('message', async (msg) => {
       error: err && err.message ? err.message : String(err),
     });
   }
-});
+}
 
 // Signal ready as soon as the message handler is installed. The model
 // loads lazily on first embed call.
