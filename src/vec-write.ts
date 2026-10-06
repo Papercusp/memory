@@ -185,8 +185,13 @@ export function resolveMemoryVectorBinding(
   resolved: Exclude<ResolvedEmbedder, { mode: 'disabled' }>,
 ): { binding?: ResolvedMemoryVectorBinding; problems: string[] } {
   const mode = resolved.mode as ResolvedVecMode;
-  const storage = MEMORY_VECTOR_STORAGE_PROFILES[mode];
-  if (!storage) return { problems: [`no memory vector storage is declared for mode ${resolved.mode}`] };
+  const declared = MEMORY_VECTOR_STORAGE_PROFILES[mode];
+  if (!declared) return { problems: [`no memory vector storage is declared for mode ${resolved.mode}`] };
+  const candidate = candidateStorageFor(mode);
+  if (candidate.problem) return { problems: [candidate.problem] };
+  const storage: MemoryVectorStorageProfile = candidate.acceptedProfileIds
+    ? { ...declared, acceptedProfileIds: candidate.acceptedProfileIds }
+    : declared;
   const problems = validateMemoryStorageCompatibility(resolved.profile, storage);
   if (resolved.dims !== resolved.profile.targetDims) {
     problems.push(
@@ -196,6 +201,36 @@ export function resolveMemoryVectorBinding(
   return problems.length === 0
     ? { binding: { mode, profile: resolved.profile, storage }, problems }
     : { problems };
+}
+
+/** Schemas a candidate storage override may never target: the shared
+ *  production memory schema and the library default. */
+const NON_CANDIDATE_SCHEMAS: ReadonlySet<string> = new Set(['harness_shared', 'public']);
+
+/**
+ * The host's benchmark-only candidate acceptance for one mode (see
+ * `MemoryHost.candidateStorage`). Fails CLOSED: an override declared for a
+ * shared/default schema, or for a schema other than the active one, is a
+ * binding problem — never a silent fallback to (or widening of) production
+ * acceptance. No override for this mode ⇒ the declared production profile.
+ */
+export function candidateStorageFor(mode: ResolvedVecMode): {
+  acceptedProfileIds?: readonly EmbeddingProfileId[];
+  problem?: string;
+} {
+  const candidate = memoryHost().candidateStorage;
+  if (!candidate) return {};
+  const accepted = candidate.acceptedProfileIds[mode as keyof typeof candidate.acceptedProfileIds];
+  if (!accepted) return {};
+  if (NON_CANDIDATE_SCHEMAS.has(candidate.schema)) {
+    return { problem: `candidate storage is refused on shared schema ${candidate.schema}` };
+  }
+  const active = memorySchema();
+  if (active !== candidate.schema) {
+    return { problem: `candidate storage declared for schema ${candidate.schema} but the active memory schema is ${active}` };
+  }
+  if (accepted.length === 0) return { problem: `candidate storage for ${mode} accepts no profile` };
+  return { acceptedProfileIds: accepted as readonly EmbeddingProfileId[] };
 }
 
 /** The parameterized vec-upsert statement for one mode ($1 = memory_id,

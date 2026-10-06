@@ -75,6 +75,24 @@ export interface MemoryHost {
   buildEmbedderForMode: (mode: 'openai' | 'local' | 'gemma' | 'harrier') => Promise<EmbedFn>;
 
   /**
+   * Optional, BENCHMARK-ONLY: let one isolated schema's physical vector tables
+   * accept a candidate embedding profile instead of the production profile.
+   *
+   * A candidate model (e.g. mDenseOn) has no production `EmbedderMode`, so the
+   * complete production memory path (mem0 client, entity linking, canonical
+   * vector/lexical search, decay) would refuse to bind it. This seam REPLACES a
+   * mode's accepted profile ids — never widens — and is honored ONLY when the
+   * active `schema` equals `schema` here and is not a shared/default schema
+   * (`harness_shared` / `public`). Any other combination fails closed in
+   * `resolveMemoryVectorBinding`, so candidate vectors can never enter a
+   * production vector space. Production hosts never set it.
+   */
+  candidateStorage?: {
+    schema: string;
+    acceptedProfileIds: Partial<Record<'openai' | 'local' | 'gemma' | 'harrier', readonly string[]>>;
+  };
+
+  /**
    * Optional: adaptive extraction instructions fed to mem0's
    * `customInstructions`. The operator's learning loop supplies these;
    * the package treats it as a black box. Default: none.
