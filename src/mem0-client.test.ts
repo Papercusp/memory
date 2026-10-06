@@ -1,10 +1,42 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname, resolve } from 'node:path';
+import { satisfies } from '../../../../scripts/check-peer-dep-conflicts.mjs';
 import { patchEmbedderFactory, _setCurrentEmbedFnForTest } from './mem0-client';
 import { Mem0Backend } from './mem0-backend';
 import type { MemoryClient } from './mem0-client';
 
 afterEach(() => {
   vi.restoreAllMocks();
+});
+
+describe('installed mem0 peer compatibility', () => {
+  const require = createRequire(import.meta.url);
+  const manifest = JSON.parse(readFileSync(
+    resolve(dirname(require.resolve('mem0ai/oss')), '../../package.json'), 'utf8',
+  )) as {
+    peerDependencies: Record<string, string>;
+    peerDependenciesMeta: Record<string, { optional?: boolean }>;
+  };
+
+  it('accepts the host pg and type packages without forcing obsolete exact versions', () => {
+    // mem0 3.1.8 pinned pg 8.11.3 and @types/pg 8.11.0, rejecting the
+    // compatible versions used by our injected PostgreSQL memory store.
+    for (const name of ['pg', '@types/pg']) {
+      const installed = JSON.parse(readFileSync(require.resolve(`${name}/package.json`), 'utf8'));
+      expect(satisfies(installed.version, manifest.peerDependencies[name])).toBe(true);
+    }
+  });
+
+  it('keeps unused upstream stores and test tooling out of required runtime peers', () => {
+    // The host supplies its own store; it does not use mem0's natural/PGVector
+    // adapters. These peers are optional upstream, and Jest is test-only.
+    for (const name of ['pg', '@types/pg', 'natural']) {
+      expect(manifest.peerDependenciesMeta[name]?.optional).toBe(true);
+    }
+    expect(manifest.peerDependencies['@types/jest']).toBeUndefined();
+  });
 });
 
 /**
