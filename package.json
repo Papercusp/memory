@@ -26,6 +26,9 @@
     "pg": "^8.20.0",
     "tokenizers": "0.23.2"
   },
+  "optionalDependencies": {
+    "@huggingface/transformers": "4.2.0"
+  },
   "devDependencies": {
     "@types/pg": "^8.15.5",
     "vitest": "^4.1.4"
