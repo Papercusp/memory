@@ -326,6 +326,18 @@ describe('buildSidecarFirstEmbedder', () => {
     expect(transitions).toEqual(['down']); // transition-only, not per-attempt
   });
 
+  it.each([
+    Object.assign(new Error('connect failed'), { code: 'ECONNREFUSED' }),
+    new DOMException('request aborted', 'AbortError'),
+  ])('preserves the exact terminal provider cause for diagnostics: $name', async (cause) => {
+    const embed = buildSidecarFirstEmbedder({
+      model: 'gemma', kind: 'query', url: 'http://127.0.0.1:1', maxAttempts: 1,
+      fallback: () => async () => [0], fetchFn: async () => { throw cause; },
+      onTransition: () => {},
+    });
+    await expect(embed('abc')).rejects.toMatchObject({ cause });
+  });
+
   it('caller abort closes the sidecar attempt and never retries stale work (WI-41248)', async () => {
     let fetchAttempts = 0;
     const abortingFetch = ((_url: string, init: RequestInit) => {
@@ -408,7 +420,10 @@ describe('buildSidecarFirstEmbedder', () => {
       onTransition: (state) => transitions.push(state),
     });
 
-    await expect(embed('abc')).rejects.toThrow(/sidecar_rejected_request/);
+    await expect(embed('abc')).rejects.toMatchObject({
+      message: expect.stringContaining('sidecar_rejected_request'),
+      cause: expect.any(SidecarEmbedHttpError),
+    });
     expect(fetchAttempts).toBe(1); // no retry budget burned on a request that can never succeed
     expect(fallbackBuilds).toBe(0);
     expect(transitions).toEqual(['rejected']); // never 'down' — the sidecar IS up
