@@ -393,11 +393,13 @@ export function buildSidecarFirstEmbedder(opts: SidecarFirstEmbedderOpts): Embed
           `sidecar_rejected_request: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
             `(${currentUrl}, ${opts.model}:${opts.kind}) — the sidecar rejected this request (non-retryable); ` +
             'check payload shape/size — this is not a downtime issue',
+          { cause: lastErr },
         )
       : new Error(
           `sidecar_required_unavailable: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
             `(${currentUrl}, ${opts.model}:${opts.kind}, budget ${timeoutMs}ms) — embedding requires the sidecar; ` +
             'writes are parked in the memory write journal and auto-recover when it returns',
+          { cause: lastErr },
         );
   };
 }
