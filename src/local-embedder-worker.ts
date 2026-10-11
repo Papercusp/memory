@@ -26,6 +26,7 @@ import { availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname, isAbsolute, join } from 'node:path';
 import { dynamicImport } from './dynamic-import';
+import { observeFallback } from './config';
 import { applyWorkerDeviceReport, constructEmbedPipeline, currentEmbedDeviceDecision } from './embed-device';
 
 interface PendingRequest {
@@ -848,7 +849,7 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
   cancelIdleUnload();
 
   const id = state.nextId++;
-  return new Promise<number[]>((resolveEmbed, rejectEmbed) => {
+  const vector = await new Promise<number[]>((resolveEmbed, rejectEmbed) => {
     state.pending.set(id, { resolve: resolveEmbed, reject: rejectEmbed, onInputTrace: opts.onInputTrace,
       onInferenceTrace: opts.onInferenceTrace, onNativeInferenceTrace: opts.onNativeInferenceTrace });
     // Ref BEFORE posting: between the post and the reply the caller is awaiting
@@ -869,6 +870,8 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
       ...(opts.onNativeInferenceTrace ? { traceNativeInference: true } : {}),
     });
   });
+  observeFallback('embed-worker', { eligible: 1, applied: 1, reason: 'worker-completed' });
+  return vector;
 }
 
 /** Test seam — drop the worker and reset state. Kept as the underlying
@@ -1125,6 +1128,8 @@ export function isEmbedWorkerShutdownError(err: unknown): boolean {
  */
 const FALLBACK_WARN_COOLDOWN_MS = 30_000;
 export function warnEmbedFallback(model: string, err: unknown): void {
+  observeFallback('embed-worker', { eligible: 1, applied: 0,
+    reason: err === 'worker-disabled' ? 'worker-disabled' : 'worker-failed' });
   const now = Date.now();
   if (now - state.lastFallbackWarnAt < FALLBACK_WARN_COOLDOWN_MS) return;
   state.lastFallbackWarnAt = now;
@@ -1263,6 +1268,8 @@ export async function buildLocalEmbedder(): Promise<(text: string) => Promise<nu
         if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
         warnEmbedFallback('local', err);
       }
+    } else {
+      warnEmbedFallback('local', 'worker-disabled');
     }
 
     // Inline (main-thread) fallback path.

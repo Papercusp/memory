@@ -53,6 +53,7 @@
  */
 
 import { existsSync, readdirSync } from 'node:fs';
+import { observeFallback } from './config';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 
@@ -325,6 +326,7 @@ export function recordEmbedPipelineDevice(model: string, device: EmbedDevice): v
  * failures in the same process are consequences, not new information.
  */
 export function recordEmbedDeviceDemotion(demotion: Omit<EmbedDeviceDemotion, 'at'> & { at?: string }): void {
+  observeFallback('embed-device', { eligible: 1, applied: 0, reason: `gpu-${demotion.stage}-failed` });
   if (state.demotion) return;
   state.demotion = { ...demotion, at: demotion.at ?? new Date().toISOString() };
   console.warn(
@@ -362,6 +364,10 @@ export function applyWorkerDeviceReport(msg: unknown): boolean {
       stage: d.stage,
       cause: typeof d.cause === 'string' ? d.cause : String(d.cause),
     });
+  } else if (m.device === 'cuda') {
+    observeFallback('embed-device', { eligible: 1, applied: 1, reason: 'gpu-constructed' });
+  } else if (state.demotion) {
+    observeFallback('embed-device', { eligible: 1, applied: 0, reason: 'sticky-gpu-demotion' });
   }
   return true;
 }
@@ -391,11 +397,13 @@ export async function constructEmbedPipeline<P>(
   if (device === 'cpu') {
     const p = await build('cpu');
     recordEmbedPipelineDevice(model, 'cpu');
+    if (state.demotion) observeFallback('embed-device', { eligible: 1, applied: 0, reason: 'sticky-gpu-demotion' });
     return p;
   }
   try {
     const p = await build(device);
     recordEmbedPipelineDevice(model, device);
+    observeFallback('embed-device', { eligible: 1, applied: 1, reason: 'gpu-constructed' });
     return p;
   } catch (err) {
     recordEmbedDeviceDemotion({ from: device, to: 'cpu', model, stage: 'construct', cause: errMessage(err) });

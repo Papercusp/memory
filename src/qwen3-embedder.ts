@@ -101,6 +101,8 @@ export function buildQwen3Embedder(opts: {
         if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
         warnEmbedFallback('qwen3', err);
       }
+    } else {
+      warnEmbedFallback('qwen3', 'worker-disabled');
     }
 
     // Inline (main-thread) fallback — same thread-cap rationale as the worker.

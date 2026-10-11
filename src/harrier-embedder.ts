@@ -136,6 +136,8 @@ export function buildHarrierEmbedder(opts: {
         if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
         warnEmbedFallback('harrier', err);
       }
+    } else {
+      warnEmbedFallback('harrier', 'worker-disabled');
     }
 
     // Inline (main-thread) fallback — same direct model call as the worker.

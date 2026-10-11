@@ -173,6 +173,8 @@ export function buildGemmaEmbedder(opts: {
         if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
         warnEmbedFallback('gemma', err);
       }
+    } else {
+      warnEmbedFallback('gemma', 'worker-disabled');
     }
 
     // Inline (main-thread) fallback.

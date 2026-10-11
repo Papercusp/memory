@@ -121,6 +121,8 @@ export function buildGraniteEmbedder(opts: {
         if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
         warnEmbedFallback(`granite-${variant}`, err);
       }
+    } else {
+      warnEmbedFallback(`granite-${variant}`, 'worker-disabled');
     }
 
     // Inline (main-thread) fallback — same thread-cap rationale as the worker.

@@ -46,6 +46,8 @@ export interface MemoryCredentials {
 }
 
 export interface MemoryHost {
+  /** Optional host sink for fallback decisions; the library never owns delivery or storage. */
+  observeFallback?: (mechanism: string, decision: { eligible: number; applied: number; reason: string }) => unknown;
   /**
    * Resolve the harness-admin Postgres URL the store should connect to.
    * Replaces the operator's `@/lib/embedded-pg-discovery`. May be sync
@@ -235,6 +237,11 @@ export function memoryHost(): MemoryHost {
 /** Test/diagnostic helper: is a host wired? */
 export function isMemoryConfigured(): boolean {
   return state.host != null;
+}
+
+/** Instrumentation must neither require a configured store nor fail a model call. */
+export function observeFallback(mechanism: string, decision: { eligible: number; applied: number; reason: string }): void {
+  try { state.host?.observeFallback?.(mechanism, decision); } catch { /* Best effort host sink. */ }
 }
 
 /**
