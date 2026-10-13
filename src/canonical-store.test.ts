@@ -533,9 +533,17 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     expect(q.sql).toContain("lower(payload->>'name') AS nm");
     expect(q.sql).toContain("lower(payload->>'description') AS ds");
     expect(q.sql).toContain("lower(payload->>'data') AS dt");
-    expect(q.sql).toContain('dt LIKE');
-    expect(q.sql).toContain('nm LIKE');
-    expect(q.sql).toContain('ds LIKE');
+    // P-007 (papercusp-performance-audit-2026-10-12): literal substring tests via
+    // strpos, never a LIKE pattern — same predicate for a literal token, measured
+    // ~2.8x cheaper matching on the live store.
+    expect(q.sql).toContain('strpos(dt, $');
+    expect(q.sql).toContain('strpos(nm, $');
+    expect(q.sql).toContain('strpos(ds, $');
+    expect(q.sql).not.toMatch(/\b(nm|ds|dt) I?LIKE\b/);
+    // P-007: the GENERATED canonical discriminator rides beside the jsonb probe so the
+    // planner can BitmapAnd the partial row_kind index with the scope index instead of
+    // fetching and discarding every entity row in scope (~92% of the table).
+    expect(q.sql).toContain("row_kind = 'memory'");
     // Exactly one extraction per field, however many tokens the query has.
     expect(q.sql.match(/payload->>'name'/g)).toHaveLength(1);
     expect(q.sql.match(/payload->>'description'/g)).toHaveLength(1);
@@ -552,11 +560,11 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     expect(q.sql).not.toContain('SELECT id, payload, valid_at');
     expect(q.sql).not.toContain('memory_vec'); // never touches an embedding table
     expect(q.params).toContain('scope-a');
-    expect(q.params).toContain('%embed%');
-    expect(q.params).toContain('%sidecar%');
-    expect(q.params).toContain('%concurrency%');
+    expect(q.params).toContain('embed');
+    expect(q.params).toContain('sidecar');
+    expect(q.params).toContain('concurrency');
     // One param per token (not one per field) — the field CASEs reuse it.
-    expect(q.params.filter((p) => p === '%embed%')).toHaveLength(1);
+    expect(q.params.filter((p) => p === 'embed')).toHaveLength(1);
   });
 
   it('scores IN SQL with the field weights, and RANKS BY THAT SCORE — never by recency', async () => {
@@ -571,7 +579,7 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     await store.lexicalSearch('embed sidecar', 5, { user_id: 'u' });
     const { sql, params } = queries[0];
     // The weights live in SQL: name ×3 > description ×2 > data ×1, per token.
-    expect(sql).toContain('CASE WHEN nm LIKE');
+    expect(sql).toContain('CASE WHEN strpos(nm, $');
     expect(sql).toContain('THEN 3 WHEN');
     expect(sql).toContain('THEN 2 WHEN');
     expect(sql).toContain('THEN 1 ELSE 0 END');
@@ -584,16 +592,20 @@ describe('CanonicalVectorStore lexicalSearch (WI-4214 embed-free fallback)', () 
     // of the match chain — measured 761 ms vs 430 ms at 24 tokens. Rows that score 0
     // are already excluded by the match predicate below.
     expect(sql).not.toContain('lex_raw > 0');
-    expect(sql).toMatch(/WHERE \(nm LIKE/);
+    expect(sql).toMatch(/WHERE \(strpos\(nm, \$\d+\) > 0/);
     // NOT a recency-ranked candidate pull, and no candidate cap above topK.
     expect(sql).not.toContain('ORDER BY created_at DESC');
     expect(params.at(-1)).toBe(5); // the only LIMIT is topK itself
   });
 
-  it('escapes the LIKE single-char wildcard in tokens (user_id matches literally)', async () => {
+  it('passes tokens as raw literals to strpos — no pattern, so `_` is never a wildcard', async () => {
     const { store, queries } = makeLexStore([]);
     await store.lexicalSearch('user_id', 5);
-    expect(queries[0].params).toContain('%user\\_id%');
+    // strpos has no wildcards, so the token goes in unescaped; an escaped
+    // `user\_id` here would search for a literal backslash and never match.
+    expect(queries[0].params).toContain('user_id');
+    expect(queries[0].params).not.toContain('user\\_id');
+    expect(queries[0].params.some((p) => typeof p === 'string' && p.includes('%'))).toBe(false);
   });
 
   it('a query with no usable tokens returns [] WITHOUT querying', async () => {

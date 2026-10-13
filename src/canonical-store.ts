@@ -247,7 +247,7 @@ function entityFilterEnabled(): boolean {
 
 /**
  * Cap on query tokens for the lexical leg — bounds the per-token CASE chain in
- * `lexicalSearch` (worst case 32 × 3 ILIKEs/row) so a pasted wall of text can't
+ * `lexicalSearch` (worst case 32 × 3 substring tests/row) so a pasted wall of text can't
  * build an unbounded query.
  *
  * ⚠ It must stay WELL ABOVE a real query's length, and 12 did NOT (that is why
@@ -375,6 +375,30 @@ function storeKindCond(alias: string, kind: 'memory' | 'entity'): string {
  * memory recall: drift degrades speed, never correctness.
  */
 function vecKindCond(alias: string, kind: 'memory' | 'entity'): string {
+  return `${alias}row_kind = '${kind}'`;
+}
+
+/**
+ * The discriminator against `memory_canonical.row_kind` itself — for reads that
+ * scan the canonical table alone (no `v` join), i.e. `lexicalSearch`.
+ *
+ * Unlike the vec-side mirror, this column cannot drift: migration 757 made it a
+ * STORED GENERATED column computed from the very rule `storeKindCond` expresses,
+ * and Postgres refuses a hand-set value. What it buys is an INDEX: `payload ?
+ * 'entityType'` is a jsonb probe the planner can only apply after fetching each
+ * heap row, while `row_kind = 'memory'` matches the partial
+ * `memory_canonical_row_kind_memory_idx`, which the planner BitmapAnds with the
+ * scope index. Entity rows are ~92% of the table (102,133 of 110,681 live,
+ * 2026-10-13), so without it a scoped lexical read fetches and discards them all.
+ *
+ * Measured live (papercusp-performance-audit-2026-10-12 P-007, scope
+ * `harness:papercusp`, 20-token query, 8 interleaved EXPLAIN ANALYZE runs):
+ * heap rows fetched 72,258 → 3,884, heap blocks 6,925 → 2,935, and the
+ * scan-plus-extraction floor 161 → 115 ms median. Callers keep `storeKindCond`
+ * beside it as the generic lib's own contract; it then runs only on the
+ * memory rows that survive the index, so it is cheap.
+ */
+function canonicalRowKindCond(alias: string, kind: 'memory' | 'entity'): string {
   return `${alias}row_kind = '${kind}'`;
 }
 
@@ -841,7 +865,11 @@ export class CanonicalVectorStore {
     const { temporal, rest } = splitTemporalControls(controls);
     const params: unknown[] = [];
     let idx = 1;
-    const conds: string[] = [storeKindCond('', this.storeKind), archivedCond('', eligible, params, () => idx++)];
+    const conds: string[] = [
+      canonicalRowKindCond('', this.storeKind),
+      storeKindCond('', this.storeKind),
+      archivedCond('', eligible, params, () => idx++),
+    ];
     if (rest) {
       for (const [key, value] of Object.entries(rest)) {
         if (value === undefined || value === null) continue;
@@ -870,9 +898,10 @@ export class CanonicalVectorStore {
     // silently breaks EXACT-IDENTIFIER recall, which is this leg's entire job
     // (a rare identifier in an old row never enters the candidate pool).
     //
-    // `_` is a LIKE single-char wildcard and survives the tokenizer — escape it
-    // so a token like `user_id` matches literally. ONE param per token, reused
-    // across the three fields AND across the pre-filter below.
+    // A token like `user_id` must match literally — `_` survives the tokenizer.
+    // The substring test is `strpos` (P-007, below), which takes the raw token and
+    // has no wildcards at all. ONE param per token, reused across the three fields
+    // AND across the pre-filter below.
     //
     // ⚠ EI-10931 — WHY THERE IS AN OR PRE-FILTER (there deliberately wasn't one, and
     // that was the bug). Scoring in the SELECT list with `lex_raw > 0` applied in the
@@ -930,17 +959,33 @@ export class CanonicalVectorStore {
     const scoreTerms: string[] = [];
     const matchTerms: string[] = [];
     // P-004: tokens are already lowercase. Lower each field once inside the
-    // existing OFFSET fence, then use LIKE. Repeating ILIKE lowercased the same
-    // potentially long field for every token in both filtering and scoring.
-    // Keep PostgreSQL's own lower/collation semantics (never JS-normalize stored
-    // text), NULL behavior, escaping, scope, validity and rank-before-limit.
+    // existing OFFSET fence. Repeating ILIKE lowercased the same potentially long
+    // field for every token in both filtering and scoring. Keep PostgreSQL's own
+    // lower/collation semantics (never JS-normalize stored text), NULL behavior,
+    // scope, validity and rank-before-limit.
+    //
+    // papercusp-performance-audit-2026-10-12 P-007 — substring test is
+    // `strpos(field, token) > 0`, NOT `field LIKE '%token%'`. A token is a LITERAL,
+    // so the two are the same predicate: under the database's deterministic
+    // collation both compare bytes; `strpos(NULL, t)` is NULL exactly where
+    // `NULL LIKE p` is (so the CASE falls through and the OR stays three-valued
+    // identically); and an empty needle matches like `'%%'` does. The token goes in
+    // raw — there is no pattern, so `_` / `%` / `\` can never act as wildcards and
+    // need no escaping. What differs is only the matcher: LIKE's generic
+    // `%`-pattern walker vs strpos's substring search, and this query does
+    // ~(tokens × 3) of them per candidate row over fields that average ~1.9 KB.
+    // Measured live (scope `harness:papercusp`, 3,884 memory rows, 20-token
+    // query, 8 interleaved EXPLAIN ANALYZE runs): LIKE 503 ms median vs strpos
+    // 290 ms, against a 173 ms no-match floor — matching cost ~330 → ~117 ms; full
+    // ranked output (2,519 / 878 / 39 rows on three scopes) md5-identical.
+    // The real-PG parity guard is canonical-lexical-search.integration.test.ts.
     for (const t of tokens) {
-      params.push(`%${t.replace(/[\\%_]/g, (m) => `\\${m}`)}%`);
+      params.push(t);
       const p = `$${idx++}`;
       scoreTerms.push(
-        `CASE WHEN nm LIKE ${p} THEN 3 WHEN ds LIKE ${p} THEN 2 WHEN dt LIKE ${p} THEN 1 ELSE 0 END`,
+        `CASE WHEN strpos(nm, ${p}) > 0 THEN 3 WHEN strpos(ds, ${p}) > 0 THEN 2 WHEN strpos(dt, ${p}) > 0 THEN 1 ELSE 0 END`,
       );
-      matchTerms.push(`nm LIKE ${p} OR ds LIKE ${p} OR dt LIKE ${p}`);
+      matchTerms.push(`strpos(nm, ${p}) > 0 OR strpos(ds, ${p}) > 0 OR strpos(dt, ${p}) > 0`);
     }
     const rawScore = scoreTerms.join(' + ');
     params.push(topK);
