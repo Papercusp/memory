@@ -17,12 +17,11 @@
  */
 
 import { parentPort, workerData, threadId } from 'node:worker_threads';
-import { readFileSync, readlinkSync, realpathSync, openSync, readSync, writeSync, closeSync, fstatSync } from 'node:fs';
-import { isAbsolute, join } from 'node:path';
-import { availableParallelism } from 'node:os';
+import { readFileSync, readlinkSync, realpathSync, openSync, readSync, writeSync, closeSync, fstatSync, mkdirSync } from 'node:fs';
+import { isAbsolute, join, dirname } from 'node:path';
+import { availableParallelism, homedir } from 'node:os';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRequire } from 'node:module';
-import { dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
@@ -347,6 +346,20 @@ const TRANSFORMERS_SPECIFIER =
   (workerData && typeof workerData.transformersSpecifier === 'string' && workerData.transformersSpecifier) ||
   '@huggingface/transformers';
 
+/** Keep shipped package assets readable while putting every new Transformers.js
+ *  cache write under this Papercusp home. The package root override is a worker
+ *  test seam; production resolves the installed package entry. */
+function configureTransformersCache(t) {
+  const packageRoot = workerData && typeof workerData.transformersPackageRoot === 'string'
+    ? workerData.transformersPackageRoot
+    : dirname(dirname(createRequire(import.meta.url).resolve('@huggingface/transformers')));
+  const papercuspHome = process.env.PAPERCUSP_HOME || join(homedir(), '.papercusp');
+  const cacheDir = join(papercuspHome, 'cache', 'transformers');
+  mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+  t.env.localModelPath = join(packageRoot, '.cache');
+  t.env.cacheDir = cacheDir;
+}
+
 /** An error that means the GPU itself failed, not the input. */
 const GPU_FAILURE_PATTERN = /\b(cuda|cudnn|cublas|curand|cufft|gpu|tensorrt)\b|out of memory|failed to allocate memory for requested buffer/i;
 
@@ -365,6 +378,7 @@ function loadTransformers() {
     // Dynamic import keeps the worker spawn cheap when @huggingface/transformers
     // isn't installed — the package only loads on first embed.
     transformersPromise = import(TRANSFORMERS_SPECIFIER).then((t) => {
+      configureTransformersCache(t);
       if (
         process.env.PAPERCUSP_DISTRIBUTION_PROFILE === 'vm-release' ||
         process.env.PAPERCUSP_TRANSFORMERS_LOCAL_ONLY === '1'
