@@ -210,8 +210,9 @@ describe('local-embedder-worker Transformers.js cache', () => {
       }
     `);
 
-    const scriptPath = resolve(fileURLToPath(import.meta.url), '..', 'local-embedder-worker.script.mjs');
+    const scriptPath = resolve(__dirname, 'local-embedder-worker.script.mjs');
     const worker = new Worker(scriptPath, {
+      // `test:file` may place committed-source-loader in process.execArgv; this test must run the worker under test.
       execArgv: [],
       env: { ...process.env, PAPERCUSP_HOME: home },
       workerData: {
