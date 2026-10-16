@@ -38,9 +38,11 @@ import {
   MemoryUnavailableError,
   scopesOf,
   type ListOptions,
+  type ListPageOptions,
   type MemoryAvailability,
   type MemoryBackend,
   type MemoryEntry,
+  type MemoryListPage,
   type RememberOptions,
   type SearchOptions,
   type UpdatePatch,
@@ -183,6 +185,14 @@ export class ClaudeFileMemoryBackend implements MemoryBackend {
       }
     }
     return [...merged.values()].sort((a, b) => Number(b.metadata?.mtimeMs ?? 0) - Number(a.metadata?.mtimeMs ?? 0));
+  }
+
+  async listPage(opts: ListPageOptions): Promise<MemoryListPage> {
+    const entries = await this.list(opts);
+    return {
+      entries: entries.slice(opts.offset, opts.offset + opts.limit),
+      total: entries.length,
+    };
   }
 
   async get(id: string): Promise<MemoryEntry | null> {

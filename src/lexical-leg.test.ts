@@ -100,4 +100,12 @@ describe('LexicalLegBackend', () => {
     expect(inner.forget).toHaveBeenCalledWith('id-1');
     expect(inner.update).toHaveBeenCalledWith('id-1', { text: 'new' });
   });
+
+  it('bounded listPage delegates when the wrapped store supports it', async () => {
+    const listPage = vi.fn(async () => ({ entries: [], total: 0 }));
+    const inner = makeInner({ listPage });
+    const leg = new LexicalLegBackend(inner);
+    await leg.listPage({ scope: 's', limit: 5, offset: 10 });
+    expect(listPage).toHaveBeenCalledWith({ scope: 's', limit: 5, offset: 10 });
+  });
 });

@@ -16,9 +16,11 @@
 import {
   MemoryUnavailableError,
   type ListOptions,
+  type ListPageOptions,
   type MemoryAvailability,
   type MemoryBackend,
   type MemoryEntry,
+  type MemoryListPage,
   type RememberOptions,
   type SearchOptions,
   type UpdatePatch,
@@ -48,6 +50,10 @@ export class NoopBackend implements MemoryBackend {
 
   async list(_opts: ListOptions): Promise<MemoryEntry[]> {
     return [];
+  }
+
+  async listPage(_opts: ListPageOptions): Promise<MemoryListPage> {
+    return { entries: [], total: 0 };
   }
 
   async get(_id: string): Promise<MemoryEntry | null> {

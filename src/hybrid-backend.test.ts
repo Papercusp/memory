@@ -1308,4 +1308,15 @@ describe("per-leg queries — SearchOptions.lexicalQuery (context-injection-audi
     ).toEqual([]);
     expect(asked.lexical).toEqual([]);
   });
+
+  it('delegates bounded listing to the cosine source of truth', async () => {
+    const listPage = vi.fn(async () => ({ entries: [e('paged')], total: 1 }));
+    const cosine = fakeBackend('cosine', [], { listPage });
+    const hy = new HybridBackend(fakeBackend('lexical', []), cosine);
+    await expect(hy.listPage({ scope: 's', limit: 1, offset: 0 })).resolves.toEqual({
+      entries: [e('paged')],
+      total: 1,
+    });
+    expect(listPage).toHaveBeenCalledWith({ scope: 's', limit: 1, offset: 0 });
+  });
 });

@@ -37,10 +37,12 @@
  */
 import type {
   ListOptions,
+  ListPageOptions,
   MemoryAvailability,
   MemoryBackend,
   ManagedMemoryWrites,
   MemoryEntry,
+  MemoryListPage,
   RememberOptions,
   SearchLegStats,
   SearchOptions,
@@ -255,6 +257,14 @@ export class HybridBackend implements MemoryBackend {
 
   list(opts: ListOptions): Promise<MemoryEntry[]> {
     return this.cosine.list(opts);
+  }
+
+  listPage(opts: ListPageOptions): Promise<MemoryListPage> {
+    if (this.cosine.listPage) return this.cosine.listPage(opts);
+    return this.cosine.list(opts).then((entries) => ({
+      entries: entries.slice(opts.offset, opts.offset + opts.limit),
+      total: entries.length,
+    }));
   }
 
   async search(query: string, opts: SearchOptions): Promise<MemoryEntry[]> {

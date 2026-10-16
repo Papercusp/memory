@@ -597,6 +597,34 @@ describe('Mem0Backend.list', () => {
     const out = await be.list({ scope: ['userA', 'userB'] });
     expect(out.map((e) => e.id)).toEqual(['dup']);
   });
+
+  it('listPage counts scopes without materializing skipped rows, then reads only the intersecting page', async () => {
+    const calls: Array<{ scope: string; topK: number; offset: number }> = [];
+    const listPage = vi.fn(async (filters: Record<string, string>, topK: number, offset: number) => {
+      const scope = filters.user_id!;
+      calls.push({ scope, topK, offset });
+      const total = scope === 'userA' ? 25 : 3;
+      if (topK === 0) return { rows: [], total };
+      return {
+        rows: Array.from({ length: Math.min(topK, total - offset) }, (_, i) => ({
+          id: `${scope}-${offset + i}`,
+          payload: { data: `${scope} fact ${offset + i}`, user_id: scope },
+        })),
+        total,
+      };
+    });
+    const be = new Mem0Backend({ getClient: async () => stubClient(), listPage });
+
+    const out = await be.listPage({ scope: ['userA', 'harness:x'], offset: 20, limit: 4 });
+
+    expect(out.total).toBe(28);
+    expect(out.entries.map((entry) => entry.id)).toEqual(['userA-20', 'userA-21', 'userA-22', 'userA-23']);
+    expect(calls).toEqual([
+      { scope: 'userA', topK: 0, offset: 0 },
+      { scope: 'harness:x', topK: 0, offset: 0 },
+      { scope: 'userA', topK: 4, offset: 20 },
+    ]);
+  });
 });
 
 describe('Mem0Backend.get', () => {

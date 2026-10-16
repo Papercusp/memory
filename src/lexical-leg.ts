@@ -26,9 +26,11 @@
  */
 import type {
   ListOptions,
+  ListPageOptions,
   MemoryAvailability,
   MemoryBackend,
   MemoryEntry,
+  MemoryListPage,
   RememberOptions,
   SearchOptions,
   UpdatePatch,
@@ -73,6 +75,14 @@ export class LexicalLegBackend implements MemoryBackend {
 
   list(opts: ListOptions): Promise<MemoryEntry[]> {
     return this.inner.list(opts);
+  }
+
+  listPage(opts: ListPageOptions): Promise<MemoryListPage> {
+    if (this.inner.listPage) return this.inner.listPage(opts);
+    return this.inner.list(opts).then((entries) => ({
+      entries: entries.slice(opts.offset, opts.offset + opts.limit),
+      total: entries.length,
+    }));
   }
 
   get(id: string): Promise<MemoryEntry | null> {
