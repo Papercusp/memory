@@ -194,6 +194,26 @@ export async function lexicalSearchCanonical(
 }
 
 /**
+ * Bounded list access for the neutral Mem0Backend adapter. This bypasses
+ * mem0's `getAll(topK)` surface so LIMIT/OFFSET and the authoritative count are
+ * applied by CanonicalVectorStore before rows are materialized.
+ */
+export async function listPageCanonical(
+  filters: Record<string, string>,
+  topK: number,
+  offset: number,
+): Promise<{
+  rows: Array<{ id: string; payload: Record<string, unknown>; score?: number }>;
+  total: number;
+} | null> {
+  await getMemoryClient();
+  const store = [..._liveCanonicalStores][0];
+  if (!store) return null;
+  const [rows, total] = await store.listPage(filters, topK, offset);
+  return { rows, total };
+}
+
+/**
  * Vector search over the canonical store with a PRECOMPUTED query vector —
  * the store half of `Mem0Backend`'s batched multi-scope search (EI-12962).
  * Same live-store access pattern as `lexicalSearchCanonical`. The caller

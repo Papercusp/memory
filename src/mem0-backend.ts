@@ -31,6 +31,8 @@ import {
   ARCHIVED_ELIGIBLE_FILTER,
   scopesOf,
   type ListOptions,
+  type ListPageOptions,
+  type MemoryListPage,
   type MemoryAvailability,
   type MemoryBackend,
   type MemoryEntry,
@@ -45,6 +47,7 @@ import {
   getMemoryClient,
   invalidateEntryCanonical,
   invalidateMemoryClient,
+  listPageCanonical,
   lexicalSearchCanonical,
   updateMemoryPayload,
   vectorSearchCanonical,
@@ -334,6 +337,15 @@ export interface Mem0BackendDeps {
     topK: number,
     filters: Record<string, string>,
   ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
+  /** Test seam — the bounded canonical list query. */
+  listPage?: (
+    filters: Record<string, string>,
+    topK: number,
+    offset: number,
+  ) => Promise<{
+    rows: Array<{ id: string; payload: Record<string, unknown>; score?: number }>;
+    total: number;
+  } | null>;
   /** Test seam — the validity-window close (defaults to the real canonical-store path). */
   invalidateEntry?: (id: string, opts: { supersededBy?: string }) => Promise<boolean>;
   /**
@@ -437,6 +449,7 @@ export class Mem0Backend implements MemoryBackend {
     topK: number,
     filters: Record<string, string>,
   ) => Promise<Array<{ id: string; payload: Record<string, unknown>; score?: number }>>;
+  private readonly canonicalListPage: NonNullable<Mem0BackendDeps['listPage']> | null;
   private readonly invalidateEntryStore: (id: string, opts: { supersededBy?: string }) => Promise<boolean>;
   private readonly reembedVector: (id: string, scope: string, embedText: string) => Promise<boolean>;
   /** PUBLIC (EI-12992): satisfies MemoryBackend.embedQuery? — a caller issuing
@@ -455,6 +468,10 @@ export class Mem0Backend implements MemoryBackend {
     this.getClient = deps.getClient ?? getMemoryClient;
     this.updatePayload = deps.updatePayload ?? updateMemoryPayload;
     this.lexicalSearch = deps.lexicalSearch ?? lexicalSearchCanonical;
+    // A replaced client may use an in-memory/test store, so never let the
+    // real canonical-store seam run against it unless the caller supplied a
+    // coherent listPage seam explicitly.
+    this.canonicalListPage = deps.listPage ?? (deps.getClient ? null : listPageCanonical);
     this.invalidateEntryStore = deps.invalidateEntry ?? invalidateEntryCanonical;
     // scope is unused by the default (memory_id is globally unique + the vec
     // table is per-mode, not per-scope) but kept in the seam for symmetry.
@@ -710,6 +727,73 @@ export class Mem0Backend implements MemoryBackend {
     let merged = mergeById((await Promise.all(pulls)).flat());
     if (opts.kind !== undefined) merged = merged.filter((e) => e.kind === opts.kind);
     return merged;
+  }
+
+  /**
+   * Read one globally bounded page while keeping the per-scope ordering of
+   * `list()`. Counts are fetched first with LIMIT 0, so a large offset never
+   * materializes skipped payloads; only the scopes intersecting the requested
+   * page issue a payload query.
+   */
+  async listPage(opts: ListPageOptions): Promise<MemoryListPage> {
+    const offset = opts.offset;
+    const limit = opts.limit;
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('Mem0Backend.listPage: offset must be a non-negative integer');
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error('Mem0Backend.listPage: limit must be a positive integer');
+
+    // Test/in-memory clients do not expose the canonical SQL seam. Preserve
+    // the old behavior there; production canonical clients take the bounded
+    // path below.
+    if (!this.canonicalListPage) {
+      const all = await this.list(opts);
+      return { entries: all.slice(offset, offset + limit), total: all.length };
+    }
+
+    const scopes = scopesOf(opts.scope);
+    if (scopes.length === 0) return { entries: [], total: 0 };
+    const filtersFor = (scope: string): Record<string, string> => ({
+      user_id: scope,
+      ...temporalFilters(opts),
+      ...(opts.kind !== undefined ? { kind: opts.kind } : {}),
+    });
+
+    const counts: Array<Awaited<ReturnType<NonNullable<Mem0BackendDeps['listPage']>>> | undefined> =
+      new Array(scopes.length);
+    await forEachWithConcurrency(scopes, LEXICAL_SCOPE_CONCURRENCY, async (scope, index) => {
+      counts[index] = await this.canonicalListPage!(filtersFor(scope), 0, 0);
+    });
+    // `null` means the configured mem0 client is the volatile in-process
+    // implementation, which has no canonical SQL store. Fall back to its
+    // existing bounded-in-handler behavior rather than fabricating a count.
+    if (counts.some((page) => page === null || page === undefined)) {
+      const all = await this.list(opts);
+      return { entries: all.slice(offset, offset + limit), total: all.length };
+    }
+
+    const total = counts.reduce((sum, page) => sum + (page?.total ?? 0), 0);
+    let remainingOffset = offset;
+    let remainingLimit = limit;
+    const entries: MemoryEntry[] = [];
+    for (let i = 0; i < scopes.length && remainingLimit > 0; i++) {
+      const scopeTotal = counts[i]!.total;
+      if (remainingOffset >= scopeTotal) {
+        remainingOffset -= scopeTotal;
+        continue;
+      }
+      const page = await this.canonicalListPage!(
+        filtersFor(scopes[i]!),
+        Math.min(remainingLimit, scopeTotal - remainingOffset),
+        remainingOffset,
+      );
+      if (page === null) {
+        const all = await this.list(opts);
+        return { entries: all.slice(offset, offset + limit), total: all.length };
+      }
+      for (const row of page.rows) entries.push(canonicalRowToEntry(row, scopes[i]!));
+      remainingLimit -= page.rows.length;
+      remainingOffset = 0;
+    }
+    return { entries, total };
   }
 
   async get(id: string): Promise<MemoryEntry | null> {
