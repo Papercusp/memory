@@ -490,6 +490,21 @@ export interface ListOptions {
   includeSuperseded?: boolean;
 }
 
+/** A bounded list request. Backends may implement this capability to keep the
+ * database read bounded; callers fall back to `list()` when they do not. */
+export interface ListPageOptions extends ListOptions {
+  /** Number of rows to return. */
+  limit: number;
+  /** Zero-based number of matching rows to skip. */
+  offset: number;
+}
+
+/** The result of a bounded list read. `total` counts all matching rows. */
+export interface MemoryListPage {
+  entries: MemoryEntry[];
+  total: number;
+}
+
 export interface UpdatePatch {
   /** Replacement fact body. */
   text?: string;
@@ -608,6 +623,9 @@ export interface MemoryBackend {
 
   /** Enumerate entries in the given pools (insertion order unspecified). */
   list(opts: ListOptions): Promise<MemoryEntry[]>;
+
+  /** Optional bounded enumeration capability. */
+  listPage?(opts: ListPageOptions): Promise<MemoryListPage>;
 
   /** Fetch one entry by id, or null when it doesn't exist. */
   get(id: string): Promise<MemoryEntry | null>;

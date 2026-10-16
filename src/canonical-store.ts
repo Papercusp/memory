@@ -1190,10 +1190,23 @@ export class CanonicalVectorStore {
    * edit/delete. (Semantic SEARCH naturally requires a vector in the
    * active model; LIST does not.)
    */
-  async list(
+  async list(filters?: SearchFilters, topK = 100): Promise<[VectorStoreResult[], number]> {
+    return this.listPage(filters, topK, 0);
+  }
+
+  /**
+   * Bounded canonical listing. The page LIMIT/OFFSET is applied in SQL before
+   * JSONB payloads are materialized, while the count remains authoritative for
+   * the caller's pagination envelope. `list()` delegates here so every direct
+   * canonical read gets the same memory/entity and temporal predicates.
+   */
+  async listPage(
     filters?: SearchFilters,
     topK = 100,
+    offset = 0,
   ): Promise<[VectorStoreResult[], number]> {
+    if (!Number.isSafeInteger(topK) || topK < 0) throw new Error('CanonicalVectorStore.listPage: topK must be a non-negative integer');
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('CanonicalVectorStore.listPage: offset must be a non-negative integer');
     const client = await this.getClient();
     const { temporal, rest } = splitTemporalControls(filters);
     const conds: string[] = [storeKindCond('', this.storeKind), `state != 'archived'`];
@@ -1219,7 +1232,7 @@ export class CanonicalVectorStore {
       FROM ${this.cfg.schema}.memory_canonical
       ${where}
       ORDER BY created_at DESC
-      LIMIT $${idx}
+      LIMIT $${idx} OFFSET $${idx + 1}
     `;
     const countSql = `
       SELECT COUNT(*)::bigint AS n
@@ -1228,7 +1241,7 @@ export class CanonicalVectorStore {
     `;
 
     const [listRes, countRes] = await Promise.all([
-      client.query(listSql, [...params, topK]),
+      client.query(listSql, [...params, topK, offset]),
       client.query(countSql, params),
     ]);
 

@@ -115,6 +115,16 @@ describe('CanonicalVectorStore store-kind segregation', () => {
     }
   });
 
+  it('bounded listPage applies LIMIT/OFFSET in SQL and keeps the count query', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.listPage({ user_id: 'scope-a' }, 7, 12);
+    expect(queries).toHaveLength(2);
+    expect(queries[0].sql).toMatch(/LIMIT \$\d+ OFFSET \$\d+/);
+    expect(queries[0].params).toEqual(expect.arrayContaining(['scope-a', 7, 12]));
+    expect(queries[1].sql).toContain('COUNT(*)');
+    expect(queries[1].params).toEqual(['scope-a']);
+  });
+
   it('search with no filters still carries the kind clause', async () => {
     const { store, queries } = makeStore('operator_memory_openai');
     await store.search(VEC, 5);
