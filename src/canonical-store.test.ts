@@ -850,10 +850,16 @@ describe('CanonicalVectorStore temporal-lite validity windows (P-002, migration 
       at: '2026-07-12T00:00:00Z',
     });
     const q = queries[0];
-    expect(q.sql).toContain('SET invalid_at = COALESCE($2::timestamptz, now())');
+    // An OPEN row is closed at `at` (or now()); a closed row keeps its window.
+    expect(q.sql).toContain('SET invalid_at = CASE WHEN invalid_at IS NULL');
+    expect(q.sql).toContain('THEN COALESCE($2::timestamptz, now())');
     expect(q.sql).toContain('superseded_by = $3::uuid');
     expect(q.sql).toContain("NOT (payload ? 'entityType')");
-    expect(q.sql).toContain('AND invalid_at IS NULL');
+    expect(q.sql).toContain('AND (invalid_at IS NULL');
+    // Lineage attach: only a winner-less closed row, and only with a winner to attach.
+    expect(q.sql).toContain('OR ($3::uuid IS NOT NULL AND superseded_by IS NULL)');
+    // An already-closed row keeps the first closer's window.
+    expect(q.sql).toContain('ELSE invalid_at END');
     expect(q.sql).not.toContain('memory_vec'); // never touches an embedding table
     expect(q.params).toEqual(['old-fact', '2026-07-12T00:00:00Z', 'new-fact']);
     // makeStore's fake reports rowCount 0 — already-closed (or unknown) id → false.

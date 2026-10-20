@@ -1133,8 +1133,18 @@ export class CanonicalVectorStore {
    * costs no re-embed. First-wins idempotence: only an OPEN row
    * (`invalid_at IS NULL`) matches, so a repeat call or a racing peer is a
    * no-op returning false — the first closer's window (and superseded_by)
-   * stands. Entity rows are exempt (mem0's lifecycle). Returns whether an
-   * open memory row was closed.
+   * stands. Entity rows are exempt (mem0's lifecycle).
+   *
+   * Lineage attach: a row already closed WITHOUT a winner (a soft-forget, so
+   * `superseded_by IS NULL`) still accepts a `supersededBy` link. Its window
+   * stays as the first closer left it (`invalid_at` is kept), so this
+   * records the lineage only. Without it, a retracted memory could never be
+   * linked to its correction, and every supersede caller misread the refusal
+   * as a lost race (EI-26515229747561182). A row that already names a winner
+   * is never re-pointed.
+   *
+   * Returns whether the call closed an open row or attached lineage to a
+   * winner-less closed row.
    */
   async invalidate(
     id: string,
@@ -1143,10 +1153,14 @@ export class CanonicalVectorStore {
     const client = await this.getClient();
     const res = await client.query(
       `UPDATE ${this.cfg.schema}.memory_canonical
-          SET invalid_at = COALESCE($2::timestamptz, now()),
+          SET invalid_at = CASE WHEN invalid_at IS NULL
+                                THEN COALESCE($2::timestamptz, now())
+                                ELSE invalid_at END,
               superseded_by = $3::uuid,
               updated_at = now()
-        WHERE id = $1 AND NOT (payload ? 'entityType') AND invalid_at IS NULL`,
+        WHERE id = $1 AND NOT (payload ? 'entityType')
+          AND (invalid_at IS NULL
+               OR ($3::uuid IS NOT NULL AND superseded_by IS NULL))`,
       [id, opts.at ?? null, opts.supersededBy ?? null],
     );
     return (res.rowCount ?? 0) > 0;
