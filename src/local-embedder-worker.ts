@@ -899,7 +899,10 @@ export async function _resetWorker(opts: { drainMs?: number } = {}): Promise<voi
   notifyIfDrained();
   state.refd = false;
   state.nextId = 0;
-  if (old) {
+  // An exited worker already satisfied shutdown. Bun 1.3.14 leaves a redundant
+  // terminate() promise pending forever; it also cannot answer a retire request.
+  // Reject callers above even when their worker exited before this reset.
+  if (old && old.threadId !== -1) {
     // Owing nothing means no inference is running in it, so it is safe to
     // terminate now; a worker that owed answers may be mid-run, and terminating
     // THAT one aborts the process (WI-10006567).
@@ -944,7 +947,8 @@ function retireWorker(w: Worker, drainMs: number): Promise<void> {
       console.warn(`[embed-worker] retiring worker did not report retired within ${drainMs}ms; terminating it anyway `
         + '(WI-10006567: terminating during a native run can abort the process)');
     }
-    if (how !== 'exited') {
+    // The exit can overtake the queued retired/error continuation.
+    if (how !== 'exited' && w.threadId !== -1) {
       try { await w.terminate(); } catch { /* already gone */ }
     }
     retiring.delete(w);
