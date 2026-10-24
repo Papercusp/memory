@@ -194,6 +194,9 @@ interface WorkerState {
    * pinned state object before the field existed.
    */
   onnxBindingPin?: OnnxBindingPin | null;
+  /** Private qualification scope; absent in ordinary production requests.
+   * Pinned state shares the observer across this module's CJS/ESM records. */
+  nativeInferenceObserver?: (event: WorkerNativeInferenceTrace) => void;
   /** The armed idle-unload timer (`armIdleUnload`, WI-10005070), if any. */
   idleTimer?: ReturnType<typeof setTimeout> | null;
   /** How many times the idle unload has released the worker in this process. */
@@ -838,7 +841,29 @@ export interface EmbedViaWorkerOpts {
  * Throws when worker_threads is unavailable or the worker has failed
  * — callers should fall back to inline embedding in that case.
  */
+/** Observe actual adapter calls without replacing their embedder or changing
+ * model/tokenizer settings. The caller owns this process-local diagnostic
+ * lifetime; cleanup stops observing NEW requests while already admitted calls
+ * retain their sink through their terminal evidence. One scope at a time. */
+export function observeWorkerNativeInference(observer: (event: WorkerNativeInferenceTrace) => void): () => void {
+  if (typeof observer !== 'function') throw new TypeError('native inference observer must be a function');
+  if (state.nativeInferenceObserver) throw new Error('native inference observation is already active');
+  state.nativeInferenceObserver = observer;
+  let stopped = false;
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    if (state.nativeInferenceObserver === observer) delete state.nativeInferenceObserver;
+  };
+}
+
 export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}): Promise<number[]> {
+  // Snapshot before any await: disposing a scope must not drop evidence from
+  // a request that entered it while the worker was still starting/recycling.
+  const observer = state.nativeInferenceObserver;
+  const onNativeInferenceTrace = observer && opts.onNativeInferenceTrace && observer !== opts.onNativeInferenceTrace
+    ? (event: WorkerNativeInferenceTrace) => { observer(event); opts.onNativeInferenceTrace!(event); }
+    : observer ?? opts.onNativeInferenceTrace;
   // A device change is recycling the worker: wait for it rather than land on
   // the old worker (which would keep embedding on the old device) or race its
   // termination.
@@ -851,7 +876,7 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
   const id = state.nextId++;
   const vector = await new Promise<number[]>((resolveEmbed, rejectEmbed) => {
     state.pending.set(id, { resolve: resolveEmbed, reject: rejectEmbed, onInputTrace: opts.onInputTrace,
-      onInferenceTrace: opts.onInferenceTrace, onNativeInferenceTrace: opts.onNativeInferenceTrace });
+      onInferenceTrace: opts.onInferenceTrace, onNativeInferenceTrace });
     // Ref BEFORE posting: between the post and the reply the caller is awaiting
     // a Promise, which is not loop work — an unref'd worker would leave the loop
     // looking idle and let `beforeExit` terminate this very request (WI-37683).
@@ -867,7 +892,7 @@ export async function embedViaWorker(text: string, opts: EmbedViaWorkerOpts = {}
       tokenizerBackend: opts.tokenizerBackend,
       ...(opts.onInputTrace ? { traceInput: true } : {}),
       ...(opts.onInferenceTrace ? { traceInference: true } : {}),
-      ...(opts.onNativeInferenceTrace ? { traceNativeInference: true } : {}),
+      ...(onNativeInferenceTrace ? { traceNativeInference: true } : {}),
     });
   });
   observeFallback('embed-worker', { eligible: 1, applied: 1, reason: 'worker-completed' });

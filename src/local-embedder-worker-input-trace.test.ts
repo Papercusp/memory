@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { embedViaWorker, getWorkerState, shutdownLocalEmbedder, _resetBeforeExitHookForTest,
+import { embedViaWorker, getWorkerState, shutdownLocalEmbedder, _resetBeforeExitHookForTest, observeWorkerNativeInference,
   type WorkerInputTrace, type WorkerInferenceTrace } from './local-embedder-worker';
 
 const trace: WorkerInputTrace = { model: '/private/model', device: 'cpu', observedAt: '2026-10-02T00:00:00.000Z',
@@ -52,7 +52,7 @@ try {
 } finally {await worker.terminate();}
 `);
     try {
-      const env = { ...process.env, LD_DEBUG: 'files,libs,versions' }; delete env.LD_DEBUG_OUTPUT;
+      const env: NodeJS.ProcessEnv = { ...process.env, LD_DEBUG: 'files,libs,versions' }; delete env.LD_DEBUG_OUTPUT;
       const run = (flag: string) => {
         const child = spawnSync(process.execPath, [parent, flag], { env, encoding: 'utf8', timeout: 20_000, maxBuffer: 4 * 1024 * 1024 });
         expect(child.status, child.stderr.slice(-4000)).toBe(0);
@@ -231,6 +231,79 @@ describe('worker input evidence protocol', () => {
       else await expect(result).rejects.toThrow(['missing', 'unfinished'].includes(failure)
         ? 'without complete requested native inference evidence' : 'invalid worker');
     });
+});
+
+describe('scoped observation of ordinary adapter worker requests', () => {
+  function reply(worker: Worker, msg: any, includeEvidence = true) {
+    if (includeEvidence) {
+      const start = { requestId:msg.id,attempt:1,processId:123,workerThreadId:1,nativeThreadId:456,
+        model:msg.model ?? trace.model,device:'cpu',observedAt:trace.observedAt,clock:'node-hrtime',
+        monotonicNs:'100',phase:'start',runIndex:1,runTag:`pc-embed:123:1:${msg.id}:1:1` };
+      worker.emit('message',{kind:'embed_native_inference',id:msg.id,inference:start});
+      worker.emit('message',{kind:'embed_native_inference',id:msg.id,
+        inference:{...start,monotonicNs:'200',phase:'end',outcome:'success'}});
+    }
+    worker.emit('message',{kind:'embed_ok',id:msg.id,vector:[1]});
+  }
+
+  it('observes calls with no diagnostic opts and restores ordinary request messages after cleanup', async () => {
+    const phases: string[] = [], flags: boolean[] = [];
+    vi.spyOn(Worker.prototype,'postMessage').mockImplementation(function(this:Worker,msg:any) {
+      flags.push(msg.traceNativeInference===true);
+      if (flags.length===1) expect(msg).toMatchObject({model:'actual-model',normalize:false});
+      setImmediate(()=>reply(this,msg,msg.traceNativeInference===true));
+    });
+    const stop=observeWorkerNativeInference(event=>phases.push(event.phase));
+    try {
+      expect(()=>observeWorkerNativeInference(()=>{})).toThrow('already active');
+      expect(await embedViaWorker('ordinary query',{model:'actual-model',normalize:false})).toEqual([1]);
+      expect(phases).toEqual(['start','end']);
+    } finally {stop();}
+    stop();
+    expect(await embedViaWorker('unobserved query')).toEqual([1]);
+    expect(flags).toEqual([true,false]);
+  });
+
+  it('keeps per-request callbacks and already entered requests after scope cleanup', async () => {
+    const scoped: string[] = [], perRequest: string[] = [];
+    vi.spyOn(Worker.prototype,'postMessage').mockImplementation(function(this:Worker,msg:any) {
+      expect(msg.traceNativeInference).toBe(true);
+      setImmediate(()=>reply(this,msg));
+    });
+    const stop=observeWorkerNativeInference(event=>scoped.push(event.phase));
+    try {
+      const pending=embedViaWorker('q',{onNativeInferenceTrace:event=>perRequest.push(event.phase)});
+      stop();
+      expect(await pending).toEqual([1]);
+      expect(scoped).toEqual(['start','end']);
+      expect(perRequest).toEqual(['start','end']);
+    } finally {stop();}
+  });
+
+  it('does not let a retired cleanup cancel a later scope using the same callback', async () => {
+    const observer=vi.fn();
+    const retired=observeWorkerNativeInference(observer); retired();
+    const stop=observeWorkerNativeInference(observer);
+    vi.spyOn(Worker.prototype,'postMessage').mockImplementation(function(this:Worker,msg:any) {
+      expect(msg.traceNativeInference).toBe(true);
+      setImmediate(()=>reply(this,msg));
+    });
+    try {
+      retired();
+      expect(await embedViaWorker('q',{onNativeInferenceTrace:observer})).toEqual([1]);
+      expect(observer).toHaveBeenCalledTimes(2);
+    } finally {stop();}
+  });
+
+  it.each(['missing','observer-error'])('fails closed on %s evidence', async failure => {
+    vi.spyOn(Worker.prototype,'postMessage').mockImplementation(function(this:Worker,msg:any) {
+      setImmediate(()=>reply(this,msg,failure!=='missing'));
+    });
+    const stop=observeWorkerNativeInference(()=>{if(failure==='observer-error')throw new Error('scope sink failed');});
+    try {await expect(embedViaWorker('q')).rejects.toThrow(failure==='missing'
+      ? 'without complete requested native inference evidence':'scope sink failed');}
+    finally {stop();}
+  });
 });
 
 describe('real worker submitted tensors', () => {
