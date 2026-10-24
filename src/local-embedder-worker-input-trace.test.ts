@@ -12,6 +12,74 @@ const trace: WorkerInputTrace = { model: '/private/model', device: 'cpu', observ
   inputShape: [1, 2], inputIds: [1, 2], attentionMask: [1, 1] };
 afterEach(async () => { vi.restoreAllMocks(); await shutdownLocalEmbedder(); _resetBeforeExitHookForTest(); });
 
+describe('SDK tokenizer native inference evidence', () => {
+  it.each(['pipeline', 'output', 'error', 'raw-input'])('preserves the SDK %s route and observes its actual native call', (mode) => {
+    const dir = mkdtempSync(join(tmpdir(), 'worker-sdk-native-'));
+    const fake = join(dir, 'transformers.mjs');
+    // Reuse the existing native mul_1.onnx fixture, without a model download.
+    const graph = 'CAMSBmNoZW50YTpwChUKAVgKAVcSAVkaBW11bF8xIgNNdWwSCG11bCB0ZXN0KiMIAwgCEAEiGAAAgD8AAABAAABAQAAAgEAAAKBAAADAQEIBV1oTCgFYEg4KDAgBEggKAggDCgIIAmITCgFZEg4KDAgBEggKAggDCgIIAkIECgAQBw==';
+    writeFileSync(fake, `import ort from ${JSON.stringify(import.meta.resolve('onnxruntime-node'))};
+export const env = {};
+export async function pipeline() {
+  const session = await ort.InferenceSession.create(Buffer.from(${JSON.stringify(graph)}, 'base64'),
+    { executionProviders:['cpu'], intraOpNumThreads:1, interOpNumThreads:1 });
+  const model = async inputs => {
+    const output = await session.run({ X: new ort.Tensor('float32', Float32Array.from([1,1,1,1,1,1]), inputs.bad ? [2,3] : [3,2]) });
+    return { pooled: { data: output.Y.data } };
+  };
+  const pipe = async (text, options) => {
+    if(options.pooling !== 'mean' || options.normalize !== false) throw new Error('SDK options changed');
+    return (await model({bad:text==='bad'})).pooled;
+  };
+  return Object.assign(pipe, { tokenizer: text => ({bad:text==='bad'}), model });
+}
+`);
+    const parent = join(dir, 'parent.mjs');
+    writeFileSync(parent, `import { Worker } from 'node:worker_threads';
+const traced = process.argv[2] === 'trace';
+const mode = ${JSON.stringify(mode)};
+const worker = new Worker(new URL(${JSON.stringify(new URL('./local-embedder-worker.script.mjs', import.meta.url).href)}),
+  { workerData:{device:'cpu',transformersSpecifier:${JSON.stringify(pathToFileURL(fake).href)}}, execArgv:[] });
+const messages=[];
+try {
+  await new Promise((resolve,reject)=>{worker.once('error',reject);worker.on('message',m=>{messages.push(m);if(m.kind==='ready')resolve();});});
+  const finished=new Promise((resolve,reject)=>{worker.once('error',reject);worker.on('message',m=>{if(['embed_ok','embed_err'].includes(m.kind))resolve(m);});});
+  worker.postMessage({kind:'embed',id:41,text:traced&&mode==='error'?'bad':'good',model:'fixture-sdk',pooling:'mean',normalize:false,
+    ...(mode==='output'?{output:'pooled'}:{}),
+    ...(traced ? mode==='raw-input'?{traceInput:true}:{traceInference:true,traceNativeInference:true}: {})});
+  const result=await finished;
+  console.log(JSON.stringify({result,graph:messages.filter(m=>m.kind==='embed_inference'),native:messages.filter(m=>m.kind==='embed_native_inference')}));
+} finally {await worker.terminate();}
+`);
+    try {
+      const env = { ...process.env, LD_DEBUG: 'files,libs,versions' }; delete env.LD_DEBUG_OUTPUT;
+      const run = (flag: string) => {
+        const child = spawnSync(process.execPath, [parent, flag], { env, encoding: 'utf8', timeout: 20_000, maxBuffer: 4 * 1024 * 1024 });
+        expect(child.status, child.stderr.slice(-4000)).toBe(0);
+        return JSON.parse(child.stdout.trim());
+      };
+      const control = run('control');
+      expect(control.result).toMatchObject({kind:'embed_ok', vector:[1,2,3,4,5,6]});
+      expect(control.graph).toEqual([]); expect(control.native).toEqual([]);
+      const observed = run('trace');
+      if (mode === 'raw-input') {
+        expect(observed.result).toMatchObject({kind:'embed_err', error:expect.stringContaining('explicit Rust tensor route')});
+        expect(observed.graph).toEqual([]); expect(observed.native).toEqual([]);
+      } else {
+        if (mode === 'error') expect(observed.result.kind).toBe('embed_err');
+        else expect(observed.result).toEqual(control.result);
+        for (const events of [observed.graph, observed.native]) {
+          expect(events.map((m: any)=>[m.inference.requestId,m.inference.phase,m.inference.outcome])).toEqual([
+            [41,'start',undefined], [41,'end',mode==='error'?'error':'success'],
+          ]);
+        }
+        expect(observed.native[0].inference.runTag).toBe(observed.native[1].inference.runTag);
+        expect(observed.native[0].inference.runtime.libraries.some((f: any)=>f.path.endsWith('.node'))).toBe(true);
+      }
+    } finally { rmSync(dir, {recursive:true,force:true}); }
+  }, 90_000);
+});
+
 describe('file worker boot from a stdin parent', () => {
   it.each([['--input-type=module'], ['--input-type', 'module']])('does not inherit stdin-only flags %j', (...inputArgs) => {
     const moduleUrl = new URL('./local-embedder-worker.ts', import.meta.url).href;
