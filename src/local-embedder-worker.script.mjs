@@ -458,7 +458,33 @@ async function runEmbed(msg, entry, attempt = 1) {
   const pooling = msg.pooling || 'mean';
   const normalize = msg.normalize === undefined ? true : msg.normalize;
   const pipe = entry.pipe;
-  if ((msg.traceInput || msg.traceInference || msg.traceNativeInference) && msg.tokenizerBackend !== 'rust') throw new Error('input evidence requires the explicit Rust tensor route');
+  if (msg.traceInput && msg.tokenizerBackend !== 'rust') throw new Error('input evidence requires the explicit Rust tensor route');
+  const request = msg.traceInput || msg.traceInference || msg.traceNativeInference ? {
+    requestId: msg.id, attempt, processId: process.pid, workerThreadId: threadId,
+    nativeThreadId: process.platform === 'linux' ? Number(readlinkSync('/proc/thread-self').split('/').at(-1)) : null,
+  } : undefined;
+  // Observe the selected inference route without replacing its tokenizer,
+  // pooling or outputs. Raw submitted tensors still require the Rust route.
+  const invokeInference = (operation) => {
+    if (!msg.traceInference && !msg.traceNativeInference) return operation();
+    const emitInference = (phase, outcome) => {
+      if (msg.traceInference) parentPort.postMessage({ kind: 'embed_inference', id: msg.id, inference: {
+        ...request, model: msg.model, device: entry.device, observedAt: new Date().toISOString(),
+        clock: 'node-hrtime', monotonicNs: process.hrtime.bigint().toString(), phase,
+        ...(outcome ? { outcome } : {}),
+      } });
+    };
+    return (async () => {
+      emitInference('start');
+      try {
+        const output = await (msg.traceNativeInference
+          ? nativeInferenceContext.run({ request, model: msg.model, device: entry.device, runIndex: 0 }, operation)
+          : operation());
+        emitInference('end', 'success');
+        return output;
+      } catch (error) { emitInference('end', 'error'); throw error; }
+    })();
+  };
   if (msg.tokenizerBackend === 'rust') {
     if (pooling !== 'cls' || msg.output) throw new Error('Rust candidate contract requires native CLS output');
     const encoding = await rustTokenize(msg.model, text);
@@ -469,31 +495,13 @@ async function runEmbed(msg, entry, attempt = 1) {
       input_ids: new t.Tensor('int64', BigInt64Array.from(ids, BigInt), shape),
       attention_mask: new t.Tensor('int64', BigInt64Array.from(encoding.getAttentionMask(), BigInt), shape),
     };
-    const request = msg.traceInput || msg.traceInference || msg.traceNativeInference ? {
-      requestId: msg.id, attempt, processId: process.pid, workerThreadId: threadId,
-      nativeThreadId: process.platform === 'linux' ? Number(readlinkSync('/proc/thread-self').split('/').at(-1)) : null,
-    } : undefined;
     if (msg.traceInput) parentPort.postMessage({ kind: 'embed_input', id: msg.id, trace: {
       model: msg.model, device: entry.device, observedAt: new Date().toISOString(),
       request,
       inputShape: [...inputs.input_ids.dims], inputIds: Array.from(inputs.input_ids.data, Number),
       attentionMask: Array.from(inputs.attention_mask.data, Number),
     } });
-    const emitInference = (phase, outcome) => {
-      if (msg.traceInference) parentPort.postMessage({ kind: 'embed_inference', id: msg.id, inference: {
-        ...request, model: msg.model, device: entry.device, observedAt: new Date().toISOString(),
-        clock: 'node-hrtime', monotonicNs: process.hrtime.bigint().toString(), phase,
-        ...(outcome ? { outcome } : {}),
-      } });
-    };
-    emitInference('start');
-    let output;
-    try {
-      output = await (msg.traceNativeInference
-        ? nativeInferenceContext.run({ request, model: msg.model, device: entry.device, runIndex: 0 }, () => pipe.model(inputs))
-        : pipe.model(inputs));
-    } catch (error) { emitInference('end', 'error'); throw error; }
-    emitInference('end', 'success');
+    const output = await invokeInference(() => pipe.model(inputs));
     if (!output.last_hidden_state) throw new Error('Rust candidate graph lacks last_hidden_state');
     const cls = output.last_hidden_state.slice(null, 0);
     return Array.from((normalize ? cls.normalize(2, -1) : cls).data);
@@ -504,14 +512,14 @@ async function runEmbed(msg, entry, attempt = 1) {
   // that graph output; tokenize + run the model directly and return it.
   if (msg.output) {
     const enc = pipe.tokenizer(text, { padding: true, truncation: true });
-    const out = await pipe.model(enc);
+    const out = await invokeInference(() => pipe.model(enc));
     const tensor = out[msg.output];
     if (!tensor) {
       throw new Error(`model output '${msg.output}' missing (has: ${Object.keys(out).join(', ')})`);
     }
     return Array.from(tensor.data);
   }
-  const result = await pipe(text, { pooling, normalize });
+  const result = await invokeInference(() => pipe(text, { pooling, normalize }));
   return Array.from(result.data);
 }
 
