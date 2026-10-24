@@ -65,34 +65,50 @@ describe('local-embedder-worker (protocol contract)', () => {
   });
 
   it('shares worker ownership and shutdown across distinct module records', async () => {
-    const { Worker } = await import('node:worker_threads');
-    const first = await import('./local-embedder-worker');
-    let second: typeof first | undefined;
-    // Exercise a real worker without loading a model. Its request stays pending
-    // until the other module record shuts down the same worker.
-    const post = vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(() => {});
-    const pending = first.embedViaWorker('cross-loader shutdown').catch((error: unknown) => error);
+    // Re-evaluate the actual ESM source in one Node realm. Resetting Vitest's
+    // entire module graph with a live worker stalled on the second import;
+    // two native URL identities exercise the intended ownership boundary.
+    const dir = mkdtempSync(join(tmpdir(), 'embed-cross-module-'));
+    const child = join(dir, 'cross-module.mjs');
+    const moduleUrl = new URL('./local-embedder-worker.ts', import.meta.url).href;
+    writeFileSync(child, `import assert from 'node:assert/strict';
+import { Worker } from 'node:worker_threads';
+const postMessage = Worker.prototype.postMessage;
+Worker.prototype.postMessage = function(message, ...args) {
+  if (message.kind !== 'embed') return postMessage.call(this, message, ...args);
+};
+const first = await import(${JSON.stringify(moduleUrl + '?ownership=first')});
+const pending = first.embedViaWorker('cross-loader shutdown').catch(error => error);
+try {
+  const deadline = Date.now() + 2000;
+  while (first.getWorkerState().pendingCount !== 1 && Date.now() < deadline)
+    await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(first.getWorkerState().pendingCount, 1);
+  const second = await import(${JSON.stringify(moduleUrl + '?ownership=second')});
+  assert.notEqual(second.embedViaWorker, first.embedViaWorker);
+  assert.deepEqual(second.getWorkerState(), first.getWorkerState());
+  Worker.prototype.postMessage = postMessage;
+  await second.shutdownLocalEmbedder();
+  assert.ok(await pending instanceof Error);
+  assert.equal(first.getWorkerState().alive, false);
+  assert.equal(first.getWorkerState().pendingCount, 0);
+  second._resetBeforeExitHookForTest();
+  console.log(JSON.stringify({ distinctRecords: true, sharedPending: true, shutdown: true }));
+} finally {
+  Worker.prototype.postMessage = postMessage;
+  await first.shutdownLocalEmbedder();
+  first._resetBeforeExitHookForTest();
+  await pending;
+}
+`);
     try {
-      await vi.waitFor(() => expect(first.getWorkerState().pendingCount).toBe(1));
-      vi.resetModules();
-      second = await import('./local-embedder-worker');
-      expect(second.embedViaWorker).not.toBe(first.embedViaWorker);
-      expect(second.getWorkerState()).toEqual(first.getWorkerState());
-      // Restore delivery before shutting down: a worker that owes an answer is
-      // retired, not killed (WI-10006567), and the retire request must reach it.
-      post.mockRestore();
-      await second.shutdownLocalEmbedder();
-      expect(await pending).toBeInstanceOf(Error);
-      expect(first.getWorkerState()).toMatchObject({ alive: false, pendingCount: 0 });
+      const { stdout } = await promisify(execFile)(process.execPath,
+        ['--import', import.meta.resolve('tsx/esm'), child], { timeout: 20_000 });
+      expect(JSON.parse(stdout.trim())).toEqual({ distinctRecords: true, sharedPending: true, shutdown: true });
     } finally {
-      post.mockRestore();
-      await first.shutdownLocalEmbedder();
-      await second?.shutdownLocalEmbedder();
-      await pending;
-      first._resetBeforeExitHookForTest();
-      second?._resetBeforeExitHookForTest();
+      rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   it('exports the expected API surface', async () => {
     const mod = await import('./local-embedder-worker');
