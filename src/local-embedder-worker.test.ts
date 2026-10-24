@@ -3,16 +3,16 @@
  *
  * Step B1 (Tier-3 follow-up arc).
  *
- * Doesn't actually exercise @huggingface/transformers (the package
- * isn't installed in CI by default — it's optional dev-mode dep).
- * Instead exercises the protocol contract: ensureWorker spawns the
- * worker, getWorkerState reports state, _resetWorker tears down.
+ * Exercises the protocol contract with real file workers and model-free
+ * replies: ensureWorker spawns the worker, getWorkerState reports state,
+ * and _resetWorker tears down. Native inference has its own tiny ORT fixture
+ * in local-embedder-worker-input-trace.test.ts.
  *
  * The actual ONNX path is exercised by the live mem0 round-trip when
  * the user opts into memoryEmbedderMode='local'.
  */
-import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -20,18 +20,24 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-const HF_PACKAGE_PATH = 'node_modules/@huggingface/transformers';
-let hfInstalled = false;
-
-beforeAll(() => {
-  hfInstalled = existsSync(join(process.cwd(), HF_PACKAGE_PATH)) ||
-                existsSync(join(process.cwd(), '..', HF_PACKAGE_PATH)) ||
-                existsSync(join(process.cwd(), '..', '..', HF_PACKAGE_PATH));
+beforeEach(() => {
+  const postMessage = Worker.prototype.postMessage;
+  vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function (this: Worker, message, ...args) {
+    // Only bridge protocol requests use the default model. Explicit worker
+    // fixtures below keep their real message delivery and supplied model.
+    if (message.kind === 'embed' && message.model === undefined) {
+      setImmediate(() => this.emit('message', message.text === 'protocol-error'
+        ? { kind: 'embed_err', id: message.id, error: 'fixture inference error' }
+        : { kind: 'embed_ok', id: message.id, vector: [1, 0] }));
+      return;
+    }
+    return postMessage.call(this, message, ...args);
+  });
 });
 
 afterEach(async () => {
   const mod = await import('./local-embedder-worker');
-  await mod._resetWorker();
+  try { await mod._resetWorker(); } finally { vi.restoreAllMocks(); }
 });
 
 describe('local-embedder-worker (protocol contract)', () => {
@@ -103,26 +109,14 @@ describe('local-embedder-worker (protocol contract)', () => {
     expect(s.pendingCount).toBe(0);
   });
 
-  it('embedViaWorker either succeeds with a vector or throws (worker protocol contract)', async () => {
-    if (!hfInstalled) return; // soft-skip when @huggingface/transformers absent
+  it.each(['success', 'error'])('settles a worker protocol %s response', async (outcome) => {
     const mod = await import('./local-embedder-worker');
-    try {
-      const vector = await mod.embedViaWorker('hello world');
-      // Success path: must be a numeric vector.
-      expect(Array.isArray(vector)).toBe(true);
-      expect(vector.length).toBeGreaterThan(0);
-      expect(typeof vector[0]).toBe('number');
-    } catch (err) {
-      // Failure path: ONNX binding conflicts (common in vitest where
-      // the main thread + multiple workers all try to load the same
-      // native binding) surface here. The contract is "either returns
-      // a vector or throws cleanly" — not "must always succeed".
-      expect(err).toBeInstanceOf(Error);
-    }
+    if (outcome === 'error') await expect(mod.embedViaWorker('protocol-error')).rejects.toThrow('fixture inference error');
+    else expect(await mod.embedViaWorker('hello world')).toEqual([1, 0]);
+    expect(mod.getWorkerState().pendingCount).toBe(0);
   }, 30_000);
 
   it('after embedViaWorker, getWorkerState reflects spawn (alive OR disabled)', async () => {
-    if (!hfInstalled) return;
     const mod = await import('./local-embedder-worker');
     await mod.embedViaWorker('warm').catch(() => { /* protocol may throw */ });
     const s = mod.getWorkerState();
@@ -133,7 +127,6 @@ describe('local-embedder-worker (protocol contract)', () => {
   }, 30_000);
 
   it('_resetWorker returns state to fully-idle', async () => {
-    if (!hfInstalled) return;
     const mod = await import('./local-embedder-worker');
     await mod.embedViaWorker('warm').catch(() => { /* */ });
     await mod._resetWorker();
@@ -583,7 +576,17 @@ describe('local-embedder-worker (WI-37683: holds the loop while a request is in 
       const child = join(dir, 'idle-host.mts');
       writeFileSync(
         child,
-        `const { embedViaWorker } = await import(${JSON.stringify(modulePath)});\n` +
+        `import { Worker } from 'node:worker_threads';\n` +
+          `const postMessage = Worker.prototype.postMessage;\n` +
+          `Worker.prototype.postMessage = function(message, ...args) {\n` +
+          `  if (message.kind === 'embed') {\n` +
+          `    setImmediate(() => this.emit('message', { kind:'embed_ok', id:message.id, vector:[1,0] }));\n` +
+          `    return;\n` +
+          `  }\n` +
+          `  return postMessage.call(this, message, ...args);\n` +
+          `};\n` +
+          `const imported = await import(${JSON.stringify(modulePath)});\n` +
+          `const { embedViaWorker } = imported.default ?? imported;\n` +
           `try {\n` +
           `  const v = await embedViaWorker('hello');\n` +
           `  console.log('CHILD_SETTLED ok dims=' + v.length);\n` +
@@ -592,7 +595,7 @@ describe('local-embedder-worker (WI-37683: holds the loop while a request is in 
           `}\n`,
       );
 
-      const { stdout } = await promisify(execFile)('npx', ['tsx', child], {
+      const { stdout } = await promisify(execFile)(process.execPath, ['--import', import.meta.resolve('tsx/esm'), child], {
         cwd: resolve(__dirname, '..'),
         timeout: 180_000,
       });

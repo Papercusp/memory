@@ -7,7 +7,7 @@
  * The model-loading path (buildGemmaEmbedder) is exercised by the live memory
  * suite; here we pin the math + the prompt contract.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mrlTruncate, gemmaPrompt, GEMMA_TARGET_DIMS, GEMMA_MODEL } from './gemma-embedder';
 
 describe('mrlTruncate (MRL slice + renormalize; the target is now the NATIVE 768)', () => {
@@ -106,8 +106,22 @@ describe('buildGemmaEmbedder — non-sticky worker fallback (EI-16184)', () => {
   beforeEach(() => {
     vi.resetModules();
   });
+  afterEach(() => {
+    vi.doUnmock('./local-embedder-worker');
+    vi.doUnmock('./dynamic-import');
+  });
+
+  // dynamicImport deliberately bypasses package-level mocks. Stub its existing
+  // seam, as the Harrier tests do, so fallback never downloads a real model.
+  const stubInlineModel = () => {
+    const pipeline = vi.fn(async () => async () => ({ data: new Float32Array(768).fill(0.05) }));
+    const dynamicImport = vi.fn(async () => ({ pipeline }));
+    vi.doMock('./dynamic-import', () => ({ dynamicImport }));
+    return { pipeline, dynamicImport };
+  };
 
   it('retries the worker path on the NEXT call after a transient failure — does not stick to inline forever', async () => {
+    const inline = stubInlineModel();
     const embedViaWorker = vi
       .fn()
       .mockRejectedValueOnce(new Error('transient worker hiccup'))
@@ -126,10 +140,9 @@ describe('buildGemmaEmbedder — non-sticky worker fallback (EI-16184)', () => {
     const { buildGemmaEmbedder } = await import('./gemma-embedder');
     const embed = buildGemmaEmbedder({ kind: 'query' });
 
-    // Call 1: worker rejects, falls through toward inline (no real
-    // @huggingface/transformers wired in this unit test — swallow whatever
-    // that path does; only call 2's behavior is under test here).
-    await embed('hello').catch(() => {});
+    expect(await embed('hello')).toHaveLength(GEMMA_TARGET_DIMS);
+    expect(inline.dynamicImport).toHaveBeenCalledWith('@huggingface/transformers');
+    expect(inline.pipeline).toHaveBeenCalledTimes(1);
 
     // Call 2 MUST re-attempt the worker — the old sticky `workerDisabled`
     // flag would have skipped straight to inline forever after call 1.
@@ -137,9 +150,11 @@ describe('buildGemmaEmbedder — non-sticky worker fallback (EI-16184)', () => {
     expect(embedViaWorker).toHaveBeenCalledTimes(2);
     expect(result).toHaveLength(GEMMA_TARGET_DIMS);
     expect(warnEmbedFallback).toHaveBeenCalledTimes(1);
+    expect(inline.pipeline).toHaveBeenCalledTimes(1);
   });
 
   it('skips the worker entirely once the module reports genuine, permanent unavailability', async () => {
+    const inline = stubInlineModel();
     const embedViaWorker = vi.fn().mockResolvedValue(new Array(768).fill(0.1));
     const getWorkerState = vi.fn(() => ({ alive: false, disabled: true, pendingCount: 0 }));
     const warnEmbedFallback = vi.fn();
@@ -154,9 +169,11 @@ describe('buildGemmaEmbedder — non-sticky worker fallback (EI-16184)', () => {
 
     const { buildGemmaEmbedder } = await import('./gemma-embedder');
     const embed = buildGemmaEmbedder({ kind: 'query' });
-    await embed('hello').catch(() => {});
+    expect(await embed('hello')).toHaveLength(GEMMA_TARGET_DIMS);
 
     expect(embedViaWorker).not.toHaveBeenCalled();
+    expect(inline.dynamicImport).toHaveBeenCalledTimes(1);
+    expect(inline.pipeline).toHaveBeenCalledTimes(1);
   });
 });
 
