@@ -330,6 +330,14 @@ export class HybridBackend implements MemoryBackend {
           return await this.lexical.search(lexicalText, {
             scope: opts.scope,
             limit: depth,
+            // Both legs must admit the same lifecycle and archive population.
+            ...(opts.asOf !== undefined ? { asOf: opts.asOf } : {}),
+            ...(opts.includeSuperseded !== undefined
+              ? { includeSuperseded: opts.includeSuperseded }
+              : {}),
+            ...(opts.archivedEligibility !== undefined
+              ? { archivedEligibility: opts.archivedEligibility }
+              : {}),
             ...(signal ? { signal } : {}),
           });
         } catch {

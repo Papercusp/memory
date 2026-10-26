@@ -70,6 +70,31 @@ describe("HybridBackend identity (memory-declaude-and-defaults-2026-07-28 P-003)
 });
 
 describe("HybridBackend (P-020)", () => {
+  for (const fusionMode of ['floored-union', 'cosine-gated'] as const) {
+    for (const overlapGatedLexical of [false, true]) {
+      it(`keeps lifecycle and archive eligibility on the lexical leg (${fusionMode}, overlap=${overlapGatedLexical})`, async () => {
+        const lexicalSearch = vi.fn(async (_query: string, _opts: SearchOptions) => [e('match', 1)]);
+        const cosineSearch = vi.fn(async (_query: string, _opts: SearchOptions) => [e('match', 0.9)]);
+        const hy = new HybridBackend(fakeBackend('lexical', [], { search: lexicalSearch }),
+          fakeBackend('cosine', [], { search: cosineSearch }));
+        const eligibility = { key: 'packageVersion', values: ['v1'] };
+        await hy.search('semantic query', { scope: 's', limit: 4, fusionMode,
+          overlapGatedLexical, asOf: '2019-06-01T00:00:00Z', includeSuperseded: true,
+          archivedEligibility: eligibility, lexicalQuery: 'exact identifier', minScore: 0.6 });
+        expect(lexicalSearch.mock.calls[0][0]).toBe('exact identifier');
+        expect(lexicalSearch.mock.calls[0][1]).toMatchObject({
+          scope: 's', limit: 12, asOf: '2019-06-01T00:00:00Z',
+          includeSuperseded: true, archivedEligibility: eligibility,
+        });
+        expect(cosineSearch.mock.calls[0][1]).toMatchObject({
+          asOf: '2019-06-01T00:00:00Z', includeSuperseded: true, archivedEligibility: eligibility,
+        });
+        expect(lexicalSearch.mock.calls[0][1]).not.toHaveProperty('minScore');
+        expect(lexicalSearch.mock.calls[0][1]).not.toHaveProperty('vector');
+      });
+    }
+  }
+
   it('never starts the gated lexical phase after an obsolete cosine result arrives', async () => {
     let release!: (hits: MemoryEntry[]) => void;
     const cosine = fakeBackend('cosine', [], {
