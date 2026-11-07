@@ -5,12 +5,38 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { embedViaWorker, getWorkerState, shutdownLocalEmbedder, _resetBeforeExitHookForTest, observeWorkerNativeInference,
+import { embedViaWorker, getWorkerState, shutdownLocalEmbedder, _resetBeforeExitHookForTest, observeWorkerNativeInference, validNativeRuntimeSample,
   type WorkerInputTrace, type WorkerInferenceTrace } from './local-embedder-worker';
 
 const trace: WorkerInputTrace = { model: '/private/model', device: 'cpu', observedAt: '2026-10-02T00:00:00.000Z',
   inputShape: [1, 2], inputIds: [1, 2], attentionMask: [1, 1] };
 afterEach(async () => { vi.restoreAllMocks(); await shutdownLocalEmbedder(); _resetBeforeExitHookForTest(); });
+
+it('samples native runtime from the main process without starting an embedder or loading a model', () => {
+  const script = new URL('./local-embedder-worker.script.mjs', import.meta.url).href;
+  const program = `import { sampleNativeRuntime } from ${JSON.stringify(script)};
+import { realpathSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+const runtime = sampleNativeRuntime('cpu');
+const executable = realpathSync('/proc/self/exe');
+const bytes = readFileSync(executable);
+console.log(JSON.stringify({ runtime, executable,
+  sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length,
+  monotonicNs: process.hrtime.bigint().toString() }));`;
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', program], {
+    env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8', timeout: 20_000, maxBuffer: 1024 * 1024,
+  });
+  expect(child.status, child.stderr).toBe(0);
+  const observed = JSON.parse(child.stdout);
+  expect(validNativeRuntimeSample({ phase: 'start', device: 'cpu', runtime: observed.runtime,
+    monotonicNs: observed.monotonicNs } as any)).toBe(true);
+  expect(observed.runtime.loaderProcess.executablePath).toBe(observed.executable);
+  expect(observed.runtime.libraries).toContainEqual(expect.objectContaining({
+    path: observed.executable, sha256: observed.sha256, bytes: observed.bytes,
+  }));
+  expect(observed.runtime.loaderProcess.vdso).toMatchObject({ origin: 'kernel-auxv-AT_SYSINFO_EHDR',
+    sha256: expect.stringMatching(/^[a-f0-9]{64}$/) });
+});
 
 describe('SDK tokenizer native inference evidence', () => {
   it.each(['pipeline', 'output', 'error', 'raw-input'])('preserves the SDK %s route and observes its actual native call', (mode) => {
