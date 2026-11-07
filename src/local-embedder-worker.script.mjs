@@ -144,7 +144,10 @@ function sampleNativeLoaderProcess(libraries, vdsoRanges) {
       origin:'kernel-auxv-AT_SYSINFO_EHDR' } };
 }
 
-function sampleNativeRuntime(device) {
+/** Also usable by a main-process diagnostic without starting an embedder or
+ * loading a model. Keep this in the shipped single-file worker so native
+ * observations use the same inode, auxv and mapped-byte checks everywhere. */
+export function sampleNativeRuntime(device) {
   if (process.platform !== 'linux') return undefined;
   const beforeNs = process.hrtime.bigint().toString(), files = new Map(), vdsoRanges = [];
   for (const line of readFileSync('/proc/self/maps', 'utf8').trim().split('\n')) {
@@ -539,7 +542,7 @@ function announceRetiredIfIdle() {
   parentPort.postMessage({ kind: 'retired' });
 }
 
-parentPort.on('message', async (msg) => {
+parentPort?.on('message', async (msg) => {
   if (!msg || typeof msg !== 'object') return;
   if (msg.kind === 'retire') {
     retired = true;
@@ -611,4 +614,4 @@ async function handleEmbed(msg) {
 
 // Signal ready as soon as the message handler is installed. The model
 // loads lazily on first embed call.
-parentPort.postMessage({ kind: 'ready' });
+parentPort?.postMessage({ kind: 'ready' });
