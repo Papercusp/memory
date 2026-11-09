@@ -128,6 +128,45 @@ describe('CanonicalVectorStore store-kind segregation', () => {
     expect(queries).toEqual([]);
   });
 
+  it('admits only pinned archived resources within exact scoped IDs in page and count', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    const ids = ['11111111-1111-4111-8111-111111111111'];
+    await store.listPage({ user_id: 'scope-a', include_superseded: 'true',
+      archived_eligible: JSON.stringify({ key: 'identity_package_resource', values: ['resource-v1'] }) }, 8, 0, ids);
+    expect(queries).toHaveLength(2);
+    for (const query of queries) {
+      expect(query.sql).toContain("(state != 'archived' OR payload->>'identity_package_resource' = ANY($1::text[]))");
+      expect(query.sql).toContain('id = ANY($2::uuid[])');
+      expect(query.sql).toContain("payload->>'user_id' = $3");
+      expect(query.sql).not.toContain("payload->>'archived_eligible'");
+      expect(query.params.slice(0, 3)).toEqual([['resource-v1'], ids, 'scope-a']);
+    }
+  });
+
+  it.each(['not json', JSON.stringify({ key: 'identity_package_resource', values: [] })])(
+    'keeps malformed or empty archived eligibility excluded for exact reads: %s', async archived_eligible => {
+      const { store, queries } = makeStore('operator_memory_local');
+      await store.listPage({ user_id: 'scope-a', archived_eligible }, 8, 0,
+        ['11111111-1111-4111-8111-111111111111']);
+      for (const query of queries) {
+        expect(query.sql).toContain("state != 'archived'");
+        expect(query.sql).not.toContain("payload->>'identity_package_resource'");
+        expect(query.sql).not.toContain("payload->>'archived_eligible'");
+      }
+    });
+
+  it('does not widen ordinary listing when an archived eligibility control is supplied', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    await store.listPage({ user_id: 'scope-a', archived_eligible: JSON.stringify({
+      key: 'identity_package_resource', values: ['resource-v1'] }) }, 8, 0);
+    for (const query of queries) {
+      expect(query.sql).toContain("state != 'archived'");
+      expect(query.sql).not.toContain("payload->>'identity_package_resource'");
+      expect(query.sql).not.toContain("payload->>'archived_eligible'");
+      expect(query.params[0]).toBe('scope-a');
+    }
+  });
+
   it('entity-kind list sees only entity rows', async () => {
     const { store, queries } = makeStore('operator_memory_local_entities');
     await store.list(undefined, 10);

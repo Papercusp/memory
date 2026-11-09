@@ -493,6 +493,9 @@ export interface ListOptions {
 /** A bounded list request. Backends may implement this capability to keep the
  * database read bounded; callers fall back to `list()` when they do not. */
 export interface ListPageOptions extends ListOptions {
+  /** Re-admit exact pinned archived rows for source revalidation. Honoured
+   * only with `ids`; ordinary pool listing retains its active-only contract. */
+  archivedEligibility?: ArchivedEligibilityOption;
   /** Exact stored IDs within the requested pools. Empty selects nothing.
    * Backends unable to bound this selection must return no entries rather
    * than enumerate the pool or fall back to an unscoped get. */

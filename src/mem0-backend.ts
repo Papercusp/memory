@@ -71,9 +71,10 @@ function temporalFilters(opts: { asOf?: string; includeSuperseded?: boolean }): 
 
 /**
  * `SearchOptions.archivedEligibility` as a search FILTER key, JSON-encoded for
- * the same string-only seam. Search legs only: list() is not recall.
+ * the same string-only seam. Exact source revalidation shares this control;
+ * ordinary list() is not recall and does not pass it.
  */
-function recallFilters(opts: SearchOptions): Record<string, string> {
+function recallFilters(opts: Pick<SearchOptions, 'asOf' | 'includeSuperseded' | 'archivedEligibility'>): Record<string, string> {
   const eligible = opts.archivedEligibility;
   return {
     ...temporalFilters(opts),
@@ -759,7 +760,7 @@ export class Mem0Backend implements MemoryBackend {
     if (scopes.length === 0) return { entries: [], total: 0 };
     const filtersFor = (scope: string): Record<string, string> => ({
       user_id: scope,
-      ...temporalFilters(opts),
+      ...(ids ? recallFilters(opts) : temporalFilters(opts)),
       ...(opts.kind !== undefined ? { kind: opts.kind } : {}),
     });
 

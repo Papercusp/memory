@@ -653,6 +653,24 @@ describe('Mem0Backend.get', () => {
     expect(client.get).not.toHaveBeenCalled();
   });
 
+  it('passes pinned archived eligibility only to exact bounded listing, including its count', async () => {
+    const client = stubClient();
+    const listPage = vi.fn(async (_filters: Record<string, string>, topK: number) => ({
+      total: 1, rows: topK ? [{ id: UUID_A, payload: { data: 'pinned fact', user_id: 'userA' } }] : [],
+    }));
+    const be = new Mem0Backend({ getClient: async () => client, listPage });
+    const archivedEligibility = { key: 'identity_package_resource', values: ['resource-v1'] };
+    await be.listPage({ scope: 'userA', ids: [UUID_A], limit: 8, offset: 0, archivedEligibility });
+    const filters = { user_id: 'userA', archived_eligible: JSON.stringify(archivedEligibility) };
+    expect(listPage).toHaveBeenCalledWith(filters, 0, 0, [UUID_A]);
+    expect(listPage).toHaveBeenCalledWith(filters, 1, 0, [UUID_A]);
+    listPage.mockClear();
+    await be.listPage({ scope: 'userA', limit: 8, offset: 0, archivedEligibility });
+    expect(listPage.mock.calls.every(([filters]) => !('archived_eligible' in filters))).toBe(true);
+    expect(client.get).not.toHaveBeenCalled();
+    expect(client.getAll).not.toHaveBeenCalled();
+  });
+
   it('derives scope from row.user_id', async () => {
     const get = vi.fn(async () => ({ id: UUID_A, memory: 'hi', user_id: 'harness:y', metadata: { kind: 'project' } }));
     const be = new Mem0Backend({ getClient: async () => stubClient({ get }) });

@@ -1230,10 +1230,12 @@ export class CanonicalVectorStore {
         throw new Error('CanonicalVectorStore.listPage: exact IDs require a pool scope');
     }
     const client = await this.getClient();
-    const { temporal, rest } = splitTemporalControls(filters);
-    const conds: string[] = [storeKindCond('', this.storeKind), `state != 'archived'`];
+    const { eligible, rest: controls } = splitArchivedEligibility(filters);
+    const { temporal, rest } = splitTemporalControls(controls);
     const params: unknown[] = [];
     let idx = 1;
+    const conds: string[] = [storeKindCond('', this.storeKind),
+      archivedCond('', ids === undefined ? null : eligible, params, () => idx++)];
     if (ids !== undefined) {
       conds.push(`id = ANY($${idx++}::uuid[])`);
       params.push([...new Set(ids)]);
