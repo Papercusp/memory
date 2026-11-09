@@ -342,6 +342,7 @@ export interface Mem0BackendDeps {
     filters: Record<string, string>,
     topK: number,
     offset: number,
+    ids?: readonly string[],
   ) => Promise<{
     rows: Array<{ id: string; payload: Record<string, unknown>; score?: number }>;
     total: number;
@@ -740,11 +741,16 @@ export class Mem0Backend implements MemoryBackend {
     const limit = opts.limit;
     if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('Mem0Backend.listPage: offset must be a non-negative integer');
     if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error('Mem0Backend.listPage: limit must be a positive integer');
+    const ids = opts.ids === undefined ? undefined : [...new Set(opts.ids)];
+    if (ids && (ids.length > 256 || ids.some(id => typeof id !== 'string' || !UUID_RE.test(id))))
+      throw new Error('Mem0Backend.listPage: ids must contain at most 256 UUIDs');
+    if (ids?.length === 0) return { entries: [], total: 0 };
 
     // Test/in-memory clients do not expose the canonical SQL seam. Preserve
     // the old behavior there; production canonical clients take the bounded
     // path below.
     if (!this.canonicalListPage) {
+      if (ids) return { entries: [], total: 0 };
       const all = await this.list(opts);
       return { entries: all.slice(offset, offset + limit), total: all.length };
     }
@@ -760,12 +766,13 @@ export class Mem0Backend implements MemoryBackend {
     const counts: Array<Awaited<ReturnType<NonNullable<Mem0BackendDeps['listPage']>>> | undefined> =
       new Array(scopes.length);
     await forEachWithConcurrency(scopes, LEXICAL_SCOPE_CONCURRENCY, async (scope, index) => {
-      counts[index] = await this.canonicalListPage!(filtersFor(scope), 0, 0);
+      counts[index] = await this.canonicalListPage!(filtersFor(scope), 0, 0, ids);
     });
     // `null` means the configured mem0 client is the volatile in-process
     // implementation, which has no canonical SQL store. Fall back to its
     // existing bounded-in-handler behavior rather than fabricating a count.
     if (counts.some((page) => page === null || page === undefined)) {
+      if (ids) return { entries: [], total: 0 };
       const all = await this.list(opts);
       return { entries: all.slice(offset, offset + limit), total: all.length };
     }
@@ -784,8 +791,10 @@ export class Mem0Backend implements MemoryBackend {
         filtersFor(scopes[i]!),
         Math.min(remainingLimit, scopeTotal - remainingOffset),
         remainingOffset,
+        ids,
       );
       if (page === null) {
+        if (ids) return { entries: [], total: 0 };
         const all = await this.list(opts);
         return { entries: all.slice(offset, offset + limit), total: all.length };
       }

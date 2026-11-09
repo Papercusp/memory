@@ -1218,14 +1218,26 @@ export class CanonicalVectorStore {
     filters?: SearchFilters,
     topK = 100,
     offset = 0,
+    ids?: readonly string[],
   ): Promise<[VectorStoreResult[], number]> {
     if (!Number.isSafeInteger(topK) || topK < 0) throw new Error('CanonicalVectorStore.listPage: topK must be a non-negative integer');
     if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('CanonicalVectorStore.listPage: offset must be a non-negative integer');
+    if (ids !== undefined) {
+      if (ids.length > 256 || ids.some(id => typeof id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)))
+        throw new Error('CanonicalVectorStore.listPage: ids must contain at most 256 UUIDs');
+      if (ids.length === 0) return [[], 0];
+      if (typeof filters?.user_id !== 'string' || !filters.user_id.trim())
+        throw new Error('CanonicalVectorStore.listPage: exact IDs require a pool scope');
+    }
     const client = await this.getClient();
     const { temporal, rest } = splitTemporalControls(filters);
     const conds: string[] = [storeKindCond('', this.storeKind), `state != 'archived'`];
     const params: unknown[] = [];
     let idx = 1;
+    if (ids !== undefined) {
+      conds.push(`id = ANY($${idx++}::uuid[])`);
+      params.push([...new Set(ids)]);
+    }
     if (rest) {
       for (const [key, value] of Object.entries(rest)) {
         if (value === undefined || value === null) continue;

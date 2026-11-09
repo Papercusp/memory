@@ -202,6 +202,7 @@ export async function listPageCanonical(
   filters: Record<string, string>,
   topK: number,
   offset: number,
+  ids?: readonly string[],
 ): Promise<{
   rows: Array<{ id: string; payload: Record<string, unknown>; score?: number }>;
   total: number;
@@ -209,7 +210,7 @@ export async function listPageCanonical(
   await getMemoryClient();
   const store = [..._liveCanonicalStores][0];
   if (!store) return null;
-  const [rows, total] = await store.listPage(filters, topK, offset);
+  const [rows, total] = await store.listPage(filters, topK, offset, ids);
   return { rows, total };
 }
 

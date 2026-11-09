@@ -261,6 +261,7 @@ export class HybridBackend implements MemoryBackend {
 
   listPage(opts: ListPageOptions): Promise<MemoryListPage> {
     if (this.cosine.listPage) return this.cosine.listPage(opts);
+    if (opts.ids !== undefined) return Promise.resolve({ entries: [], total: 0 });
     return this.cosine.list(opts).then((entries) => ({
       entries: entries.slice(opts.offset, opts.offset + opts.limit),
       total: entries.length,

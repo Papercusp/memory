@@ -105,6 +105,29 @@ describe('CanonicalVectorStore store-kind segregation', () => {
     }
   });
 
+  it('exact list pages apply IDs and pool scope in both SQL reads, including closed validity', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    const ids = ['11111111-1111-4111-8111-111111111111'];
+    await store.listPage({ user_id: 'scope-a', include_superseded: 'true' }, 8, 0, ids);
+    expect(queries).toHaveLength(2);
+    for (const query of queries) {
+      expect(query.sql).toContain('id = ANY($1::uuid[])');
+      expect(query.sql).toContain("payload->>'user_id' = $2");
+      expect(query.params.slice(0, 2)).toEqual([ids, 'scope-a']);
+      expect(query.sql).not.toContain('invalid_at IS NULL');
+      expect(query.sql).toContain("state != 'archived'");
+    }
+  });
+
+  it('never widens an empty, malformed or unscoped exact selection', async () => {
+    const { store, queries } = makeStore('operator_memory_local');
+    expect(await store.listPage({ user_id: 'scope-a' }, 8, 0, [])).toEqual([[], 0]);
+    await expect(store.listPage({ user_id: 'scope-a' }, 8, 0, ['bad-id'])).rejects.toThrow('UUID');
+    await expect(store.listPage(undefined, 8, 0, ['11111111-1111-4111-8111-111111111111']))
+      .rejects.toThrow('pool scope');
+    expect(queries).toEqual([]);
+  });
+
   it('entity-kind list sees only entity rows', async () => {
     const { store, queries } = makeStore('operator_memory_local_entities');
     await store.list(undefined, 10);

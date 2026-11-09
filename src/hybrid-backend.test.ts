@@ -38,6 +38,16 @@ function fakeBackend(
 }
 
 describe("HybridBackend identity (memory-declaude-and-defaults-2026-07-28 P-003)", () => {
+  it('leaves exact scoped paging unknown when the canonical leg cannot support it', async () => {
+    const list = vi.fn(async () => [e('unrelated')]);
+    const get = vi.fn(async () => e('unrelated'));
+    const hybrid = new HybridBackend(fakeBackend('lexical', []), fakeBackend('cosine', [], { list, get }));
+    expect(await hybrid.listPage({ scope: 's', ids: ['confirmed'], limit: 8, offset: 0 }))
+      .toEqual({ entries: [], total: 0 });
+    expect(list).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
+  });
+
   it("reports the name it was CONSTRUCTED with, so two hybrid wirings are distinguishable", () => {
     const mem0 = new Mem0Backend();
     const pg = new HybridBackend(new LexicalLegBackend(mem0), mem0, {

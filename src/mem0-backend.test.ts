@@ -628,6 +628,31 @@ describe('Mem0Backend.list', () => {
 });
 
 describe('Mem0Backend.get', () => {
+  it('selects exact IDs in the canonical scoped page without an unscoped get', async () => {
+    const client = stubClient();
+    const listPage = vi.fn(async (_filters: Record<string, string>, topK: number, _offset: number, ids?: readonly string[]) => ({
+      total: 1, rows: topK ? [{ id: ids![0], payload: { data: 'closed fact', user_id: 'userA' } }] : [],
+    }));
+    const be = new Mem0Backend({ getClient: async () => client, listPage });
+    const out = await be.listPage({ scope: 'userA', ids: [UUID_A], limit: 8, offset: 0, includeSuperseded: true });
+    expect(out.entries).toMatchObject([{ id: UUID_A, scope: 'userA', text: 'closed fact' }]);
+    expect(listPage).toHaveBeenCalledWith({ user_id: 'userA', include_superseded: 'true' }, 0, 0, [UUID_A]);
+    expect(listPage).toHaveBeenCalledWith({ user_id: 'userA', include_superseded: 'true' }, 1, 0, [UUID_A]);
+    expect(client.get).not.toHaveBeenCalled();
+    expect(client.getAll).not.toHaveBeenCalled();
+  });
+
+  it('does not enumerate a pool when exact paging is unavailable or the IDs are empty', async () => {
+    const client = stubClient();
+    for (const listPage of [undefined, vi.fn(async () => null)]) {
+      const be = new Mem0Backend({ getClient: async () => client, listPage });
+      expect(await be.listPage({ scope: 'userA', ids: [UUID_A], limit: 8, offset: 0 })).toEqual({ entries: [], total: 0 });
+      expect(await be.listPage({ scope: 'userA', ids: [], limit: 8, offset: 0 })).toEqual({ entries: [], total: 0 });
+    }
+    expect(client.getAll).not.toHaveBeenCalled();
+    expect(client.get).not.toHaveBeenCalled();
+  });
+
   it('derives scope from row.user_id', async () => {
     const get = vi.fn(async () => ({ id: UUID_A, memory: 'hi', user_id: 'harness:y', metadata: { kind: 'project' } }));
     const be = new Mem0Backend({ getClient: async () => stubClient({ get }) });
