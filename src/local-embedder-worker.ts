@@ -551,6 +551,59 @@ function loadOnnxBindingFrom(fromPath: string): OnnxBindingPin {
   }
 }
 
+/** Where the local embed engine would load from, answered by resolution only. */
+export type LocalEmbedEngineResolution =
+  | { status: 'resolvable'; base: string; transformersEntry: string; onnxRuntimeEntry: string }
+  | { status: 'unavailable'; base: string; reason: string };
+
+/**
+ * Is the local embed engine installed where the embed worker will load it?
+ * Answered by module RESOLUTION, never by evaluation.
+ *
+ * WI-6554700010050711: the operator's `localAvailable()` used to answer this by
+ * importing `@huggingface/transformers` on the calling thread. That evaluates
+ * the package and loads its native dependencies (onnxruntime-node, sharp):
+ * measured 115-127ms of blocked event loop on a warm page cache and 862ms on a
+ * cold one, once per process, spent only to learn "is it installed". The worker
+ * does the real import, so this resolves the same two packages from the same
+ * base the worker and `pinOnnxRuntimeBinding` use (the worker script) in a few
+ * milliseconds. When the worker script cannot be located, this module's own
+ * location is the base: a missing script keeps surfacing where it always has,
+ * at the first embed, rather than as "not installed".
+ *
+ * Deliberate tradeoff: a package that resolves but cannot load (a broken native
+ * binary) is reported resolvable. Its failure surfaces as the worker's load
+ * error, with the real cause, on the first embed. Folding it into "not
+ * installed" is the mislabel dynamic-import.ts was written to stop.
+ */
+export function resolveLocalEmbedEngine(fromPath?: string): LocalEmbedEngineResolution {
+  const base = fromPath ?? engineResolutionBase();
+  let transformersEntry: string;
+  try {
+    transformersEntry = createRequire(base).resolve(TRANSFORMERS_PACKAGE);
+  } catch {
+    return { status: 'unavailable', base, reason: `${TRANSFORMERS_PACKAGE} is not resolvable from ${base}` };
+  }
+  try {
+    const onnxRuntimeEntry = createRequire(transformersEntry).resolve('onnxruntime-node');
+    return { status: 'resolvable', base, transformersEntry, onnxRuntimeEntry };
+  } catch {
+    return { status: 'unavailable', base, reason: `onnxruntime-node is not resolvable from ${transformersEntry}` };
+  }
+}
+
+function engineResolutionBase(): string {
+  try {
+    return workerPath();
+  } catch {
+    const metaUrl = runtimeMetaUrl();
+    if (metaUrl?.startsWith('file:')) return fileURLToPath(metaUrl);
+    const filename = runtimeFilename();
+    if (filename && isAbsolute(filename)) return filename;
+    return join(process.cwd(), WORKER_SCRIPT_NAME);
+  }
+}
+
 /** The pin outcome, or null when no worker has been spawned yet in this process. */
 export function getOnnxBindingPin(): OnnxBindingPin | null {
   return state.onnxBindingPin ?? null;

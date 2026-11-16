@@ -171,6 +171,8 @@ export {
   shutdownLocalEmbedder,
   recycleEmbedWorker,
   LOCAL_EMBEDDER_MODEL,
+  resolveLocalEmbedEngine,
+  type LocalEmbedEngineResolution,
 } from './local-embedder-worker';
 
 export {
