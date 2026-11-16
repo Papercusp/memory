@@ -123,6 +123,7 @@ beforeEach(async () => {
   failLink = new Set(); linked = []; connections = ended = 0; onLink = undefined;
   configureMemory({ getAdminUrl: () => 'postgres://u:p@localhost:5432/db',
     getCredentials: async () => ({}), resolveEmbedder: async () => ({ mode: 'disabled' as const }),
+    buildEmbedderForMode: async () => async () => [],
     schema: 'harness_shared' });
   vi.mocked(getMemoryClient).mockReset().mockResolvedValue(makeMem0() as never);
   ({ relinkEntities } = await import('./relink-entities'));
