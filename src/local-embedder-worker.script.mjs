@@ -17,7 +17,7 @@
  */
 
 import { parentPort, workerData, threadId } from 'node:worker_threads';
-import { readFileSync, readlinkSync, realpathSync, openSync, readSync, writeSync, closeSync, fstatSync, mkdirSync } from 'node:fs';
+import { readFileSync, readlinkSync, realpathSync, openSync, readSync, writeSync, closeSync, fstatSync, mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { isAbsolute, join, dirname } from 'node:path';
 import { availableParallelism, homedir } from 'node:os';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -363,6 +363,118 @@ function configureTransformersCache(t) {
   t.env.cacheDir = cacheDir;
 }
 
+/**
+ * EI-28961860650735669: drop a TORN cached model before Transformers.js resolves it.
+ *
+ * Transformers.js 4.2.0 resolves every model file on its own (FS cache, then
+ * localModelPath, then remote). Under Node it hands ONNX Runtime only the core
+ * file's PATH, and ORT finds the external data (`<core>_data`, `<core>_data_<n>`)
+ * by looking beside that path. A remote download that dies after the small core
+ * file but before its external data leaves the core cached and the data as an
+ * orphaned `<name>.tmp.<pid>.<rand>` partial. From then on every load, in every
+ * process sharing this cache, takes the cached core and fails with "cannot get
+ * file size ... model.onnx_data", even when a complete copy sits in
+ * localModelPath (measured 2026-11-16: gemma and harrier, after three killed
+ * downloads). The embedders then ran ONNX inline on the main thread and blocked
+ * the event loop for seconds. A cached core whose external data is not all
+ * beside it can never load, so removing it loses nothing: resolution falls
+ * through to the complete local copy, or re-downloads core and data together.
+ *
+ * The expected data files come from the model's own config, by the rule
+ * Transformers.js itself applies (`transformers.js_config.use_external_data_format`,
+ * resolveExternalDataFormat + getExternalDataChunkNames). Orphaned partials are
+ * removed too, but only once their writer is gone: the pid in the name no longer
+ * exists and the file has not been written for ORPHAN_PARTIAL_MIN_AGE_MS.
+ */
+const DTYPE_FILE_SUFFIXES = ['_fp16', '_int8', '_uint8', '_quantized', '_q4f16', '_q4', '_bnb4'];
+const MAX_EXTERNAL_DATA_CHUNKS = 100; // Transformers.js refuses more.
+const ORPHAN_PARTIAL_MIN_AGE_MS = 30 * 60_000;
+const CACHE_PARTIAL_NAME = /\.tmp\.(\d+)\.[0-9a-z]+$/;
+
+/** Chunk count Transformers.js would request for core `fullName` (0 = no external data). */
+function externalDataChunkCount(format, fullName) {
+  if (!format) return 0;
+  if (typeof format !== 'object') return Math.min(+format || 0, MAX_EXTERNAL_DATA_CHUNKS);
+  const own = (k) => Object.prototype.hasOwnProperty.call(format, k);
+  if (own(fullName)) return Math.min(+format[fullName] || 0, MAX_EXTERNAL_DATA_CHUNKS);
+  // Transformers.js falls back to the file stem without its dtype suffix
+  // (`model_fp16.onnx` -> `model`).
+  const stem = fullName.replace(/\.onnx$/, '');
+  const suffix = DTYPE_FILE_SUFFIXES.find((s) => stem.endsWith(s));
+  const fileName = suffix ? stem.slice(0, -suffix.length) : stem;
+  return own(fileName) ? Math.min(+format[fileName] || 0, MAX_EXTERNAL_DATA_CHUNKS) : 0;
+}
+
+function readJsonFile(path) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writerIsGone(pid) {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return Boolean(err && err.code === 'ESRCH');
+  }
+}
+
+/** Returns what was removed, or null when the cached entry was already sound. */
+function dropTornCachedModel(env, key, now = Date.now()) {
+  const cacheDir = env && env.cacheDir;
+  if (!cacheDir || !key) return null;
+  const modelDir = join(cacheDir, key);
+  const onnxDir = join(modelDir, 'onnx');
+  let names;
+  try {
+    names = readdirSync(onnxDir);
+  } catch {
+    return null;
+  }
+  const config = readJsonFile(join(modelDir, 'config.json'))
+    ?? (env.localModelPath ? readJsonFile(join(env.localModelPath, key, 'config.json')) : null);
+  const jsConfig = config && config['transformers.js_config'];
+  const format = jsConfig ? jsConfig.use_external_data_format : undefined;
+  const present = new Set(names);
+  const dropped = [];
+  for (const name of names) {
+    if (!name.endsWith('.onnx')) continue;
+    const missing = [];
+    const chunks = externalDataChunkCount(format, name);
+    for (let i = 0; i < chunks; i += 1) {
+      const dataName = `${name}_data${i === 0 ? '' : `_${i}`}`;
+      if (!present.has(dataName)) missing.push(dataName);
+    }
+    if (missing.length === 0) continue;
+    try {
+      unlinkSync(join(onnxDir, name));
+      dropped.push({ file: name, missing });
+    } catch {
+      // Another process repaired it first, or it is not ours to remove.
+    }
+  }
+  const orphans = [];
+  for (const name of names) {
+    const match = CACHE_PARTIAL_NAME.exec(name);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (pid === process.pid) continue;
+    const path = join(onnxDir, name);
+    try {
+      if (now - statSync(path).mtimeMs < ORPHAN_PARTIAL_MIN_AGE_MS) continue;
+      if (!writerIsGone(pid)) continue;
+      unlinkSync(path);
+      orphans.push(name);
+    } catch {
+      // Raced with its writer finishing, or with another repair.
+    }
+  }
+  return dropped.length > 0 || orphans.length > 0 ? { model: key, dropped, orphans } : null;
+}
+
 /** An error that means the GPU itself failed, not the input. */
 const GPU_FAILURE_PATTERN = /\b(cuda|cudnn|cublas|curand|cufft|gpu|tensorrt)\b|out of memory|failed to allocate memory for requested buffer/i;
 
@@ -406,6 +518,9 @@ function demote(stage, err) {
 
 async function buildPipeline(key) {
   const t = await loadTransformers();
+  // Before resolution, so a torn cache entry cannot shadow a loadable copy.
+  const repair = dropTornCachedModel(t.env, key);
+  if (repair) parentPort.postMessage({ kind: 'cache_repair', ...repair });
   const build = (d) => t.pipeline('feature-extraction', key, { session_options: ORT_SESSION_OPTIONS, device: d });
   if (device === 'cpu') {
     const pipe = await build('cpu');

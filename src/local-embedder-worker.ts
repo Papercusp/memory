@@ -640,6 +640,14 @@ function ensureWorker(): Promise<void> {
         applyWorkerDeviceReport(msg);
         return;
       }
+      // EI-28961860650735669: the worker removed a torn cached model (a core
+      // file whose external data never finished downloading) before loading.
+      if (msg.kind === 'cache_repair') {
+        if (process.env.NODE_ENV !== 'test') {
+          console.warn(`[embed] repaired torn Transformers.js cache entry: ${JSON.stringify(msg)}`);
+        }
+        return;
+      }
       if (typeof msg.id !== 'number') return;
       const p = state.pending.get(msg.id);
       if (!p) return;

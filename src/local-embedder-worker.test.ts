@@ -12,7 +12,7 @@
  * the user opts into memoryEmbedderMode='local'.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -246,6 +246,110 @@ describe('local-embedder-worker Transformers.js cache', () => {
       expect(readFileSync(join(home, 'cache', 'transformers', 'worker-write-probe'), 'utf8'))
         .toBe('memory-cache-write');
       expect(readFileSync(assetPath, 'utf8')).toBe('installed-model-asset');
+    } finally {
+      await worker.terminate();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+describe('local-embedder-worker torn Transformers.js cache (EI-28961860650735669)', () => {
+  // The measured failure: Transformers.js resolves the core model file from the
+  // FS cache before localModelPath, and ONNX Runtime then looks for external
+  // data beside that cached core. A download killed between the two left the
+  // core cached and the data as orphaned partials, so every load failed (and the
+  // embedders fell back to main-thread ONNX) until the core was removed.
+  it('drops a cached core whose external data is incomplete, then loads the complete local copy', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'memory-torn-cache-'));
+    const home = join(root, 'tenant-home');
+    const cacheDir = join(home, 'cache', 'transformers');
+    const packageRoot = join(root, 'transformers-package');
+    const packageCache = join(packageRoot, '.cache');
+    const seed = (base: string, key: string, chunks: number, files: string[]): void => {
+      mkdirSync(join(base, key, 'onnx'), { recursive: true });
+      writeFileSync(join(base, key, 'config.json'),
+        JSON.stringify({ 'transformers.js_config': { use_external_data_format: { 'model.onnx': chunks } } }));
+      for (const file of files) writeFileSync(join(base, key, 'onnx', file), file);
+    };
+    // Complete shipped copies.
+    seed(packageCache, 'fixture/torn', 2, ['model.onnx', 'model.onnx_data', 'model.onnx_data_1']);
+    seed(packageCache, 'fixture/sound', 1, ['model.onnx', 'model.onnx_data']);
+    // The torn cache entry: core and first chunk, the second chunk only as partials.
+    const deadPid = 99_999_999; // above Linux pid_max, so kill(pid, 0) is ESRCH
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60_000);
+    const deadStale = `model.onnx_data_1.tmp.${deadPid}.a1`;
+    const deadFresh = `model.onnx_data_1.tmp.${deadPid}.b2`;
+    const liveStale = `model.onnx_data_1.tmp.${process.ppid}.c3`;
+    seed(cacheDir, 'fixture/torn', 2, ['model.onnx', 'model.onnx_data', deadStale, deadFresh, liveStale]);
+    const tornOnnx = join(cacheDir, 'fixture/torn', 'onnx');
+    utimesSync(join(tornOnnx, deadStale), twoHoursAgo, twoHoursAgo);
+    utimesSync(join(tornOnnx, liveStale), twoHoursAgo, twoHoursAgo);
+    // A sound cache entry stays and is still served from the cache.
+    seed(cacheDir, 'fixture/sound', 1, ['model.onnx', 'model.onnx_data']);
+
+    const fakeModulePath = join(root, 'fake-transformers.mjs');
+    writeFileSync(fakeModulePath, `
+      import { parentPort } from 'node:worker_threads';
+      import { existsSync, readFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      export const env = {};
+      // Transformers.js 4.2.0 takes the core file from the cache before the
+      // local copy; ONNX Runtime needs the external data beside that core.
+      export function pipeline(task, key) {
+        const cachedCore = join(env.cacheDir, key, 'onnx', 'model.onnx');
+        const modelDir = existsSync(cachedCore) ? join(env.cacheDir, key) : join(env.localModelPath, key);
+        const config = JSON.parse(readFileSync(join(modelDir, 'config.json'), 'utf8'));
+        const chunks = config['transformers.js_config'].use_external_data_format['model.onnx'];
+        for (let i = 0; i < chunks; i += 1) {
+          const data = join(modelDir, 'onnx', 'model.onnx_data' + (i === 0 ? '' : '_' + i));
+          if (!existsSync(data)) {
+            throw new Error('filesystem error: cannot get file size: No such file or directory [' + data + ']');
+          }
+        }
+        parentPort.postMessage({ kind: 'fixture_loaded', key, modelDir });
+        return async () => ({ data: new Float32Array([0.5, 0.5]), dims: [1, 2] });
+      }
+    `);
+
+    const worker = new Worker(resolve(__dirname, 'local-embedder-worker.script.mjs'), {
+      execArgv: [],
+      env: { ...process.env, PAPERCUSP_HOME: home },
+      workerData: {
+        device: 'cpu',
+        transformersSpecifier: pathToFileURL(fakeModulePath).href,
+        transformersPackageRoot: packageRoot,
+      },
+    });
+    const repairs: unknown[] = [];
+    worker.on('message', (message: { kind?: string }) => {
+      if (message?.kind === 'cache_repair') repairs.push(message);
+    });
+    const next = workerMessages(worker);
+    try {
+      expect(await next('ready')).toMatchObject({ kind: 'ready' });
+      worker.postMessage({ kind: 'embed', id: 1, text: 'torn', model: 'fixture/torn' });
+      expect(await next('cache_repair')).toEqual({
+        kind: 'cache_repair',
+        model: 'fixture/torn',
+        dropped: [{ file: 'model.onnx', missing: ['model.onnx_data_1'] }],
+        orphans: [deadStale],
+      });
+      expect(await next('fixture_loaded'))
+        .toEqual({ kind: 'fixture_loaded', key: 'fixture/torn', modelDir: join(packageCache, 'fixture/torn') });
+      expect(await next('embed_ok')).toMatchObject({ kind: 'embed_ok', id: 1, vector: [0.5, 0.5] });
+      expect(existsSync(join(tornOnnx, 'model.onnx'))).toBe(false);
+      expect(existsSync(join(tornOnnx, 'model.onnx_data'))).toBe(true);
+      expect(existsSync(join(tornOnnx, deadStale))).toBe(false);
+      // A partial is kept while its writer may still be alive or writing.
+      expect(existsSync(join(tornOnnx, deadFresh))).toBe(true);
+      expect(existsSync(join(tornOnnx, liveStale))).toBe(true);
+
+      worker.postMessage({ kind: 'embed', id: 2, text: 'sound', model: 'fixture/sound' });
+      expect(await next('fixture_loaded'))
+        .toEqual({ kind: 'fixture_loaded', key: 'fixture/sound', modelDir: join(cacheDir, 'fixture/sound') });
+      expect(await next('embed_ok')).toMatchObject({ kind: 'embed_ok', id: 2, vector: [0.5, 0.5] });
+      expect(existsSync(join(cacheDir, 'fixture/sound', 'onnx', 'model.onnx'))).toBe(true);
+      expect(repairs).toHaveLength(1);
     } finally {
       await worker.terminate();
       rmSync(root, { recursive: true, force: true });
