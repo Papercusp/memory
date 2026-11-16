@@ -102,7 +102,7 @@ describe('gemmaPrompt (asymmetric task prompts)', () => {
   });
 });
 
-describe('buildGemmaEmbedder — non-sticky worker fallback (EI-16184)', () => {
+describe('buildGemmaEmbedder — worker-only, non-sticky (EI-16184, EI-28961860650735669)', () => {
   beforeEach(() => {
     vi.resetModules();
   });
@@ -111,69 +111,63 @@ describe('buildGemmaEmbedder — non-sticky worker fallback (EI-16184)', () => {
     vi.doUnmock('./dynamic-import');
   });
 
-  // dynamicImport deliberately bypasses package-level mocks. Stub its existing
-  // seam, as the Harrier tests do, so fallback never downloads a real model.
+  // dynamicImport is the first step of any inline (main-thread) model load.
+  // It throws here, so a reintroduced inline path can neither download a real
+  // model nor pass: the call would reject with this error, not the worker's.
   const stubInlineModel = () => {
-    const pipeline = vi.fn(async () => async () => ({ data: new Float32Array(768).fill(0.05) }));
-    const dynamicImport = vi.fn(async () => ({ pipeline }));
+    const dynamicImport = vi.fn(async () => {
+      throw new Error('inline-path-entered');
+    });
     vi.doMock('./dynamic-import', () => ({ dynamicImport }));
-    return { pipeline, dynamicImport };
+    return { dynamicImport };
   };
 
-  it('retries the worker path on the NEXT call after a transient failure — does not stick to inline forever', async () => {
-    const inline = stubInlineModel();
-    const embedViaWorker = vi
-      .fn()
-      .mockRejectedValueOnce(new Error('transient worker hiccup'))
-      .mockResolvedValueOnce(new Array(768).fill(0.1));
-    const getWorkerState = vi.fn(() => ({ alive: true, disabled: false, pendingCount: 0 }));
+  const mockWorker = (embedViaWorker: unknown, disabled = false) => {
     const warnEmbedFallback = vi.fn();
     vi.doMock('./local-embedder-worker', () => ({
-      applyTransformersRuntimePolicy: (value: unknown) => value,
       embedViaWorker,
-      getWorkerState,
+      embedWorkerDisabledError: (model: string) => new Error(`worker disabled: ${model}`),
+      getWorkerState: () => ({ alive: !disabled, disabled, pendingCount: 0 }),
       warnEmbedFallback,
       isEmbedWorkerShutdownError: () => false,
-      ORT_SESSION_OPTIONS: {},
     }));
+    return { warnEmbedFallback };
+  };
+
+  it('rejects a failed call with the worker error (no inline retry), then retries the worker on the NEXT call', async () => {
+    const inline = stubInlineModel();
+    const failure = new Error('transient worker hiccup');
+    const embedViaWorker = vi.fn().mockRejectedValueOnce(failure).mockResolvedValueOnce(new Array(768).fill(0.1));
+    const { warnEmbedFallback } = mockWorker(embedViaWorker);
 
     const { buildGemmaEmbedder } = await import('./gemma-embedder');
     const embed = buildGemmaEmbedder({ kind: 'query' });
 
-    expect(await embed('hello')).toHaveLength(GEMMA_TARGET_DIMS);
-    expect(inline.dynamicImport).toHaveBeenCalledWith('@huggingface/transformers');
-    expect(inline.pipeline).toHaveBeenCalledTimes(1);
+    await expect(embed('hello')).rejects.toBe(failure);
+    expect(warnEmbedFallback).toHaveBeenCalledWith('gemma', failure);
+    expect(inline.dynamicImport).not.toHaveBeenCalled();
 
     // Call 2 MUST re-attempt the worker — the old sticky `workerDisabled`
-    // flag would have skipped straight to inline forever after call 1.
+    // flag skipped it forever after one failure.
     const result = await embed('hello again');
     expect(embedViaWorker).toHaveBeenCalledTimes(2);
     expect(result).toHaveLength(GEMMA_TARGET_DIMS);
     expect(warnEmbedFallback).toHaveBeenCalledTimes(1);
-    expect(inline.pipeline).toHaveBeenCalledTimes(1);
+    expect(inline.dynamicImport).not.toHaveBeenCalled();
   });
 
-  it('skips the worker entirely once the module reports genuine, permanent unavailability', async () => {
+  it('rejects without touching the worker or the main thread once the module reports permanent unavailability', async () => {
     const inline = stubInlineModel();
     const embedViaWorker = vi.fn().mockResolvedValue(new Array(768).fill(0.1));
-    const getWorkerState = vi.fn(() => ({ alive: false, disabled: true, pendingCount: 0 }));
-    const warnEmbedFallback = vi.fn();
-    vi.doMock('./local-embedder-worker', () => ({
-      applyTransformersRuntimePolicy: (value: unknown) => value,
-      embedViaWorker,
-      getWorkerState,
-      warnEmbedFallback,
-      isEmbedWorkerShutdownError: () => false,
-      ORT_SESSION_OPTIONS: {},
-    }));
+    const { warnEmbedFallback } = mockWorker(embedViaWorker, true);
 
     const { buildGemmaEmbedder } = await import('./gemma-embedder');
     const embed = buildGemmaEmbedder({ kind: 'query' });
-    expect(await embed('hello')).toHaveLength(GEMMA_TARGET_DIMS);
+    await expect(embed('hello')).rejects.toThrow('worker disabled: gemma');
 
     expect(embedViaWorker).not.toHaveBeenCalled();
-    expect(inline.dynamicImport).toHaveBeenCalledTimes(1);
-    expect(inline.pipeline).toHaveBeenCalledTimes(1);
+    expect(warnEmbedFallback).toHaveBeenCalledWith('gemma', 'worker-disabled');
+    expect(inline.dynamicImport).not.toHaveBeenCalled();
   });
 });
 

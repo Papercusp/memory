@@ -38,11 +38,15 @@
  * shared space, and adoption means a full re-embed.
  */
 
-import { embedViaWorker, getWorkerState, isEmbedWorkerShutdownError, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
+import {
+  embedViaWorker,
+  embedWorkerDisabledError,
+  getWorkerState,
+  isEmbedWorkerShutdownError,
+  warnEmbedFallback,
+} from './local-embedder-worker';
 import { mrlTruncate } from './gemma-embedder';
 import { CANDIDATE_DIM_SPECS } from './embedder-dims';
-import { dynamicImport } from './dynamic-import';
-import { constructEmbedPipeline } from './embed-device';
 
 /** Transformers.js/ONNX build of Qwen/Qwen3-Embedding-0.6B. */
 export const QWEN3_MODEL = 'onnx-community/Qwen3-Embedding-0.6B-ONNX';
@@ -83,46 +87,28 @@ export function buildQwen3Embedder(opts: {
   dims?: number;
 }): (text: string) => Promise<number[]> {
   const { kind, dims = QWEN3_NATIVE_DIMS } = opts;
-  let pipelinePromise: Promise<(text: string, o: unknown) => Promise<{ data: Float32Array }>> | null = null;
 
   return async (text: string): Promise<number[]> => {
     const prompted = qwen3Prompt(kind, text);
-
-    if (!getWorkerState().disabled) {
-      try {
-        // normalize:false — MRL requires truncate-then-normalize, done below.
-        const full = await embedViaWorker(prompted, {
-          model: QWEN3_MODEL,
-          pooling: 'last_token',
-          normalize: false,
-        });
-        return mrlTruncate(full, dims);
-      } catch (err) {
-        if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
-        warnEmbedFallback('qwen3', err);
-      }
-    } else {
+    // Worker only: a failure rejects and nothing retries on the main thread
+    // (EI-28961860650735669, see warnEmbedFallback).
+    if (getWorkerState().disabled) {
       warnEmbedFallback('qwen3', 'worker-disabled');
+      throw embedWorkerDisabledError('qwen3');
     }
-
-    // Inline (main-thread) fallback — same thread-cap rationale as the worker.
-    if (!pipelinePromise) {
-      const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
-      pipelinePromise = constructEmbedPipeline(transformers, QWEN3_MODEL, ORT_SESSION_OPTIONS);
+    let full: number[];
+    try {
+      // normalize:false — MRL requires truncate-then-normalize, done below.
+      full = await embedViaWorker(prompted, {
+        model: QWEN3_MODEL,
+        pooling: 'last_token',
+        normalize: false,
+      });
+    } catch (err) {
+      // WI-10006602: a deliberate shutdown is not a worker failure.
+      if (!isEmbedWorkerShutdownError(err)) warnEmbedFallback('qwen3', err);
+      throw err;
     }
-    const pipe = await pipelinePromise;
-    const result = await pipe(prompted, { pooling: 'last_token', normalize: false });
-    return mrlTruncate(Array.from(result.data), dims);
+    return mrlTruncate(full, dims);
   };
 }
-
-/** The @huggingface/transformers package (lazily resolved — optional dep). */
-const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
-
-type TransformersModule = {
-  pipeline: (
-    task: string,
-    model: string,
-    opts?: Record<string, unknown>,
-  ) => Promise<(text: string, o: unknown) => Promise<{ data: Float32Array }>>;
-};

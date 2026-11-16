@@ -636,6 +636,24 @@ describe('local-embedder-worker (WI-37683: holds the loop while a request is in 
     expect(mod.isEmbedWorkerShutdownError(settled)).toBe(true);
   }, 30_000);
 
+  it('buildLocalEmbedder rejects with the worker error and never retries inference inline (EI-28961860650735669)', async () => {
+    const mod = await import('./local-embedder-worker');
+    await mod.embedViaWorker('warm').catch(() => { /* */ });
+    const embed = await mod.buildLocalEmbedder();
+
+    // The file's postMessage fixture answers this text with embed_err. Pre-fix
+    // the builder caught that worker failure and re-ran the request inline: it
+    // imported Transformers.js and built the ONNX pipeline on the calling
+    // thread, which blocked the event loop for seconds. That path settles with
+    // a vector or with its own load error, never with the worker's message.
+    await expect(embed('protocol-error')).rejects.toThrow('fixture inference error');
+
+    // Not sticky: the failure did not disable the worker, so the next call
+    // goes straight back to it (EI-16184).
+    expect(mod.getWorkerState().disabled).toBe(false);
+    await expect(embed('after-error')).resolves.toEqual([1, 0]);
+  }, 30_000);
+
   it('a transient runtime crash does not latch — the next call respawns instead of going inline (EI-20012631851693581)', async () => {
     const mod = await import('./local-embedder-worker');
     const { Worker } = await import('node:worker_threads');

@@ -34,17 +34,14 @@
  */
 
 import {
-  applyTransformersRuntimePolicy,
   embedViaWorker,
+  embedWorkerDisabledError,
   getWorkerState,
   isEmbedWorkerShutdownError,
-  ORT_SESSION_OPTIONS,
   warnEmbedFallback,
 } from './local-embedder-worker';
 import { mrlTruncate } from './gemma-embedder';
 import { EMBEDDER_DIM_SPECS } from './embedder-dims';
-import { dynamicImport } from './dynamic-import';
-import { constructEmbedPipeline } from './embed-device';
 
 /** Transformers.js/ONNX build of microsoft/harrier-oss-v1-0.6b. */
 export const HARRIER_MODEL = 'onnx-community/harrier-oss-v1-0.6b-ONNX';
@@ -80,21 +77,6 @@ function assertNativeDims(vec: number[]): number[] {
   return vec;
 }
 
-const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
-
-type Tensor = { data: Float32Array };
-/** The pipeline object doubles as tokenizer+model holder — the direct-call
- *  path uses those (mirroring the worker's `output` branch) since the
- *  pipeline's own pooling path cannot run on this export. */
-type RawPipeline = {
-  tokenizer: (text: string, opts?: Record<string, unknown>) => Record<string, unknown>;
-  model: (inputs: Record<string, unknown>) => Promise<Record<string, Tensor>>;
-};
-type TransformersModule = {
-  env?: { allowRemoteModels: boolean; allowLocalModels: boolean };
-  pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<RawPipeline>;
-};
-
 /**
  * Build a harrier embedder closure `(text) => number[]` for a fixed embed
  * `kind`: last-token pooled + L2-normalized (in-graph), `dims`-wide (native
@@ -102,60 +84,36 @@ type TransformersModule = {
  * truncate-then-normalize via `mrlTruncate`, which at native width is a
  * no-op renorm of an already-unit vector).
  *
- * Prefers the worker-thread path (0.6B params — inference blocks the main
- * loop far worse than gemma-300m); falls back to an inline main-thread
- * model call for THIS call when worker_threads is unavailable or the call
- * fails, warning (rate-limited) with the worker's real error. EI-16184: this
- * used to be sticky per closure — a single worker failure permanently
- * disabled the worker path for the rest of that closure's (often hour-long
- * cached) life, so every subsequent embed blocked the main event loop for a
- * full 0.6B-param inference. Every call now re-checks the module's own
- * liveness (`getWorkerState().disabled` — set only for genuine, permanent
- * unavailability; a crashed worker instead self-heals via `ensureWorker`'s
- * respawn), so a transient failure costs at most one degraded call. Both
- * paths cap ORT threads (the WI-3792 spin-pool storm).
+ * Inference runs only on the worker thread (0.6B params: on the main loop it
+ * blocks far worse than gemma-300m). A worker failure rejects THIS call and
+ * the caller degrades; nothing retries on the main thread
+ * (EI-28961860650735669, see warnEmbedFallback). Every call re-checks the
+ * worker (EI-16184): a crashed worker self-heals via `ensureWorker`'s
+ * respawn, so a transient failure costs one rejected call.
  */
 export function buildHarrierEmbedder(opts: {
   kind: HarrierEmbedKind;
   dims?: number;
 }): (text: string) => Promise<number[]> {
   const { kind, dims = HARRIER_NATIVE_DIMS } = opts;
-  let pipelinePromise: Promise<RawPipeline> | null = null;
 
   return async (text: string): Promise<number[]> => {
     const prompted = harrierPrompt(kind, text);
-
-    if (!getWorkerState().disabled) {
-      try {
-        const full = await embedViaWorker(prompted, {
-          model: HARRIER_MODEL,
-          output: HARRIER_GRAPH_OUTPUT,
-        });
-        return mrlTruncate(assertNativeDims(full), dims);
-      } catch (err) {
-        if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
-        warnEmbedFallback('harrier', err);
-      }
-    } else {
+    if (getWorkerState().disabled) {
       warnEmbedFallback('harrier', 'worker-disabled');
+      throw embedWorkerDisabledError('harrier');
     }
-
-    // Inline (main-thread) fallback — same direct model call as the worker.
-    if (!pipelinePromise) {
-      const transformers = applyTransformersRuntimePolicy(
-        await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE),
-      );
-      pipelinePromise = constructEmbedPipeline(transformers, HARRIER_MODEL, ORT_SESSION_OPTIONS);
+    let full: number[];
+    try {
+      full = await embedViaWorker(prompted, {
+        model: HARRIER_MODEL,
+        output: HARRIER_GRAPH_OUTPUT,
+      });
+    } catch (err) {
+      // WI-10006602: a deliberate shutdown is not a worker failure.
+      if (!isEmbedWorkerShutdownError(err)) warnEmbedFallback('harrier', err);
+      throw err;
     }
-    const pipe = await pipelinePromise;
-    const enc = pipe.tokenizer(prompted, { padding: true, truncation: true });
-    const out = await pipe.model(enc);
-    const tensor = out[HARRIER_GRAPH_OUTPUT];
-    if (!tensor) {
-      throw new Error(
-        `harrier model output '${HARRIER_GRAPH_OUTPUT}' missing (has: ${Object.keys(out).join(', ')})`,
-      );
-    }
-    return mrlTruncate(assertNativeDims(Array.from(tensor.data)), dims);
+    return mrlTruncate(assertNativeDims(full), dims);
   };
 }

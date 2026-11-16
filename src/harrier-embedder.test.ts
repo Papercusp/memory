@@ -63,90 +63,72 @@ describe('width handling (native 1024 / exploratory 384)', () => {
   });
 });
 
-describe('buildHarrierEmbedder — non-sticky worker fallback (EI-16184)', () => {
+describe('buildHarrierEmbedder — worker-only, non-sticky (EI-16184, EI-28961860650735669)', () => {
   beforeEach(() => {
     vi.resetModules();
   });
 
   /**
-   * Stub the INLINE (main-thread) fallback so these tests keep this file's
-   * stated contract — pin the worker-retry semantics "WITHOUT loading the ~0.6B
-   * model" (see the file header). Both tests below deliberately drive the
-   * embedder down the inline path, which really did `pipeline(...)` the
-   * onnx-community/harrier-oss-v1-0.6b-ONNX build: ~5-7s of real model load for
-   * a test whose subject is worker RETRY, not inference. That straddled vitest's
-   * 5s default and red-pinned the fleet green-checkpoint on candidate a94547c8
-   * ("Test timed out in 5000ms") while passing on a warm/idle box — a genuine
-   * timing flake, so the fix is to remove the real-resource dependency rather
-   * than widen the timeout. Real model loading stays covered by the P-006
-   * bake-off smoke, so no coverage moves.
-   *
-   * It must be `./dynamic-import` and not '@huggingface/transformers':
-   * dynamicImport() resolves the package through `new Function('s','return
-   * import(s)')` specifically to hide it from bundler static analysis, and that
-   * also puts it beyond vitest's module interception — mocking the package name
-   * would silently no-op and load the real model anyway.
+   * dynamicImport is the first step of any inline (main-thread) model load. It
+   * throws here, so a reintroduced inline path can neither load the ~0.6B model
+   * (a real load took 5-7s and once red-pinned the gate on candidate a94547c8)
+   * nor pass: the call would reject with this error, not the worker's. It must
+   * be `./dynamic-import`, not '@huggingface/transformers': dynamicImport()
+   * resolves the package through `new Function('s','return import(s)')`, which
+   * vitest's module interception cannot see.
    */
   const stubInlineModel = () => {
-    vi.doMock('./dynamic-import', () => ({
-      dynamicImport: async () => ({
-        pipeline: async () => ({
-          tokenizer: () => ({}),
-          model: async () => ({
-            [HARRIER_GRAPH_OUTPUT]: { data: new Float32Array(HARRIER_NATIVE_DIMS).fill(0.05) },
-          }),
-        }),
-      }),
-    }));
+    const dynamicImport = vi.fn(async () => {
+      throw new Error('inline-path-entered');
+    });
+    vi.doMock('./dynamic-import', () => ({ dynamicImport }));
+    return { dynamicImport };
   };
 
-  it('retries the worker path on the NEXT call after a transient failure — does not stick to inline forever', async () => {
-    stubInlineModel();
-    const embedViaWorker = vi
-      .fn()
-      .mockRejectedValueOnce(new Error('transient worker hiccup'))
-      .mockResolvedValueOnce(new Array(HARRIER_NATIVE_DIMS).fill(0.1));
-    const getWorkerState = vi.fn(() => ({ alive: true, disabled: false, pendingCount: 0 }));
+  const mockWorker = (embedViaWorker: unknown, disabled = false) => {
     const warnEmbedFallback = vi.fn();
     vi.doMock('./local-embedder-worker', () => ({
-      applyTransformersRuntimePolicy: (value: unknown) => value,
       embedViaWorker,
-      getWorkerState,
+      embedWorkerDisabledError: (model: string) => new Error(`worker disabled: ${model}`),
+      getWorkerState: () => ({ alive: !disabled, disabled, pendingCount: 0 }),
       warnEmbedFallback,
       isEmbedWorkerShutdownError: () => false,
-      ORT_SESSION_OPTIONS: {},
     }));
+    return { warnEmbedFallback };
+  };
+
+  it('rejects a failed call with the worker error (no inline retry), then retries the worker on the NEXT call', async () => {
+    const inline = stubInlineModel();
+    const failure = new Error('transient worker hiccup');
+    const embedViaWorker = vi
+      .fn()
+      .mockRejectedValueOnce(failure)
+      .mockResolvedValueOnce(new Array(HARRIER_NATIVE_DIMS).fill(0.1));
+    const { warnEmbedFallback } = mockWorker(embedViaWorker);
 
     const { buildHarrierEmbedder } = await import('./harrier-embedder');
     const embed = buildHarrierEmbedder({ kind: 'query' });
 
-    await embed('hello').catch(() => {});
-
+    await expect(embed('hello')).rejects.toBe(failure);
     const result = await embed('hello again');
     expect(embedViaWorker).toHaveBeenCalledTimes(2);
     expect(result).toHaveLength(HARRIER_NATIVE_DIMS);
     expect(warnEmbedFallback).toHaveBeenCalledTimes(1);
+    expect(inline.dynamicImport).not.toHaveBeenCalled();
   });
 
-  it('skips the worker entirely once the module reports genuine, permanent unavailability', async () => {
-    stubInlineModel();
+  it('rejects without touching the worker or the main thread once the module reports permanent unavailability', async () => {
+    const inline = stubInlineModel();
     const embedViaWorker = vi.fn().mockResolvedValue(new Array(HARRIER_NATIVE_DIMS).fill(0.1));
-    const getWorkerState = vi.fn(() => ({ alive: false, disabled: true, pendingCount: 0 }));
-    const warnEmbedFallback = vi.fn();
-    vi.doMock('./local-embedder-worker', () => ({
-      applyTransformersRuntimePolicy: (value: unknown) => value,
-      embedViaWorker,
-      getWorkerState,
-      warnEmbedFallback,
-      isEmbedWorkerShutdownError: () => false,
-      ORT_SESSION_OPTIONS: {},
-    }));
+    const { warnEmbedFallback } = mockWorker(embedViaWorker, true);
 
     const { buildHarrierEmbedder } = await import('./harrier-embedder');
     const embed = buildHarrierEmbedder({ kind: 'query' });
-    await embed('hello').catch(() => {});
+    await expect(embed('hello')).rejects.toThrow('worker disabled: harrier');
 
     expect(embedViaWorker).not.toHaveBeenCalled();
+    expect(warnEmbedFallback).toHaveBeenCalledWith('harrier', 'worker-disabled');
+    expect(inline.dynamicImport).not.toHaveBeenCalled();
   });
 });
 

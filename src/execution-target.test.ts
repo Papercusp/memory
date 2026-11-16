@@ -13,8 +13,9 @@
  *   1. `embedRequestedExecution()` claims every embed path constructs through
  *      the device selector (embed-device.ts) and pins no dtype. That is a claim
  *      ABOUT CODE, and the derived-truth ladder says such a claim must be pinned
- *      or it drifts. The source scan below fails the moment an embedder builds a
- *      pipeline around the selector, or anything passes `dtype:`. (Until
+ *      or it drifts. The source scan below fails the moment a main-thread
+ *      embedder module builds a pipeline at all (since EI-28961860650735669
+ *      only the worker builds one), or anything passes `dtype:`. (Until
  *      2026-09-24 this pinned the opposite — that NO device was requested.)
  *
  *   2. An unmeasured probe must never render as a confident `false`. A detector
@@ -48,10 +49,12 @@ import {
 const SRC = dirname(fileURLToPath(import.meta.url));
 
 /**
- * Every module that constructs a feature-extraction pipeline. Hardcoding the
- * list is deliberate: a NEW embedder file must be added here consciously, and
- * the completeness assertion below fails if one of these stops constructing a
- * pipeline (a rename that would otherwise silently shrink the scan's coverage).
+ * Every embedder's main-thread module. Hardcoding the list is deliberate: a NEW
+ * embedder file must be added here consciously, and the completeness assertion
+ * below fails if one of these stops routing through the worker (a rename that
+ * would otherwise silently shrink the scan's coverage). Since
+ * EI-28961860650735669 none of them builds a pipeline: inference runs only on
+ * the worker, whose script is scanned separately (WORKER_SCRIPT).
  */
 const EMBEDDER_SOURCES = [
   'gemma-embedder.ts',
@@ -106,11 +109,13 @@ describe('embed execution target — the detector the 14 latency filings lacked'
   });
 
   describe('every embed path constructs through the device selector (pinned to the sources)', () => {
-    // Since 2026-09-24 the embedders DO request a device (embed-device.ts, plan
-    // memory-reduction-2026-09-24 D-003). What must hold now: no embedder builds
-    // a pipeline around the selector (it would silently skip the GPU choice AND
-    // the CPU fallback), and nothing passes a dtype (only the device may move,
-    // or new vectors drift from the stored corpus).
+    // Since 2026-09-24 the embed path DOES request a device (embed-device.ts,
+    // plan memory-reduction-2026-09-24 D-003). Since EI-28961860650735669 the
+    // worker is the ONLY place an embed pipeline is built: a main-thread build
+    // blocked the event loop for seconds. What must hold now: no main-thread
+    // embedder module builds a pipeline, the worker and the selector pass a
+    // device on every pipeline call, and nothing passes a dtype (only the
+    // device may move, or new vectors drift from the stored corpus).
     const tsSources = EMBEDDER_SOURCES.map((file) => ({ file, source: readFileSync(join(SRC, file), 'utf8') }));
     // The files that DO call pipeline('feature-extraction', …) directly: the
     // selector itself and the worker script (the hot path — which the pre-2026-09-24
@@ -120,18 +125,20 @@ describe('embed execution target — the detector the 14 latency filings lacked'
       blocks: pipelineOptionBlocks(readFileSync(join(SRC, file), 'utf8')),
     }));
 
-    it('every embedder constructs through constructEmbedPipeline (positive control for coverage)', () => {
+    it('every embedder routes inference through embedViaWorker (positive control for coverage)', () => {
       for (const { file, source } of tsSources) {
-        expect(source, `${file} — no constructEmbedPipeline( call found`).toContain('constructEmbedPipeline(');
+        expect(source, `${file} — no embedViaWorker( call found`).toContain('embedViaWorker(');
       }
     });
 
-    it('no embedder calls pipeline(\'feature-extraction\') around the selector', () => {
-      const offenders = tsSources.filter(({ source }) => source.includes(PIPELINE_CALL)).map(({ file }) => file);
+    it('no embedder builds a pipeline on the main thread (EI-28961860650735669)', () => {
+      const offenders = tsSources
+        .filter(({ source }) => source.includes(PIPELINE_CALL) || source.includes('constructEmbedPipeline('))
+        .map(({ file }) => file);
       expect(
         offenders,
-        `${offenders.join(', ')} build a pipeline directly — route it through constructEmbedPipeline so the ` +
-          'device choice, the CPU fallback and /healthz all see it.',
+        `${offenders.join(', ')} build an embed pipeline on the main thread. Inference runs only on the ` +
+          'worker: a main-thread ONNX load blocks the event loop for seconds (EI-28961860650735669).',
       ).toEqual([]);
     });
 

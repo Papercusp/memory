@@ -10,9 +10,9 @@
  * interrupted requests settling 8-18s late), where mdenseon — no inline path —
  * answered fast classified 500s.
  *
- * Every guarded case is paired with a CALIBRATION control: a generic worker-path
- * error on the same builder DOES reach the inline path. Without it, a probe that
- * could never observe the inline path would pass the guard vacuously.
+ * Since EI-28961860650735669 no builder has an inline path at all. Each guarded
+ * case is paired with a generic worker-path error that must be warned and
+ * re-thrown unchanged; an inline rescue would surface 'inline-path-entered'.
  * `buildLocalEmbedder` lives inside the worker module itself, so it is guarded
  * against a real worker in `local-embedder-worker.test.ts`.
  */
@@ -72,14 +72,19 @@ describe('builders never rescue a deliberate worker shutdown inline (WI-10006602
       expect(m.dynamicImport).not.toHaveBeenCalled();
     });
 
-    it(`${b.name}: calibration - a generic worker-path error DOES reach the inline path`, async () => {
+    // EI-28961860650735669: there is no inline path any more. A generic worker
+    // error is warned (it IS a worker failure, unlike a shutdown) and rejects
+    // with that same error. Any inline rescue would reject with
+    // 'inline-path-entered' instead, so `rejects.toBe(failure)` is the guard.
+    it(`${b.name}: a generic worker-path error is warned and re-thrown, never retried inline`, async () => {
       const m = mockWorkerPath();
-      m.embedViaWorker.mockRejectedValue(new Error('transient worker hiccup'));
+      const failure = new Error('transient worker hiccup');
+      m.embedViaWorker.mockRejectedValue(failure);
       const embed = await b.build();
 
-      await expect(embed('hello')).rejects.toThrow('inline-path-entered');
+      await expect(embed('hello')).rejects.toBe(failure);
       expect(m.warnEmbedFallback).toHaveBeenCalledTimes(1);
-      expect(m.dynamicImport).toHaveBeenCalledTimes(1);
+      expect(m.dynamicImport).not.toHaveBeenCalled();
     });
   }
 });

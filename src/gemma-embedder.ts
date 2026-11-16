@@ -65,21 +65,16 @@
  */
 
 import {
-  applyTransformersRuntimePolicy,
   embedViaWorker,
+  embedWorkerDisabledError,
   getWorkerState,
   isEmbedWorkerShutdownError,
-  ORT_SESSION_OPTIONS,
   warnEmbedFallback,
 } from './local-embedder-worker';
 import { EMBEDDER_DIM_SPECS } from './embedder-dims';
-import { dynamicImport } from './dynamic-import';
-import { constructEmbedPipeline } from './embed-device';
 
 /** Transformers.js/ONNX build of EmbeddingGemma-300m. */
 export const GEMMA_MODEL = 'onnx-community/embeddinggemma-300m-ONNX';
-/** The @huggingface/transformers package (lazily resolved — optional dep). */
-const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
 /** MRL truncation target — currently the model's NATIVE 768, so this slice is
  *  an identity and no untrained cut happens (the former 384 is gone; D-005).
  *  EmbeddingGemma's supported MRL dims are 768/512/256/128. See the DIMENSION
@@ -124,28 +119,17 @@ export function mrlTruncate(vec: number[], dims: number = GEMMA_TARGET_DIMS): nu
   return sliced.map((v) => v / norm);
 }
 
-type TransformersModule = {
-  env?: { allowRemoteModels: boolean; allowLocalModels: boolean };
-  pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<Pipeline>;
-};
-type Pipeline = (text: string, opts: unknown) => Promise<{ data: Float32Array }>;
-
 /**
  * Build an EmbeddingGemma-300m embedder closure `(text) => number[]` (384-dim,
  * MRL-truncated + renormalized) for a fixed embed `kind`. Storage/mem0 build
  * with `kind: 'document'`; search's query embedder builds with `kind: 'query'`.
  *
- * Prefers the worker-thread path (off the main event loop — EmbeddingGemma-300m
- * is ~10x BGE-small's params, so main-thread inference blocks noticeably);
- * falls back to an inline main-thread pipeline for THIS call when the worker
- * is unavailable or the call fails. EI-16184: this used to be sticky per
- * closure (a single worker failure permanently disabled the worker path,
- * silently, for the rest of that closure's — often hour-long cached — life,
- * making every subsequent embed block the main event loop). Every call now
- * re-checks the module's own liveness (`getWorkerState().disabled` — set
- * only for genuine, permanent unavailability; a crashed worker instead
- * self-heals via `ensureWorker`'s respawn), so a transient failure costs at
- * most one degraded call.
+ * Inference runs only on the worker thread (EmbeddingGemma-300m is ~10x
+ * BGE-small's params). A worker failure rejects THIS call and the caller
+ * degrades; nothing retries on the main thread (EI-28961860650735669, see
+ * warnEmbedFallback). Every call re-checks the worker (EI-16184): a crashed
+ * worker self-heals via `ensureWorker`'s respawn, so a transient failure
+ * costs one rejected call.
  *
  * `dims` overrides the truncation width for MEASUREMENT ONLY (the P-002 MRL
  * sweep scores 768/512/384/256 against one gold set), mirroring the `dims`
@@ -159,34 +143,22 @@ export function buildGemmaEmbedder(opts: {
   dims?: number;
 }): (text: string) => Promise<number[]> {
   const { kind, dims = GEMMA_TARGET_DIMS } = opts;
-  let pipelinePromise: Promise<Pipeline> | null = null;
 
   return async (text: string): Promise<number[]> => {
     const prompted = gemmaPrompt(kind, text);
-
-    if (!getWorkerState().disabled) {
-      try {
-        // normalize:false — MRL requires truncate-then-normalize, done below.
-        const full = await embedViaWorker(prompted, { model: GEMMA_MODEL, normalize: false });
-        return mrlTruncate(full, dims);
-      } catch (err) {
-        if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
-        warnEmbedFallback('gemma', err);
-      }
-    } else {
+    if (getWorkerState().disabled) {
       warnEmbedFallback('gemma', 'worker-disabled');
+      throw embedWorkerDisabledError('gemma');
     }
-
-    // Inline (main-thread) fallback.
-    if (!pipelinePromise) {
-      const transformers = applyTransformersRuntimePolicy(
-        await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE),
-      );
-      // Same thread-cap rationale as the worker path (WI-3792 spin-pool storm).
-      pipelinePromise = constructEmbedPipeline(transformers, GEMMA_MODEL, ORT_SESSION_OPTIONS);
+    let full: number[];
+    try {
+      // normalize:false — MRL requires truncate-then-normalize, done below.
+      full = await embedViaWorker(prompted, { model: GEMMA_MODEL, normalize: false });
+    } catch (err) {
+      // WI-10006602: a deliberate shutdown is not a worker failure.
+      if (!isEmbedWorkerShutdownError(err)) warnEmbedFallback('gemma', err);
+      throw err;
     }
-    const pipe = await pipelinePromise;
-    const result = await pipe(prompted, { pooling: 'mean', normalize: false });
-    return mrlTruncate(Array.from(result.data), dims);
+    return mrlTruncate(full, dims);
   };
 }

@@ -180,10 +180,11 @@ export type EmbedExecutionHealth = {
 };
 
 /**
- * The device/dtype the embed path requests right now. Every embedder constructs
- * through `constructEmbedPipeline` (or, in the worker, the device handed over
- * from `currentEmbedDeviceDecision`) — PINNED by `execution-target.test.ts`
- * against the embedder sources, so this cannot drift into a lie.
+ * The device/dtype the embed path requests right now. The pipeline is built
+ * only on the worker, with the device handed over from
+ * `currentEmbedDeviceDecision`; no main-thread embedder builds one
+ * (EI-28961860650735669). PINNED by `execution-target.test.ts` against the
+ * embedder sources, so this cannot drift into a lie.
  */
 export function embedRequestedExecution(): EmbedRequestedExecution {
   const d = currentEmbedDeviceDecision();

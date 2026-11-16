@@ -50,11 +50,15 @@
  * incomparable cosine. Adoption means a full re-embed, never a mixed table.
  */
 
-import { embedViaWorker, getWorkerState, isEmbedWorkerShutdownError, ORT_SESSION_OPTIONS, warnEmbedFallback } from './local-embedder-worker';
+import {
+  embedViaWorker,
+  embedWorkerDisabledError,
+  getWorkerState,
+  isEmbedWorkerShutdownError,
+  warnEmbedFallback,
+} from './local-embedder-worker';
 import { mrlTruncate } from './gemma-embedder';
 import { CANDIDATE_DIM_SPECS } from './embedder-dims';
-import { dynamicImport } from './dynamic-import';
-import { constructEmbedPipeline } from './embed-device';
 
 /** The two R2 multilingual sizes under evaluation. */
 export type GraniteVariant = '97m' | '311m';
@@ -108,41 +112,25 @@ export function buildGraniteEmbedder(opts: {
   const { variant } = opts;
   const model = GRANITE_MODELS[variant];
   const dims = opts.dims ?? graniteNativeDims(variant);
-  let pipelinePromise: Promise<(text: string, o: unknown) => Promise<{ data: Float32Array }>> | null = null;
+  const name = `granite-${variant}`;
 
   return async (text: string): Promise<number[]> => {
     // No prompt: granite r2 declares both prompts empty (see docblock).
-    if (!getWorkerState().disabled) {
-      try {
-        // normalize:false — MRL requires truncate-then-normalize, done below.
-        const full = await embedViaWorker(text, { model, pooling: 'cls', normalize: false });
-        return mrlTruncate(full, dims);
-      } catch (err) {
-        if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
-        warnEmbedFallback(`granite-${variant}`, err);
-      }
-    } else {
-      warnEmbedFallback(`granite-${variant}`, 'worker-disabled');
+    // Worker only: a failure rejects and nothing retries on the main thread
+    // (EI-28961860650735669, see warnEmbedFallback).
+    if (getWorkerState().disabled) {
+      warnEmbedFallback(name, 'worker-disabled');
+      throw embedWorkerDisabledError(name);
     }
-
-    // Inline (main-thread) fallback — same thread-cap rationale as the worker.
-    if (!pipelinePromise) {
-      const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
-      pipelinePromise = constructEmbedPipeline(transformers, model, ORT_SESSION_OPTIONS);
+    let full: number[];
+    try {
+      // normalize:false — MRL requires truncate-then-normalize, done below.
+      full = await embedViaWorker(text, { model, pooling: 'cls', normalize: false });
+    } catch (err) {
+      // WI-10006602: a deliberate shutdown is not a worker failure.
+      if (!isEmbedWorkerShutdownError(err)) warnEmbedFallback(name, err);
+      throw err;
     }
-    const pipe = await pipelinePromise;
-    const result = await pipe(text, { pooling: 'cls', normalize: false });
-    return mrlTruncate(Array.from(result.data), dims);
+    return mrlTruncate(full, dims);
   };
 }
-
-/** The @huggingface/transformers package (lazily resolved — optional dep). */
-const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
-
-type TransformersModule = {
-  pipeline: (
-    task: string,
-    model: string,
-    opts?: Record<string, unknown>,
-  ) => Promise<(text: string, o: unknown) => Promise<{ data: Float32Array }>>;
-};

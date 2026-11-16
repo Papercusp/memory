@@ -47,9 +47,12 @@
  * is plain JS copied as ONE file into bundles, so it cannot import this module.
  * The main thread resolves the device here and hands it to the worker as
  * `workerData.device`; the worker reports back what actually constructed
- * (`{ kind: 'device', … }`), which lands in `recordEmbedPipelineDevice`.
- * The inline (main-thread) fallback paths call `constructEmbedPipeline`
- * directly. Either way, `/healthz` reads one state.
+ * (`{ kind: 'device', … }`), which lands in `recordEmbedPipelineDevice`, the
+ * one state `/healthz` reads. Since EI-28961860650735669 nothing on the main
+ * thread builds an embed pipeline: a worker failure rejects the call instead
+ * of retrying inline. `constructEmbedPipeline` therefore has no production
+ * caller; it is kept with its CPU-fallback contract (embed-device.test.ts and
+ * the operator-core rail-migration embed-device case).
  */
 
 import { existsSync, readdirSync } from 'node:fs';

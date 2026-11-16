@@ -14,8 +14,8 @@
  * marshall {id, text} → worker via `postMessage`, await on a pending
  * Promise keyed by id, and resolve when {id, vector} comes back.
  *
- * Falls back to inline (main-thread) embedding if worker_threads can't
- * be loaded — keeps behavior backward-compatible.
+ * There is no inline (main-thread) fallback: if worker_threads can't be
+ * loaded, embedding rejects (EI-28961860650735669, see warnEmbedFallback).
  */
 
 import { pinModuleState } from '@papercusp/module-singleton';
@@ -25,9 +25,8 @@ import { createRequire } from 'node:module';
 import { availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname, isAbsolute, join } from 'node:path';
-import { dynamicImport } from './dynamic-import';
 import { observeFallback } from './config';
-import { applyWorkerDeviceReport, constructEmbedPipeline, currentEmbedDeviceDecision } from './embed-device';
+import { applyWorkerDeviceReport, currentEmbedDeviceDecision } from './embed-device';
 
 interface PendingRequest {
   resolve: (v: number[]) => void;
@@ -846,8 +845,9 @@ export interface EmbedViaWorkerOpts {
  * The worker caches one pipeline PER model, so mixing models (BGE + Gemma) in
  * one process is safe — each `model` gets its own warm pipeline.
  *
- * Throws when worker_threads is unavailable or the worker has failed
- * — callers should fall back to inline embedding in that case.
+ * Throws when worker_threads is unavailable or the worker has failed.
+ * Builders re-throw it and the caller degrades; nothing retries inline
+ * (EI-28961860650735669).
  */
 /** Observe actual adapter calls without replacing their embedder or changing
  * model/tokenizer settings. The caller owns this process-local diagnostic
@@ -1148,20 +1148,25 @@ export function isEmbedWorkerShutdownError(err: unknown): boolean {
 }
 
 /**
- * Rate-limited warning for a builder (gemma/harrier/local) falling back to
- * inline (main-thread-blocking) embedding for ONE call (EI-16184). Every
- * embedViaWorker() failure used to permanently stick that embedder CLOSURE
- * to the inline path for the rest of the process's life (see the removed
- * per-closure `workerDisabled` booleans this replaces) — completely silent
- * for two of the three builders — so a single transient worker hiccup (a
- * crash mid-request, a spawn race during a noisy post-restart boot window)
- * condemned every subsequent embed on that closure to block the event loop
- * for the full ONNX inference duration, often for the closure's remaining
- * hour-long cache lifetime. Builders now retry the worker on EVERY call
- * instead (ensureWorker() already self-heals a crashed worker by respawning;
- * only genuine unavailability — getWorkerState().disabled — skips straight to
- * inline), so a SUSTAINED failure could otherwise warn on every single call;
- * rate-limit it to one line per cooldown window instead.
+ * Rate-limited warning for a builder (gemma/harrier/qwen3/granite/local) whose
+ * worker path failed, so THIS call rejects. The name is historical: the
+ * "fallback" is now the caller's degraded path, never inference on the
+ * calling thread.
+ *
+ * EI-28961860650735669: builders used to retry a failed call inline. That
+ * built the ONNX pipeline on the main thread and blocked the event loop for
+ * seconds (measured: gemma's first inline embed held it for gaps up to 2.5s,
+ * 4.7s in total), so every timer-based detector on the host misfired. The
+ * rescue also hid the failure: a torn model cache made every gemma worker
+ * load fail for hours, unnoticed, because the inline path read a different
+ * cache. Builders now reject instead, so a sick worker is a visible,
+ * classified failure (the 'embed-worker' degradation mechanism counts it),
+ * never a stall. mdenseon was built this way from the start.
+ *
+ * Builders retry the worker on EVERY call (EI-16184: ensureWorker() respawns
+ * a crashed worker; only genuine unavailability, getWorkerState().disabled,
+ * fails fast), so a SUSTAINED failure would warn on every call; rate-limit it
+ * to one line per cooldown window.
  */
 const FALLBACK_WARN_COOLDOWN_MS = 30_000;
 export function warnEmbedFallback(model: string, err: unknown): void {
@@ -1171,11 +1176,27 @@ export function warnEmbedFallback(model: string, err: unknown): void {
   if (now - state.lastFallbackWarnAt < FALLBACK_WARN_COOLDOWN_MS) return;
   state.lastFallbackWarnAt = now;
   if (process.env.NODE_ENV !== 'test') {
+    // Keep "falls back" in this text. The condition-rail census finds this
+    // observation site by its fallback wording; without it the immutable seed
+    // row log-only-fallback|…/local-embedder-worker.ts|warnEmbedFallback|1
+    // reads as "seed site absent" and condition-rail-coverage fails.
     console.warn(
-      `[embed] ${model} worker path failed — falling back to inline (main-thread, blocks the event loop) for this call: ` +
-        `${err instanceof Error ? err.message : String(err)}`,
+      `[embed] ${model} worker path failed — this call rejects and its caller falls back to the degraded ` +
+        `path (inference never runs on the main thread): ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+}
+
+/**
+ * What a builder throws when the worker cannot exist at all
+ * (getWorkerState().disabled: worker_threads could not start). There is no
+ * main-thread alternative (EI-28961860650735669).
+ */
+export function embedWorkerDisabledError(model: string): Error {
+  return new Error(
+    `[embed] ${model}: the embed worker is unavailable (worker_threads could not start); ` +
+      'inference never runs on the main thread, so this call rejects',
+  );
 }
 
 /** Test-only: reset the fallback-warn cooldown so tests can assert on it independently. */
@@ -1185,12 +1206,6 @@ export function _resetFallbackWarnForTest(): void {
 
 export const LOCAL_EMBEDDER_MODEL = 'Xenova/bge-small-en-v1.5';
 const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
-
-type TransformersModule = {
-  env?: { allowRemoteModels: boolean; allowLocalModels: boolean };
-  pipeline: (task: string, model: string, opts?: Record<string, unknown>) => Promise<Pipeline>;
-};
-type Pipeline = (text: string, opts: unknown) => Promise<{ data: Float32Array }>;
 
 /** Ceiling on the intra-op pool, whatever the host size (WI-3792): a 128-core
  *  box must never get a 128-thread spin pool back. */
@@ -1283,41 +1298,24 @@ export function applyTransformersRuntimePolicy<T>(
 /**
  * Build a local (free, offline) BGE-small embedder.
  *
- * Prefers the worker-thread isolated path (`embedViaWorker`) so ONNX
- * inference doesn't block the main event loop; falls back to an inline
- * main-thread pipeline for THIS call when the worker is unavailable or the
- * call fails. EI-16184: this used to be sticky per closure (a single
- * worker failure permanently disabled the worker path for the rest of the
- * closure's life, silently — see warnEmbedFallback's doc comment for the
- * full incident). Every call now re-checks the module's own liveness
- * (`getWorkerState().disabled` — set only for genuine, permanent
- * unavailability; a crashed worker instead self-heals via `ensureWorker`'s
- * respawn), so a transient failure costs at most one degraded call.
+ * Inference runs only on the worker thread (`embedViaWorker`). A worker
+ * failure rejects THIS call and the caller degrades; nothing retries on the
+ * main thread (EI-28961860650735669, see warnEmbedFallback). Every call
+ * re-checks the worker (EI-16184): a crashed worker self-heals via
+ * `ensureWorker`'s respawn, so a transient failure costs one rejected call.
  */
 export async function buildLocalEmbedder(): Promise<(text: string) => Promise<number[]>> {
-  let pipelinePromise: Promise<Pipeline> | null = null;
-
   return async (text: string): Promise<number[]> => {
-    if (!getWorkerState().disabled) {
-      try {
-        return await embedViaWorker(text);
-      } catch (err) {
-        if (isEmbedWorkerShutdownError(err)) throw err; // WI-10006602: never rescue a shutdown inline
-        warnEmbedFallback('local', err);
-      }
-    } else {
+    if (getWorkerState().disabled) {
       warnEmbedFallback('local', 'worker-disabled');
+      throw embedWorkerDisabledError('local');
     }
-
-    // Inline (main-thread) fallback path.
-    if (!pipelinePromise) {
-      const transformers = applyTransformersRuntimePolicy(
-        await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE),
-      );
-      pipelinePromise = constructEmbedPipeline(transformers, LOCAL_EMBEDDER_MODEL, ORT_SESSION_OPTIONS);
+    try {
+      return await embedViaWorker(text);
+    } catch (err) {
+      // WI-10006602: a deliberate shutdown is not a worker failure.
+      if (!isEmbedWorkerShutdownError(err)) warnEmbedFallback('local', err);
+      throw err;
     }
-    const pipe = await pipelinePromise;
-    const result = await pipe(text, { pooling: 'mean', normalize: true });
-    return Array.from(result.data);
   };
 }
