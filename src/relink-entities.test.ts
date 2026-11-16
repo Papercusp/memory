@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { configureMemory } from './config';
-import { getMemoryClient } from './mem0-client';
+import { getMemoryClient, type MemoryClient } from './mem0-client';
 
 vi.mock('./mem0-client', () => ({ getMemoryClient: vi.fn() }));
 vi.mock('pg', () => ({ Client: FakeClient, default: { Client: FakeClient } }));
@@ -85,8 +85,23 @@ class FakeClient {
   }
 }
 
+function makePublicClient(): MemoryClient {
+  const unexpectedClientCall = async (): Promise<never> => {
+    throw new Error('Unexpected public memory client call during entity relink');
+  };
+  return {
+    add: vi.fn<MemoryClient['add']>(unexpectedClientCall),
+    delete: vi.fn<MemoryClient['delete']>(unexpectedClientCall),
+    get: vi.fn<MemoryClient['get']>(unexpectedClientCall),
+    getAll: vi.fn<MemoryClient['getAll']>(unexpectedClientCall),
+    search: vi.fn<MemoryClient['search']>(unexpectedClientCall),
+    update: vi.fn<MemoryClient['update']>(unexpectedClientCall),
+  };
+}
+
 function makeMem0() {
   return {
+    ...makePublicClient(),
     embedder: { embed: async () => { if (failEmbedding) throw new Error('embed failed'); return [1]; } },
     async getEntityStore() {
       return { insert: async (_vecs: number[][], ids: string[], payloads: Payload[]) => {
@@ -125,7 +140,7 @@ beforeEach(async () => {
     getCredentials: async () => ({}), resolveEmbedder: async () => ({ mode: 'disabled' as const }),
     buildEmbedderForMode: async () => async () => [],
     schema: 'harness_shared' });
-  vi.mocked(getMemoryClient).mockReset().mockResolvedValue(makeMem0() as never);
+  vi.mocked(getMemoryClient).mockReset().mockResolvedValue(makeMem0());
   ({ relinkEntities } = await import('./relink-entities'));
   junk(); memory('m1');
 });
@@ -134,7 +149,7 @@ afterEach(() => vi.unstubAllEnvs());
 describe('relinkEntities — loss-safe maintenance and bounded retries', () => {
   it.each(['missing client', 'missing linker', 'client rejects'])('preserves rows and both vectors on %s', async mode => {
     if (mode === 'missing client') vi.mocked(getMemoryClient).mockResolvedValue(null);
-    if (mode === 'missing linker') vi.mocked(getMemoryClient).mockResolvedValue({} as never);
+    if (mode === 'missing linker') vi.mocked(getMemoryClient).mockResolvedValue(makePublicClient());
     if (mode === 'client rejects') vi.mocked(getMemoryClient).mockRejectedValue(new Error('unavailable'));
     const before = { records: copyRecords(), vectors: copyVectors() };
     await expect(relinkEntities()).rejects.toThrow();
