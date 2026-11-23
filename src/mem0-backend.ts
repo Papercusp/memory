@@ -44,6 +44,7 @@ import {
 import {
   embedForCurrentClient,
   canonicalManagedWrites,
+  extractionAvailable,
   getMemoryClient,
   invalidateEntryCanonical,
   invalidateMemoryClient,
@@ -506,6 +507,9 @@ export class Mem0Backend implements MemoryBackend {
     const metadata: Record<string, unknown> = { ...(opts.metadata ?? {}) };
     if (opts.kind !== undefined) metadata.kind = opts.kind;
     if (opts.shareable !== undefined) metadata.shareable = opts.shareable;
+    // No model to extract with: mem0 would swallow the extractor's failure into
+    // an empty result, a silently dropped memory. Refuse it by name instead.
+    if (!opts.verbatim && !extractionAvailable()) throw new MemoryUnavailableError('memory_extraction_unavailable');
     // `verbatim` → mem0's `infer: false`: skip the LLM fact-extraction and
     // embed + insert the raw text as exactly one ADD (D-008 — bulk seeding).
     const result = await client.add(text, {

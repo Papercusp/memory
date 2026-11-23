@@ -51,7 +51,7 @@ import { CanonicalVectorStore } from './canonical-store';
 import type { ManagedMemoryWrites } from './backend';
 import { memoryHost, memoryLocalStoreDir, memorySchema } from './config';
 import { coalesceEmbedFn } from './embed-coalesce';
-import { FallbackExtractionLlm, type ExtractionLlm } from './extraction-llm';
+import { FallbackExtractionLlm, UnavailableExtractionLlm, type ExtractionLlm } from './extraction-llm';
 import { dynamicImport } from './dynamic-import';
 import type { EmbedderProfileSpec } from './embedder-dims';
 import { resolveMemoryVectorBinding } from './vec-write';
@@ -341,6 +341,15 @@ export function _setCurrentEmbedFnForTest(
  * when the host supplies a session-backed extractor.
  */
 let _currentExtractionLlm: ExtractionLlm | null = null;
+// True while the built client has no model to extract facts with (its 'custom'
+// LLM is `UnavailableExtractionLlm`): search and verbatim writes work, a write
+// that needs extraction is refused (`Mem0Backend.remember`).
+let _extractionOff = false;
+
+/** Whether the current memory client can extract facts from text (false: verbatim writes only). */
+export function extractionAvailable(): boolean {
+  return !_extractionOff;
+}
 
 /**
  * mem0ai 3.x has NO `custom` LLM provider — `LLMFactory.create` is a
@@ -639,11 +648,21 @@ async function buildClient(): Promise<MemoryClient | null> {
     warnOnce(`host getExtractionLlm threw (${(e as Error).message}); using key rungs`);
   }
 
-  const llmConfig = await resolveExtractionLlmConfig({ anthropicKey, openaiKey }, undefined, sessionLlm);
-  if (!llmConfig) {
-    warnOnce('no Claude session and no Anthropic or OpenAI API key in operator-credentials or env (add at /settings/api-keys)');
-    return null;
+  // No model to extract facts with is NOT a reason to refuse the store: search
+  // and verbatim writes (`memory:remember`'s default) need only the embedder,
+  // which is local. A host whose models are reached only through a cloud
+  // provider's own sign-in has no Claude session and no API key, and used to
+  // get no memory at all. The client is built over an extractor that fails
+  // saying why; `Mem0Backend.remember` refuses a write that needs extraction.
+  const resolvedLlm = await resolveExtractionLlmConfig({ anthropicKey, openaiKey }, undefined, sessionLlm);
+  const extractionOff = !resolvedLlm;
+  if (extractionOff) {
+    warnOnce(
+      'no Claude session and no Anthropic or OpenAI API key in operator-credentials or env: fact extraction is off; ' +
+        'memory search and verbatim writes still work (add a key at /settings/api-keys to turn extraction on)',
+    );
   }
+  const llmConfig = resolvedLlm ?? { provider: 'custom', config: {} };
 
   // Per-mode collection name kept only for mem0's internal logging /
   // bookkeeping (its DEFAULT_MEMORY_CONFIG reads it). Our
@@ -822,7 +841,12 @@ async function buildClient(): Promise<MemoryClient | null> {
         },
         { warn: warnOnce, primaryLabel: 'claude-session extraction' },
       );
+    } else if (extractionOff) {
+      // The same 'custom' provider, routed to the extractor that only fails.
+      patchLlmFactory(mem0);
+      _currentExtractionLlm = new UnavailableExtractionLlm();
     }
+    _extractionOff = extractionOff;
     const { Memory } = mem0;
     _client = new Memory({
       embedder: embedderConfig,

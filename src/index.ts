@@ -41,8 +41,10 @@ export {
 // to the key rungs (D-004); `FallbackExtractionLlm` is the cascade wrapper
 // (exported for hosts that compose their own cascades + for tests).
 export {
+  EXTRACTION_UNAVAILABLE,
   ExtractionAuthError,
   FallbackExtractionLlm,
+  UnavailableExtractionLlm,
   type ExtractionLlm,
   type ExtractionLlmMessage,
   type ExtractionLlmResponse,

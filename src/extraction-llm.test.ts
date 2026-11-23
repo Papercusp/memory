@@ -7,8 +7,10 @@ import {
   resolveExtractionLlmConfig,
 } from './mem0-client';
 import {
+  EXTRACTION_UNAVAILABLE,
   ExtractionAuthError,
   FallbackExtractionLlm,
+  UnavailableExtractionLlm,
   type ExtractionLlm,
   type ExtractionLlmMessage,
 } from './extraction-llm';
@@ -133,6 +135,54 @@ describe('patchLlmFactory — mem0ai 3.x custom-LLM compatibility', () => {
       // And it landed in the store.
       const all = await memory.getAll({ filters: { user_id: 'conformance' } });
       expect(all.results.some((r) => r.memory === fact)).toBe(true);
+    } finally {
+      _setCurrentExtractionLlmForTest(null);
+      _setCurrentEmbedFnForTest(null);
+    }
+  });
+});
+
+describe('UnavailableExtractionLlm — a store with no model to extract with', () => {
+  it('fails every extraction call saying why', async () => {
+    const llm = new UnavailableExtractionLlm();
+    await expect(llm.generateResponse()).rejects.toThrow(EXTRACTION_UNAVAILABLE);
+    await expect(llm.generateChat()).rejects.toThrow(EXTRACTION_UNAVAILABLE);
+  });
+
+  it('a REAL mem0 Memory over it stores a verbatim write and finds it again', async () => {
+    const oss = (await import('mem0ai/oss')) as unknown as OssModule & {
+      Memory: new (config: Record<string, unknown>) => {
+        search: (
+          query: string,
+          opts: Record<string, unknown>,
+        ) => Promise<{ results: Array<{ memory?: string }> }>;
+      };
+    };
+    patchLlmFactory(oss);
+    patchEmbedderFactory(oss as never);
+    _setCurrentExtractionLlmForTest(new UnavailableExtractionLlm());
+    _setCurrentEmbedFnForTest(fakeEmbed());
+
+    try {
+      const memory = new oss.Memory({
+        embedder: { provider: 'custom', config: {} },
+        vectorStore: {
+          provider: 'memory',
+          config: { collectionName: 'no-extractor', dimension: 8, dbPath: ':memory:' },
+        },
+        llm: { provider: 'custom', config: {} },
+        disableHistory: true,
+      });
+      const text = 'the integration tests need the --no-network flag';
+
+      // `infer: false` is what `memory:remember` sends: no extraction, one ADD of the text itself.
+      const res = await memory.add(text, { userId: 'no-extractor', infer: false });
+      expect(res.results.some((r) => r.memory === text)).toBe(true);
+
+      const all = await memory.getAll({ filters: { user_id: 'no-extractor' } });
+      expect(all.results.map((r) => r.memory)).toEqual([text]);
+      const found = await memory.search(text, { filters: { user_id: 'no-extractor' }, topK: 3, limit: 3 });
+      expect(found.results.some((r) => r.memory === text)).toBe(true);
     } finally {
       _setCurrentExtractionLlmForTest(null);
       _setCurrentEmbedFnForTest(null);
