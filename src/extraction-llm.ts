@@ -54,6 +54,28 @@ export class ExtractionAuthError extends Error {
   }
 }
 
+/** What an extraction call fails with on a host that has no model to extract with. */
+export const EXTRACTION_UNAVAILABLE =
+  'memory fact extraction is unavailable: no Claude session and no Anthropic or OpenAI API key ' +
+  '(memory search and verbatim writes still work)';
+
+/**
+ * The extraction LLM of a host with no model to extract facts with — one whose
+ * models are reached only through a cloud provider's own sign-in, say. The
+ * memory client is still built over it, because search and verbatim writes
+ * (`memory:remember`'s default) need only the embedder, which is local. Every
+ * call fails saying why, so nothing that does need a model passes silently.
+ */
+export class UnavailableExtractionLlm implements ExtractionLlm {
+  async generateResponse(): Promise<unknown> {
+    throw new Error(EXTRACTION_UNAVAILABLE);
+  }
+
+  async generateChat(): Promise<ExtractionLlmResponse> {
+    throw new Error(EXTRACTION_UNAVAILABLE);
+  }
+}
+
 /**
  * Primary→fallback cascade over two extraction LLMs (D-002/D-004/D-005).
  *
